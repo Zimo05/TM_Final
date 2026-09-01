@@ -1,0 +1,8 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS metadata/resource-fork files
+._*
+.DS_Store
