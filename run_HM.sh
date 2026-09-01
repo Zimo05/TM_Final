@@ -421,7 +421,7 @@ evaluate_controller() {
   env PYTHONPATH="$MEMORY_PYTHONPATH" "$PYTHON_BIN" -m Evaluate \
     --checkpoint "$checkpoint" --data-path "$HAWKES_DATA" \
     --split-manifest "$SPLIT_MANIFEST" --output-dir "$output" \
-    --protocol both --seed "$SPLIT_SEED" "${extra[@]}"
+    --protocol both --seed "$SPLIT_SEED" ${extra[@]+"${extra[@]}"}
 }
 
 show_status() {

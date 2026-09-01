@@ -1,4 +1,4 @@
-"""Exact, state-isolated single-candidate Write counterfactuals."""
+"""State-isolated single-candidate local Write counterfactuals."""
 
 from __future__ import annotations
 
@@ -40,15 +40,14 @@ def paired_physical_write_utility(
     *,
     device: str = "cuda",
 ) -> dict[str, Any]:
-    """Compare no writes with exactly one normal physical write on C.
+    """Evaluate exactly one forced local candidate on its causal C window.
 
-    Both branches load independently from the same checkpoint.  The treatment
-    candidate follows the production F-window construction, add_memory call,
-    sparse retrieval, path aggregation, Retrieve gate and Hawkes likelihood.
+    The production path now keeps the candidate in probation, so this legacy
+    helper reports the virtual-insertion evidence and never mutates a normal
+    EpisodicMemory bank.
     """
     checkpoint = Path(checkpoint)
     before_sha = file_sha256(checkpoint)
-    baseline = _run(checkpoint, sequence, allowlist=(), device=device)
     treatment = _run(
         checkpoint, sequence, allowlist=(int(event_index),), device=device
     )
@@ -59,41 +58,31 @@ def paired_physical_write_utility(
         .wake_config.write_horizon
     )
     start, end = int(event_index) + h, int(event_index) + 2 * h
-    if end > len(baseline["events"]):
+    if end > len(treatment["events"]):
         raise ValueError("physical Write probe requires a complete C window")
-    baseline_by_event = {
-        int(event["event_index"]): event for event in baseline["events"]
-    }
-    treatment_by_event = {
-        int(event["event_index"]): event for event in treatment["events"]
-    }
-    gains = [
-        float(baseline_by_event[index]["nll"])
-        - float(treatment_by_event[index]["nll"])
-        for index in range(start, end)
-    ]
-    accepted = [
-        event for event in treatment["events"]
-        if bool(event.get("write_accepted", False))
-    ]
-    accepted_indices = [int(event["event_index"]) for event in accepted]
-    if accepted_indices != [int(event_index)]:
+    event = treatment["events"][int(event_index)]
+    if not bool(event.get("write_probed", False)):
         raise AssertionError(
-            f"forced physical probe accepted {accepted_indices}, expected {[int(event_index)]}"
+            f"forced local probe did not evaluate event {int(event_index)}"
         )
     lambda_write = float(
         MemoryTreeInference.from_checkpoint(checkpoint, device="cpu")
         .wake_config.lambda_write
     )
+    utility = float(event["write_utility"])
+    mean_gain = utility + lambda_write
     return {
         "event_index": int(event_index),
         "construction_window": [int(event_index), int(event_index) + h],
         "score_window": [start, end],
-        "event_gains": gains,
-        "mean_nll_gain": sum(gains) / h,
+        "event_gains": None,
+        "mean_nll_gain": mean_gain,
         "write_cost": lambda_write,
-        "write_utility": sum(gains) / h - lambda_write,
-        "accepted": True,
+        "write_utility": utility,
+        "accepted": bool(event.get("write_local_accepted", False)),
+        "probation_enqueued": bool(
+            event.get("write_probation_enqueued", False)
+        ),
         "source_checkpoint_sha256": before_sha,
     }
 

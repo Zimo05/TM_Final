@@ -33,9 +33,10 @@ class TrainingSleepMixin:
     ) -> Dict[str, tuple[SplitModule, Dict[str, Any]]]:
         self._sync_split_modules()
         proposals = {}
-        shadow_buffer = self.sleep_state.get(
-            "structural_evidence_buffer", {}
-        )
+        # Legacy checkpoints may contain rejected/shadow probes here. They are
+        # deliberately ignored: Sleep structural evidence starts at the
+        # persistent EpisodicMemory boundary.
+        self.sleep_state["structural_evidence_buffer"] = {}
         for leaf_id in list(self.tree.leaf_ids):
             if progress is not None:
                 progress.set_postfix(
@@ -46,7 +47,6 @@ class TrainingSleepMixin:
             if (
                 self.sleep_config.require_split_trigger
                 and self.controller.split_queues.get(leaf_id, 0) <= 0
-                and not shadow_buffer.get(leaf_id)
             ):
                 if progress is not None:
                     progress.update(1)
@@ -56,17 +56,7 @@ class TrainingSleepMixin:
                 self.tree.episodic_memory.get_bank(leaf_id),
                 max_items=max_evidence,
             )
-            shadow_items = [
-                record["item"]
-                for record in shadow_buffer.get(leaf_id, {}).values()
-            ]
-            shadow_batch = module.build_split_batch_from_memory_items(
-                shadow_items
-            ) if shadow_items else None
-            batch = module.combine_split_batches(
-                (episodic_batch, shadow_batch),
-                max_items=max_evidence,
-            )
+            batch = episodic_batch
             if batch is None or batch.residuals.shape[0] < 2:
                 if progress is not None:
                     progress.update(1)
@@ -145,16 +135,9 @@ class TrainingSleepMixin:
     def _continuous_split_demand(
         self,
         *,
-        accepted_writes: int,
+        accepted_writes: int = 0,
     ) -> Dict[str, float]:
-        """Estimate event-normalized raw structural pressure.
-
-        Every Wake observation contributes ``p_write_raw * p_split_raw``.
-        Physical admission is intentionally absent from the denominator, so
-        strict write calibration cannot erase topology evidence.  The legacy
-        accepted-write argument and split-queue diagnostics are retained for
-        checkpoint/API compatibility only.
-        """
+        """Estimate structural pressure from persistent-memory votes only."""
         if accepted_writes < 0:
             raise ValueError("accepted_writes must be non-negative")
         previous_snapshot = dict(
@@ -178,19 +161,19 @@ class TrainingSleepMixin:
             queue_total += current
             active_increment_count += int(increment > 0.0)
             next_snapshot[leaf_id] = current
-        structural_mass = max(float(
+        # Raw controller pressure is retained only as a discarded compatibility
+        # diagnostic. It cannot drive topology before memory persistence.
+        discarded_structural_mass = max(float(
             self.sleep_state.get("structural_mass_since_sleep", 0.0)
         ), 0.0)
-        structural_observations = max(int(
+        discarded_structural_observations = max(int(
             self.sleep_state.get(
                 "structural_observations_since_sleep", 0
             )
         ), 0)
-        observation = (
-            structural_mass / float(structural_observations)
-            if structural_observations > 0 else 0.0
+        observation = 1.0 - math.exp(
+            -queue_increment / self.sleep_config.deep_split_queue_scale
         )
-        observation = min(max(observation, 0.0), 1.0)
         previous_ema = float(
             self.sleep_state.get("structural_demand_ema", 0.0)
         )
@@ -207,8 +190,14 @@ class TrainingSleepMixin:
             "queue_total": float(queue_total),
             "active_increment_count": float(active_increment_count),
             "accepted_writes": float(accepted_writes),
-            "structural_mass": float(structural_mass),
-            "structural_observations": float(structural_observations),
+            "structural_mass": 0.0,
+            "structural_observations": 0.0,
+            "discarded_raw_structural_mass": float(
+                discarded_structural_mass
+            ),
+            "discarded_raw_structural_observations": float(
+                discarded_structural_observations
+            ),
         }
 
     @torch.no_grad()

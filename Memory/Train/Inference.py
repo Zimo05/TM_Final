@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from HawkesBackbone import (
@@ -19,6 +20,10 @@ from HawkesBackbone import (
     HawkesFamily,
 )
 from LatentHawkesTree import HawkesTree
+from MemoryResiduals.ProbationMemory import (
+    ProbationCandidate,
+    WriteProbationBuffer,
+)
 from Train.Train import (
     CausalPrefixEncoder,
     WakeObjectiveConfig,
@@ -36,9 +41,17 @@ class InferenceConfig:
     probe_write_counterfactuals: bool = False
     write_probe_random_count: int = 16
     write_probe_seed: int = 42
+    # Local Write acceptance only creates an invisible probation candidate.
+    # Persistent admission requires reuse evidence from independent sequences.
+    probation_capacity: int = 1024
+    probation_match_threshold: float = 0.5
+    probation_match_temperature: float = 0.1
+    probation_min_effective_samples: float = 2.0
+    probation_lcb_kappa: float = 1.96
+    probation_persist_threshold: float = 0.0
     # Diagnostic-only causal replay.  When set, no event outside the allowlist
     # may write; listed events bypass the learned Write threshold but still use
-    # the normal candidate construction, add_memory and retrieval path.
+    # the normal candidate construction and virtual retrieval path.
     write_event_allowlist: Optional[tuple[int, ...]] = None
 
 
@@ -82,12 +95,24 @@ class MemoryTreeInference:
             WakeObjectiveConfig() if wake_config is None else wake_config
         )
         self.config = InferenceConfig() if inference_config is None else inference_config
+        if self.config.probation_match_temperature <= 0.0:
+            raise ValueError("probation match temperature must be positive")
+        if self.config.probation_min_effective_samples < 0.0:
+            raise ValueError(
+                "probation minimum effective samples must be non-negative"
+            )
+        if self.config.probation_lcb_kappa < 0.0:
+            raise ValueError("probation LCB kappa must be non-negative")
         if device is None:
             device = next(tree.parameters()).device
         self.device = torch.device(device)
         self.tree = tree.to(self.device).eval()
         self.hawkes = hawkes.to(self.device).eval()
         self.encoder = encoder.to(self.device).eval()
+        self.write_probation = WriteProbationBuffer(
+            capacity=self.config.probation_capacity
+        )
+        self._anonymous_sequence_counter = 0
         self.controller = Controller(
             nll_fn=self.hawkes,
             tau_s=self.wake_config.tau_surprise,
@@ -768,19 +793,262 @@ class MemoryTreeInference:
             owner_id
         ] += item.queue_weight
 
+    def _enqueue_probation_candidate(
+        self,
+        request: Mapping[str, Any],
+        *,
+        source_sequence_id: Any,
+    ) -> ProbationCandidate:
+        """Store local evidence without exposing the residual to retrieval."""
+        evidence = request.get("window_evidence")
+        if evidence is None:
+            raise RuntimeError("probation candidate requires local window evidence")
+        item = evidence.get("candidate_item")
+        if item is None:
+            raise RuntimeError("write evidence is missing its residual candidate")
+        local_utility = float(evidence["write_utility"].detach().cpu())
+        gain_reference = self.wake_config.controller_gain_reference
+        local_quality = 1.0 - torch.exp(torch.tensor(
+            -max(local_utility, 0.0) / gain_reference
+        )).item()
+        probabilities = request.get("raw_action_probabilities")
+        write_probability = float(request["write_gate"].detach().cpu())
+        split_probability = (
+            float(probabilities[3].detach().cpu())
+            if probabilities is not None and probabilities.numel() > 3
+            else 0.0
+        )
+        token = (source_sequence_id, int(request["event_index"]))
+        candidate = ProbationCandidate(
+            token=token,
+            source_sequence_id=source_sequence_id,
+            event_index=int(request["event_index"]),
+            owner_id=str(evidence["owner_id"]),
+            key=item.key.detach().clone(),
+            delta_theta=item.delta_theta.detach().clone(),
+            window=item.window,
+            local_utility=local_utility,
+            local_quality=float(local_quality),
+            write_probability=write_probability,
+            split_probability=split_probability,
+            # Probation preserves the pure structural vote.  The legacy
+            # request queue_weight is p_write * p_split and must not dilute
+            # q_struct once cross-sequence persistence has been established.
+            queue_weight=split_probability,
+        )
+        self.write_probation.add(candidate)
+        return candidate
+
+    def _candidate_match(
+        self,
+        candidate: ProbationCandidate,
+        contexts: Sequence[Mapping[str, Any]],
+    ) -> Optional[tuple[int, float]]:
+        """Return the best topology-compatible context with a full CF window."""
+        horizon = self.wake_config.write_horizon
+        best: Optional[tuple[int, float]] = None
+        for index in range(max(len(contexts) - horizon + 1, 0)):
+            context = contexts[index]
+            compatible = any(
+                candidate.owner_id in self.tree.path_to_node(frontier_id)
+                for frontier_id in context["frontier_node_ids"]
+            )
+            if not compatible:
+                continue
+            query = context["query"]
+            similarity = float(F.cosine_similarity(
+                candidate.key.to(query).reshape(1, -1),
+                query.reshape(1, -1),
+                dim=-1,
+            )[0].detach().cpu())
+            if best is None or similarity > best[1]:
+                best = (index, similarity)
+        return best
+
+    def _cross_sequence_gain(
+        self,
+        sequence: Mapping[str, Tensor],
+        contexts: Sequence[Mapping[str, Any]],
+        candidate: ProbationCandidate,
+        match_index: int,
+    ) -> tuple[float, float]:
+        """Evaluate a probation residual through the production read path."""
+        horizon = self.wake_config.write_horizon
+        D = self.hawkes.num_types
+        baseline_loss = candidate.key.new_zeros(())
+        counterfactual_loss = baseline_loss.clone()
+        virtual_usage = 1.0
+        alpha_values: list[float] = []
+        for age, context in enumerate(
+            contexts[match_index:match_index + horizon]
+        ):
+            query = context["query"]
+            baseline_delta, _ = self.tree.episodic_memory.read_nodes(
+                query, [candidate.owner_id], update_state=False
+            )
+            virtual_delta, info = (
+                self.tree.episodic_memory.read_node_with_virtual_item(
+                    query,
+                    candidate.owner_id,
+                    key=candidate.key,
+                    delta=candidate.delta_theta,
+                    write_quality=candidate.local_quality,
+                    virtual_usage=virtual_usage,
+                    virtual_age=float(age),
+                )
+            )
+            alpha = 0.0
+            values = info.get("alpha")
+            if values is not None and values.numel():
+                alpha = float(values[-1].detach().cpu())
+            alpha_values.append(alpha)
+            virtual_usage += alpha
+
+            difference = virtual_delta - baseline_delta[candidate.owner_id]
+            episodic = context["frontier_episodic_delta"].clone()
+            for slot, frontier_id in enumerate(context["frontier_node_ids"]):
+                if candidate.owner_id in self.tree.path_to_node(frontier_id):
+                    episodic[slot] = episodic[slot] + difference
+            virtual_output = {
+                "frontier_semantic_theta": (
+                    context["frontier_semantic_theta"].unsqueeze(0)
+                ),
+                "frontier_episodic_delta": episodic.unsqueeze(0),
+                "r": context["posterior"].unsqueeze(0),
+            }
+            counterfactual_params = self._controller_effective_parameters(
+                virtual_output,
+                context["working_delta"],
+                context["retrieve_gate"],
+            ).select(0)
+            theta = context["no_write_theta"]
+            baseline_params = HawkesParams(
+                theta[:D], theta[D:].reshape(D, D, self.hawkes.num_basis)
+            )
+            event_index = int(context["event_index"])
+            baseline_loss = baseline_loss + self.hawkes.event_NLL(
+                sequence, baseline_params, event_index
+            )
+            counterfactual_loss = counterfactual_loss + self.hawkes.event_NLL(
+                sequence, counterfactual_params, event_index
+            )
+        gain = float(
+            ((baseline_loss - counterfactual_loss) / horizon).detach().cpu()
+        )
+        mean_alpha = sum(alpha_values) / max(len(alpha_values), 1)
+        return gain, mean_alpha
+
+    def _validate_probation_candidates(
+        self,
+        sequence: Mapping[str, Tensor],
+        contexts: Sequence[Mapping[str, Any]],
+        *,
+        sequence_id: Any,
+    ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+        """Validate once per independent sequence, then promote by ESS + LCB."""
+        validations: list[Dict[str, Any]] = []
+        for candidate in self.write_probation.candidates_for(sequence_id):
+            match = self._candidate_match(candidate, contexts)
+            # Even an unmatched sequence is consumed: rerunning it must not
+            # fabricate another independent opportunity for this candidate.
+            if match is None:
+                candidate.record_validation(
+                    sequence_id, gain=0.0, weight=0.0
+                )
+                validations.append({
+                    "token": candidate.token,
+                    "matched": False,
+                })
+                continue
+            match_index, similarity = match
+            gain, virtual_alpha = self._cross_sequence_gain(
+                sequence, contexts, candidate, match_index
+            )
+            weight = float(torch.sigmoid(torch.tensor(
+                (
+                    similarity - self.config.probation_match_threshold
+                ) / self.config.probation_match_temperature
+            )).item())
+            candidate.record_validation(
+                sequence_id, gain=gain, weight=weight
+            )
+            validations.append({
+                "token": candidate.token,
+                "matched": True,
+                "match_index": match_index,
+                "similarity": similarity,
+                "weight": weight,
+                "gain": gain,
+                "virtual_candidate_alpha": virtual_alpha,
+                "effective_sample_size": candidate.effective_sample_size,
+                "gain_mean": candidate.gain_mean,
+                "gain_variance": candidate.gain_variance,
+                "lcb": candidate.lower_confidence_bound(
+                    self.config.probation_lcb_kappa
+                ),
+            })
+
+        promotions: list[Dict[str, Any]] = []
+        for candidate in list(self.write_probation):
+            if not candidate.promotion_ready(
+                minimum_effective_samples=(
+                    self.config.probation_min_effective_samples
+                ),
+                kappa=self.config.probation_lcb_kappa,
+                persist_threshold=self.config.probation_persist_threshold,
+            ):
+                continue
+            quality = candidate.promoted_quality(
+                self.wake_config.controller_gain_reference
+            )
+            self.tree.episodic_memory.add_memory(
+                candidate.owner_id,
+                candidate.key,
+                candidate.delta_theta,
+                candidate.window,
+                write_quality=quality,
+                queue_weight=candidate.queue_weight,
+            )
+            # This is the sole probation-to-Split bridge. Before promotion the
+            # candidate is absent from both the bank and the trigger queue.
+            self.controller.split_queues[
+                candidate.owner_id
+            ] += candidate.queue_weight
+            promotions.append({
+                "token": candidate.token,
+                "owner_id": candidate.owner_id,
+                "write_quality": quality,
+                "structural_weight": candidate.queue_weight,
+                "gain_mean": candidate.gain_mean,
+                "effective_sample_size": candidate.effective_sample_size,
+                "lcb": candidate.lower_confidence_bound(
+                    self.config.probation_lcb_kappa
+                ),
+            })
+            self.write_probation.remove(candidate.token)
+        return validations, promotions
+
     def run_sequence(
         self,
         cpu_sequence: Mapping[str, Tensor],
     ) -> Dict[str, Any]:
         """Process observed events causally using only the wake mechanism.
 
-        Memory writes are delayed until their future write horizon has actually
-        been observed, preventing offline look-ahead leakage during inference.
+        Local candidates wait for their complete causal write horizon, then
+        remain retrieval-invisible until independent sequences pass ESS + LCB.
         """
         source_value = cpu_sequence.get("source_index", -1)
         source_index = int(
             source_value.item() if hasattr(source_value, "item") else source_value
         )
+        if source_index >= 0:
+            source_sequence_id: Any = source_index
+        else:
+            source_sequence_id = (
+                "anonymous_inference_sequence",
+                self._anonymous_sequence_counter,
+            )
+            self._anonymous_sequence_counter += 1
         sequence = self._move_sequence(cpu_sequence)
         self.tree.reset_working_memory()
         pending_writes: list[Dict[str, Any]] = []
@@ -788,6 +1056,7 @@ class MemoryTreeInference:
         outputs = []
         total_nll = 0.0
         accepted_write_count = 0
+        local_accepted_write_count = 0
         accepted_write_requests: list[Dict[str, Any]] = []
 
         for event_index in range(sequence["times"].numel()):
@@ -1031,6 +1300,10 @@ class MemoryTreeInference:
                     ].detach().clone(),
                     "action": action,
                     "write_gate": raw_action_probabilities[2].detach(),
+                    "raw_action_probabilities": (
+                        raw_action_probabilities.detach().clone()
+                    ),
+                    "source_sequence_id": source_sequence_id,
                     "exploration": False,
                     "novelty": novelty,
                     "queue_weight": float(
@@ -1116,18 +1389,20 @@ class MemoryTreeInference:
                 "write_priority_passed": False,
                 "write_window_complete": False,
                 "write_accepted": False,
+                "write_local_accepted": False,
+                "write_probation_enqueued": False,
+                "write_promotion_count": 0,
                 "write_retrieved_later": False,
                 "write_beneficial": False,
             })
 
-            # v6 commits immediately after F=[t,t+h) becomes observable.  The
-            # later C-window utility remains diagnostic/training-only.
+            # F=[t,t+h) still performs the existing causal local admission.
+            # It no longer mutates EpisodicMemory: C-window local utility must
+            # first create an invisible probation candidate, which later needs
+            # evidence from independent sequences.
             if (
                 int(self.controller.controller_version.detach().cpu()) >= 6
                 and self.config.allow_memory_writes
-                and accepted_write_count < min(
-                    4, self.tree.frontier_routing.config.max_writes_per_sequence
-                )
             ):
                 due = [
                     request for request in pending_writes
@@ -1155,50 +1430,29 @@ class MemoryTreeInference:
                         float(evidence["priority"].detach().cpu())
                         > self.wake_config.controller_priority_threshold
                     )
-                due = [
-                    request for request in due
-                    if (
+                    allowlist = self.config.write_event_allowlist
+                    request["local_admission_passed"] = bool(
                         (
-                            self.config.write_event_allowlist is not None
-                            and int(request["event_index"])
-                            in self.config.write_event_allowlist
+                            allowlist is not None
+                            and int(request["event_index"]) in allowlist
                         )
                         or (
-                            self.config.write_event_allowlist is None
+                            allowlist is None
                             and self.controller.write_admissible(
-                                request["write_gate"], 0.0,
-                                request["admission_evidence"]["priority"],
+                                request["write_gate"],
+                                0.0,
+                                evidence["priority"],
                                 future_window_complete=True,
-                                priority_threshold=self.wake_config.controller_priority_threshold,
+                                priority_threshold=(
+                                    self.wake_config.controller_priority_threshold
+                                ),
                             )
                         )
                     )
-                ]
-                due.sort(
-                    key=lambda request: float(
-                        request["admission_evidence"]["priority"].detach().cpu()
-                    ), reverse=True,
-                )
-                remaining_budget = min(
-                    4, self.tree.frontier_routing.config.max_writes_per_sequence
-                ) - accepted_write_count
-                for request in due[:remaining_budget]:
-                    request["window_evidence"] = request["admission_evidence"]
-                    self._commit_delayed_write(sequence, request)
-                    request["committed"] = True
-                    accepted_write_requests.append(request)
-                    accepted_write_count += 1
-                    outputs[request["event_index"]].update({
-                        "write_accepted": True,
-                        "write_gate_passed": True,
-                        "write_priority_passed": True,
-                        "write_window_complete": True,
-                        "write_priority": float(
-                            request["admission_evidence"]["priority"].detach().cpu()
-                        ),
-                    })
 
         event_count = int(sequence["times"].numel())
+        probation_validations: list[Dict[str, Any]] = []
+        promotions: list[Dict[str, Any]] = []
         eligible = [
             request
             for request in pending_writes
@@ -1212,8 +1466,16 @@ class MemoryTreeInference:
             ),
             reverse=True,
         )
-        top = ranked[:top_c]
-        remaining = ranked[top_c:]
+        if self.config.write_event_allowlist is not None:
+            allowed_events = set(self.config.write_event_allowlist)
+            top = [
+                request for request in ranked
+                if int(request["event_index"]) in allowed_events
+            ]
+            remaining = []
+        else:
+            top = ranked[:top_c]
+            remaining = ranked[top_c:]
         explored = []
         if self.config.probe_write_counterfactuals and remaining:
             generator = torch.Generator(device="cpu")
@@ -1254,19 +1516,81 @@ class MemoryTreeInference:
                     >= float(self.controller.calibration_thresholds[2])
                 ),
                 "write_utility_passed": bool(
-                    float(request["window_evidence"]["write_utility"]) > 0.0
+                    float(
+                        request["window_evidence"]["write_utility"]
+                        .detach().cpu()
+                    ) > self.wake_config.controller_write_gain_threshold
                 ),
                 "write_beneficial": bool(
-                    float(request["window_evidence"]["write_utility"]) > 0.0
+                    float(
+                        request["window_evidence"]["write_utility"]
+                        .detach().cpu()
+                    ) > 0.0
                 ),
                 "write_priority_passed": bool(
-                    float(request["window_evidence"]["priority"])
+                    float(
+                        request["window_evidence"]["priority"].detach().cpu()
+                    )
                     > self.wake_config.controller_priority_threshold
                 ),
                 "write_window_complete": True,
                 "write_accepted": bool(request.get("committed", False)),
             })
-        if int(self.controller.controller_version.detach().cpu()) < 6:
+        if (
+            self.config.allow_memory_writes
+            and int(self.controller.controller_version.detach().cpu()) >= 6
+        ):
+            probation_validations, promotions = (
+                self._validate_probation_candidates(
+                    sequence,
+                    write_probe_contexts,
+                    sequence_id=source_sequence_id,
+                )
+            )
+            accepted_write_count = len(promotions)
+            if outputs and promotions:
+                outputs[0]["write_promotion_count"] = len(promotions)
+                outputs[0]["promoted_write_tokens"] = [
+                    row["token"] for row in promotions
+                ]
+        if int(self.controller.controller_version.detach().cpu()) >= 6:
+            local_candidates = [
+                request
+                for request in eligible
+                if (
+                    not request.get("write_probe_exploration", False)
+                    and request.get("local_admission_passed", False)
+                    and float(
+                        request["window_evidence"]["write_utility"]
+                        .detach().cpu()
+                    )
+                    > self.wake_config.controller_write_gain_threshold
+                )
+            ]
+            local_candidates.sort(
+                key=lambda request: float(
+                    request["window_evidence"]["priority"].detach().cpu()
+                ),
+                reverse=True,
+            )
+            local_budget = min(
+                4, self.tree.frontier_routing.config.max_writes_per_sequence
+            )
+            for request in local_candidates[:local_budget]:
+                candidate = self._enqueue_probation_candidate(
+                    request,
+                    source_sequence_id=source_sequence_id,
+                )
+                local_accepted_write_count += 1
+                outputs[request["event_index"]].update({
+                    "write_local_accepted": True,
+                    "write_probation_enqueued": True,
+                    "write_probation_token": candidate.token,
+                    # Persistent acceptance is deliberately false until a
+                    # later independent sequence passes the ESS + LCB gate.
+                    "write_accepted": False,
+                })
+        else:
             eligible = [
                 request for request in eligible
                 if not request.get("write_probe_exploration", False)
@@ -1315,6 +1639,15 @@ class MemoryTreeInference:
                 if int(self.controller.controller_version.detach().cpu()) >= 6
                 else len(selected)
             ),
+            "local_accepted_write_count": local_accepted_write_count,
+            "probation_validation_count": sum(
+                bool(row.get("matched", False))
+                for row in probation_validations
+            ),
+            "probation_validations": probation_validations,
+            "promoted_write_count": len(promotions),
+            "promotions": promotions,
+            "probation_size": len(self.write_probation),
             "write_probe_count": sum(
                 bool(event.get("write_probed", False)) for event in outputs
             ),

@@ -79,6 +79,7 @@ def _row(source: int, event: Mapping[str, Any]) -> dict[str, Any]:
         "true_time": float(event["true_time"]),
         "predicted_time": float(event["predicted_time"]),
         "write_accepted": bool(event.get("write_accepted", False)),
+        "write_promotion_count": int(event.get("write_promotion_count", 0)),
     }
 
 
@@ -139,7 +140,13 @@ def paired_rollout_metrics(
     frozen_metrics = aggregate_metrics(frozen, num_types, seed, 1000)
     online_metrics = aggregate_metrics(online, num_types, seed, 1000)
     interval = bootstrap_ci(gains, seed, samples=1000)
-    physical_writes = sum(bool(row.get("write_accepted", False)) for row in online)
+    physical_writes = sum(
+        int(row.get(
+            "write_promotion_count",
+            int(bool(row.get("write_accepted", False))),
+        ))
+        for row in online
+    )
     event_count = max(len(gains), 1)
     gain = sum(gains) / event_count
     lower = float(interval[0]) if interval else float("-inf")

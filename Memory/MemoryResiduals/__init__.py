@@ -13,6 +13,7 @@ from .MemoryBank import (
 )
 from .WorkingMemory import WorkingMemoryAdapter
 from .SimilarityFeatures import local_recurrence_count
+from .ProbationMemory import ProbationCandidate, WriteProbationBuffer
 
 __all__ = [
     "EffectiveHawkesParameters",
@@ -21,11 +22,13 @@ __all__ = [
     "MemoryBank",
     "MemoryItem",
     "MemoryQueryNet",
+    "ProbationCandidate",
     "SmoothSparseRetriever",
     "TreeEpisodicMemory",
     "TreeMemoryRead",
     "UpdateHawkesParameter",
     "WorkingMemoryAdapter",
+    "WriteProbationBuffer",
     "entmax15_1d",
     "local_recurrence_count",
 ]

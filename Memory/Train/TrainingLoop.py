@@ -887,20 +887,9 @@ class TrainingLoopMixin:
                 self.sleep_state["accepted_writes_since_sleep"] = (
                     accepted_writes_since_sleep
                 )
-                self.sleep_state["structural_mass_since_sleep"] = (
-                    float(self.sleep_state.get(
-                        "structural_mass_since_sleep", 0.0
-                    ))
-                    + raw_structural_mass
-                )
-                self.sleep_state[
-                    "structural_observations_since_sleep"
-                ] = (
-                    int(self.sleep_state.get(
-                        "structural_observations_since_sleep", 0
-                    ))
-                    + structural_observations
-                )
+                # Raw p_write*p_split remains a controller diagnostic only.
+                # Topology demand is computed from promoted-memory queue
+                # increments in TrainingSleepMixin._continuous_split_demand.
             topology_prune_enabled = (
                 epoch > self.structure_config.prune_warmup_epochs
             )

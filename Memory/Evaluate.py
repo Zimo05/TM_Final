@@ -318,7 +318,17 @@ def aggregate_metrics(
             bool(row.get("write_window_complete", False)) for row in rows
         ),
         "write_accepted_count": sum(
-            bool(row.get("write_accepted", False)) for row in rows
+            int(row.get(
+                "write_promotion_count",
+                int(bool(row.get("write_accepted", False))),
+            ))
+            for row in rows
+        ),
+        "write_local_accepted_count": sum(
+            bool(row.get("write_local_accepted", False)) for row in rows
+        ),
+        "write_probation_enqueued_count": sum(
+            bool(row.get("write_probation_enqueued", False)) for row in rows
         ),
         "write_retrieved_later_count": sum(
             bool(row.get("write_retrieved_later", False)) for row in rows
@@ -554,6 +564,15 @@ def run_variant(
                 "write_utility": event.get("write_utility"),
                 "write_priority": event.get("write_priority"),
                 "write_accepted": bool(event.get("write_accepted", False)),
+                "write_local_accepted": bool(event.get(
+                    "write_local_accepted", False
+                )),
+                "write_probation_enqueued": bool(event.get(
+                    "write_probation_enqueued", False
+                )),
+                "write_promotion_count": int(event.get(
+                    "write_promotion_count", 0
+                )),
                 "write_probe_propensity": event.get("write_probe_propensity"),
                 "write_probe_top": bool(event.get("write_probe_top", False)),
                 "write_probe_exploration": bool(

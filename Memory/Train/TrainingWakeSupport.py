@@ -1306,49 +1306,14 @@ class TrainingWakeSupportMixin:
         *,
         accepted_tokens: Sequence[tuple[int, int]] = (),
     ) -> None:
-        """Update the Sleep-only rejected-probe buffer.
+        """Discard non-persistent structural probes.
 
-        Entries in this buffer are never installed in ``EpisodicMemory`` and
-        therefore cannot participate in Wake retrieval.  A later physical
-        admission removes the corresponding shadow entry so Split never sees
-        the same probe through both channels.
+        Kept as a checkpoint/call-site compatibility boundary.  Probation or
+        rejected candidates must never become Sleep/Split evidence; only rows
+        promoted into ``EpisodicMemory`` may carry structural weight.
         """
-        buffer = self.sleep_state.setdefault(
-            "structural_evidence_buffer", {}
-        )
-        accepted = set(accepted_tokens)
-        for leaf_records in buffer.values():
-            for token in accepted:
-                leaf_records.pop(token, None)
-
-        for record in records:
-            leaf_id = str(record["owner_id"])
-            token = tuple(record["token"])
-            if token in accepted:
-                continue
-            buffer.setdefault(leaf_id, {})[token] = dict(record)
-
-        capacity = max(
-            4,
-            min(
-                int(self.tree.episodic_memory.capacity_per_node),
-                int(self.sleep_config.deep_evidence_budget),
-            ),
-        )
-        active_leaves = set(self.tree.leaf_ids)
-        for leaf_id in tuple(buffer):
-            if leaf_id not in active_leaves:
-                del buffer[leaf_id]
-                continue
-            leaf_records = buffer[leaf_id]
-            if len(leaf_records) <= capacity:
-                continue
-            retained = sorted(
-                leaf_records.items(),
-                key=lambda pair: float(pair[1]["priority"]),
-                reverse=True,
-            )[:capacity]
-            buffer[leaf_id] = dict(retained)
+        del records, accepted_tokens
+        self.sleep_state["structural_evidence_buffer"] = {}
 
     def _finalize_write_probe_batch(
         self,

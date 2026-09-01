@@ -350,8 +350,8 @@ class TrainingLifecycleMixin:
             "accepted_writes_since_sleep": 0,
             "structural_mass_since_sleep": 0.0,
             "structural_observations_since_sleep": 0,
-            # Rejected write probes used only by Sleep/Split. These items are
-            # deliberately absent from EpisodicMemory and Wake retrieval.
+            # Deprecated checkpoint field. Non-persistent probes are never
+            # consumed by Sleep/Split and this mapping remains empty.
             "structural_evidence_buffer": {},
             "last_memory_count": sum(
                 len(bank)
