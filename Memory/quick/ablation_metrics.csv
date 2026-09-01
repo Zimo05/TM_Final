@@ -1,0 +1,3 @@
+﻿baseline,bootstrap_95ci,comparison,events,improved_event_fraction,mean_nll_gain,median_nll_gain,negative_gain_fraction,retrieval_gain_correlation,target
+semantic_only,"[0.000152490729949652, 0.0002778518604687773]",total_memory_gain,2080,0.4793269230769231,0.00021090515275808196,-2.5540590286254883e-05,0.520673076923077,0.02415752044606836,full_frozen
+full_frozen,"[-1.8466205801814795e-06, 1.144736441067205e-05]",online_vs_frozen_gain,2080,0.4860576923076923,4.592188857853986e-06,0.0,0.47451923076923075,,full_online

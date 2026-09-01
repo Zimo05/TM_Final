@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Continual-learning runner for the Hawkes Memory model.
+#
+# The first task is deliberately a four-stage upstream pipeline:
+#   task_00 CSV -> THP -> Multi-Attention Encoder -> H_tree -> Memory
+# Every later task resumes the previous Memory checkpoint, so the encoder
+# initialization and the online tree/memory/optimizer state are retained.
+# Run from anywhere, for example:
+#   ./Data/CL/run_CL all
+#   EPOCHS=10 DEVICE=cpu ./Data/CL/run_CL task 3
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT"
+CL_DATA_ROOT="${CL_DATA_ROOT:-$SCRIPT_DIR/Data}"
+RUN_NAME="${RUN_NAME:-cl_recurrence}"
+RUN_ROOT="${RUN_ROOT:-$SCRIPT_DIR/runs/$RUN_NAME}"
+
+TASK_COUNT="${TASK_COUNT:-10}"
+EPOCHS="${EPOCHS:-20}"
+COLD_START_EPOCHS="${COLD_START_EPOCHS:-10}"
+THP_EPOCHS="${THP_EPOCHS:-100}"
+ATTENTION_EPOCHS="${ATTENTION_EPOCHS:-50}"
+THP_BATCH_SIZE="${THP_BATCH_SIZE:-64}"
+ATTENTION_BATCH_SIZE="${ATTENTION_BATCH_SIZE:-64}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
+DEVICES="${DEVICES:-0}"
+NUM_EVENT_TYPES="${NUM_EVENT_TYPES:-8}"
+
+MEMTREE_PYTHON="/Users/zimoshen/opt/miniconda3/envs/memTree/bin/python"
+if [[ -n "${PYTHON:-}" ]]; then
+  PYTHON_BIN="$PYTHON"
+elif [[ -x "$MEMTREE_PYTHON" ]]; then
+  PYTHON_BIN="$MEMTREE_PYTHON"
+else
+  PYTHON_BIN="python"
+fi
+
+MEMORY_PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/Memory:$PROJECT_ROOT/MultiAttentionEncoder"
+
+TASK_ZERO_TRAIN="$CL_DATA_ROOT/task_00/train.csv"
+ENCODER_INPUT_DIR="$RUN_ROOT/encoder_input"
+ENCODER_JSON="$ENCODER_INPUT_DIR/task_00_train.json"
+TREE_CSV="$ENCODER_INPUT_DIR/tree_node_sequences.csv"
+SUMMARY_CSV="$ENCODER_INPUT_DIR/sequence_summary.csv"
+THP_OUTPUT_DIR="$RUN_ROOT/thp_checkpoints"
+THP_CHECKPOINT="$THP_OUTPUT_DIR/checkpoint_best.pt"
+THP_TRAIN_LOG="$RUN_ROOT/thp_train.log"
+ENCODED_OUTPUT="$RUN_ROOT/thp_encoded.pt"
+ATTENTION_WEIGHTS="$RUN_ROOT/encoder_weights.pt"
+H_TREE_OUTPUT="$RUN_ROOT/h_tree.pt"
+CHECKPOINT_DIR="$RUN_ROOT/memory_checkpoints"
+LOG_DIR="$RUN_ROOT/logs"
+
+resolve_device() {
+  if [[ -n "${DEVICE:-}" && "$DEVICE" != "auto" ]]; then
+    printf '%s\n' "$DEVICE"
+    return
+  fi
+  if "$PYTHON_BIN" -c 'import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)' >/dev/null 2>&1; then
+    printf 'cuda\n'
+  else
+    printf 'cpu\n'
+  fi
+}
+
+DEVICE_TYPE="$(resolve_device)"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./Data/CL/run_CL prepare          Prepare task_00 inputs for the encoder
+  ./Data/CL/run_CL train-thp        Train the THP upstream encoder
+  ./Data/CL/run_CL encode           Encode task_00 with the trained THP
+  ./Data/CL/run_CL train-attention  Train the Multi-Attention Encoder modules
+  ./Data/CL/run_CL build-h-tree     Produce the initial H-tree embedding
+  ./Data/CL/run_CL task [0-9]       Train one CL task, preserving prior state
+  ./Data/CL/run_CL all               Run upstream stages and tasks 0..9
+  ./Data/CL/run_CL status            Show generated artifacts and checkpoints
+
+Environment overrides:
+  DEVICE=cpu|cuda|auto  DEVICES=0  PYTHON=/path/to/python
+  EPOCHS=20 COLD_START_EPOCHS=10 THP_EPOCHS=100 ATTENTION_EPOCHS=50
+  RUN_NAME=cl_recurrence RUN_ROOT=/path/to/output TASK_COUNT=10
+EOF
+}
+
+require_file() {
+  local path="$1"
+  local hint="${2:-}"
+  if [[ ! -s "$path" ]]; then
+    echo "[Error] Required file is missing or empty: $path" >&2
+    if [[ -n "$hint" ]]; then
+      echo "[Hint] Run: $hint" >&2
+    fi
+    exit 1
+  fi
+}
+
+require_runtime() {
+  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 && [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "[Error] Python executable was not found: $PYTHON_BIN" >&2
+    echo "[Hint] Set PYTHON=/path/to/the/memTree/python." >&2
+    exit 1
+  fi
+  if ! "$PYTHON_BIN" -c 'import torch' >/dev/null 2>&1; then
+    echo "[Error] PyTorch is unavailable in: $PYTHON_BIN" >&2
+    exit 1
+  fi
+}
+
+prepare_encoder_input() {
+  require_runtime
+  require_file "$TASK_ZERO_TRAIN"
+  mkdir -p "$ENCODER_INPUT_DIR"
+  if [[ -s "$ENCODER_JSON" && -s "$TREE_CSV" && -s "$SUMMARY_CSV" && "${FORCE_PREPARE:-0}" != "1" ]]; then
+    echo "[Exists] Reusing Multi-Attention input: $ENCODER_INPUT_DIR"
+    return
+  fi
+  "$PYTHON_BIN" "$SCRIPT_DIR/prepare_encoder_data.py" \
+    --input "$TASK_ZERO_TRAIN" \
+    --output-dir "$ENCODER_INPUT_DIR" \
+    --num-event-types "$NUM_EVENT_TYPES"
+}
+
+run_encoder_stage() {
+  local action="$1"
+  require_runtime
+  prepare_encoder_input
+  env \
+    PYTHON="$PYTHON_BIN" \
+    DEVICES="$DEVICES" \
+    DEVICE_TYPE="$DEVICE_TYPE" \
+    THP_BATCH_SIZE="$THP_BATCH_SIZE" \
+    THP_NUM_WORKERS="$NUM_WORKERS" \
+    THP_EPOCHS="$THP_EPOCHS" \
+    THP_DATA_PARALLEL="${THP_DATA_PARALLEL:-0}" \
+    ATTENTION_BATCH_SIZE="$ATTENTION_BATCH_SIZE" \
+    ATTENTION_EPOCHS="$ATTENTION_EPOCHS" \
+    DATA_PATH="$ENCODER_JSON" \
+    OUTPUT_DIR="$THP_OUTPUT_DIR" \
+    TRAIN_LOG="$THP_TRAIN_LOG" \
+    CHECKPOINT="$THP_CHECKPOINT" \
+    ENCODED_OUTPUT="$ENCODED_OUTPUT" \
+    SUMMARY_CSV="$SUMMARY_CSV" \
+    TREE_CSV="$TREE_CSV" \
+    FINAL_OUTPUT="$H_TREE_OUTPUT" \
+    ATTENTION_WEIGHTS="$ATTENTION_WEIGHTS" \
+    bash "$PROJECT_ROOT/MultiAttentionEncoder/run.sh" "$action"
+}
+
+train_thp() {
+  prepare_encoder_input
+  require_file "$ENCODER_JSON"
+  echo "[CL 1/5] Training THP on task_00 (upstream stage)"
+  run_encoder_stage train
+  require_file "$THP_CHECKPOINT" "./Data/CL/run_CL train-thp"
+  echo "[Done] THP checkpoint: $THP_CHECKPOINT"
+}
+
+encode_task_zero() {
+  prepare_encoder_input
+  require_file "$THP_CHECKPOINT" "./Data/CL/run_CL train-thp"
+  echo "[CL 2/5] Encoding task_00 through THP"
+  run_encoder_stage encode
+  require_file "$ENCODED_OUTPUT" "./Data/CL/run_CL encode"
+  echo "[Done] THP embeddings: $ENCODED_OUTPUT"
+}
+
+train_attention() {
+  prepare_encoder_input
+  require_file "$THP_CHECKPOINT" "./Data/CL/run_CL train-thp"
+  echo "[CL 3/5] Training Multi-Attention Encoder modules"
+  run_encoder_stage train_attention
+  require_file "$ATTENTION_WEIGHTS" "./Data/CL/run_CL train-attention"
+  echo "[Done] Attention weights: $ATTENTION_WEIGHTS"
+}
+
+build_h_tree() {
+  prepare_encoder_input
+  require_file "$THP_CHECKPOINT" "./Data/CL/run_CL train-thp"
+  require_file "$ATTENTION_WEIGHTS" "./Data/CL/run_CL train-attention"
+  echo "[CL 4/5] Building initial H-tree from Multi-Attention output"
+  run_encoder_stage final_encode
+  require_file "$H_TREE_OUTPUT" "./Data/CL/run_CL build-h-tree"
+  echo "[Done] Initial H-tree: $H_TREE_OUTPUT"
+}
+
+task_checkpoint() {
+  printf '%s/%s.pt\n' "$CHECKPOINT_DIR" "$(printf 'task_%02d' "$1")"
+}
+
+task_log() {
+  printf '%s/%s.log\n' "$LOG_DIR" "$(printf 'task_%02d' "$1")"
+}
+
+run_memory_task() {
+  local task_id="$1"
+  local task_dir
+  local current_checkpoint
+  local previous_checkpoint=""
+  task_dir="$CL_DATA_ROOT/task_$(printf '%02d' "$task_id")"
+  current_checkpoint="$(task_checkpoint "$task_id")"
+
+  require_file "$task_dir/train.csv"
+  mkdir -p "$CHECKPOINT_DIR" "$LOG_DIR"
+
+  if (( task_id > 0 )); then
+    previous_checkpoint="$(task_checkpoint "$((task_id - 1))")"
+    require_file "$previous_checkpoint" "./Data/CL/run_CL task $((task_id - 1))"
+  fi
+
+  if [[ -s "$current_checkpoint" && "${SKIP_EXISTING:-0}" == "1" ]]; then
+    echo "[Exists] Skipping task $task_id checkpoint: $current_checkpoint"
+    return
+  fi
+
+  local common_args=(
+    --data-path "$task_dir/train.csv"
+    --checkpoint "$current_checkpoint"
+    --epochs "$EPOCHS"
+    --cold-start-epochs "$COLD_START_EPOCHS"
+    --z-dim 50
+    --node-dim 128
+    --memory-key-dim 64
+    --tree-init-depth 0
+    --num-basis 2
+    --decays 0.5 1.5
+    --semantic-blend 0
+    --frontier-min-experts 2
+    --frontier-budget 7
+    --frontier-exploration 0
+    --route-mix-weight 0
+    --route-posterior-weight 0
+    --route-distill-weight 0.25
+    --route-mi-weight 0.15
+    --route-balance-weight 0.10
+    --route-encoder-warmup-epochs 0
+    --route-encoder-grad-scale 0.08
+    --route-encoder-reliability-decay 0.80
+    --route-teacher-temperature 0.85
+    --light-replay-budget 128
+    --deep-min-interval 3
+    --deep-computation-cost 0.05
+    --deep-prior-probability 0.10
+    --deep-prior-weight 0.01
+    --deep-evidence-budget 32
+    --topology-inertia-strength 0.03
+    --topology-inertia-tau 3.0
+    --training-metrics-path "$CHECKPOINT_DIR/task_$(printf '%02d' "$task_id")_training_metrics.json"
+    --training-plot-path "$CHECKPOINT_DIR/task_$(printf '%02d' "$task_id")_training_curves.png"
+    --device "$DEVICE_TYPE"
+  )
+
+  if (( task_id == 0 )); then
+    common_args+=(
+      --h-tree "$H_TREE_OUTPUT"
+      --sequence-summary "$SUMMARY_CSV"
+      --residual-init-scale "${RESIDUAL_INIT_SCALE:-0.08}"
+      --residual-init-rank "${RESIDUAL_INIT_RANK:-4}"
+    )
+    echo "[CL 5/5] Task 0: injecting Multi-Attention H-tree $H_TREE_OUTPUT"
+  else
+    common_args+=(--resume "$previous_checkpoint")
+    echo "[CL] Task $task_id: resuming Memory state from $previous_checkpoint"
+  fi
+
+  echo "[CL] task=$task_id data=$task_dir/train.csv checkpoint=$current_checkpoint"
+  env \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$MEMORY_PYTHONPATH" \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    CUDA_VISIBLE_DEVICES="$DEVICES" \
+    PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
+    "$PYTHON_BIN" -u -B -m Train.Train "${common_args[@]}" \
+    2>&1 | tee "$(task_log "$task_id")"
+  require_file "$current_checkpoint"
+  echo "[Done] Task $task_id checkpoint: $current_checkpoint"
+}
+
+run_task() {
+  local task_id="${1:-}"
+  if [[ ! "$task_id" =~ ^[0-9]+$ ]]; then
+    echo "[Error] task requires a numeric task id, e.g. './Data/CL/run_CL task 3'." >&2
+    exit 2
+  fi
+  if (( task_id < 0 || task_id >= TASK_COUNT )); then
+    echo "[Error] task id $task_id is outside 0..$((TASK_COUNT - 1))." >&2
+    exit 2
+  fi
+  if (( task_id == 0 )); then
+    build_h_tree
+  fi
+  run_memory_task "$task_id"
+}
+
+run_all() {
+  prepare_encoder_input
+  train_thp
+  encode_task_zero
+  train_attention
+  build_h_tree
+  for (( task_id = 0; task_id < TASK_COUNT; task_id++ )); do
+    run_memory_task "$task_id"
+  done
+}
+
+show_status() {
+  echo "[CL] device=$DEVICE_TYPE run_root=$RUN_ROOT"
+  for path in "$ENCODER_JSON" "$THP_CHECKPOINT" "$ENCODED_OUTPUT" "$ATTENTION_WEIGHTS" "$H_TREE_OUTPUT"; do
+    if [[ -s "$path" ]]; then
+      echo "[Present] $path"
+    else
+      echo "[Missing] $path"
+    fi
+  done
+  if [[ -d "$CHECKPOINT_DIR" ]]; then
+    find "$CHECKPOINT_DIR" -maxdepth 1 -type f -name 'task_*.pt' -print | sort
+  fi
+}
+
+ACTION="${1:-help}"
+case "$ACTION" in
+  prepare)
+    prepare_encoder_input
+    ;;
+  train-thp|train_thp)
+    train_thp
+    ;;
+  encode)
+    encode_task_zero
+    ;;
+  train-attention|train_attention|attention)
+    train_attention
+    ;;
+  build-h-tree|build_h_tree|h-tree|htree)
+    build_h_tree
+    ;;
+  task|train-task)
+    run_task "${2:-}"
+    ;;
+  all)
+    run_all
+    ;;
+  status)
+    show_status
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "[Error] Unknown action: $ACTION" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

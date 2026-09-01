@@ -1,0 +1,613 @@
+[ Epoch 1 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.17661, top3:  0.46958, macro-F1:  0.16653, RMSE:  9.42535, elapse: 0.051 min
+  - (Validation)  loglikelihood: -11.73017, accuracy:  0.20952, top3:  0.52183, macro-F1:  0.20285, RMSE:  9.58440, elapse: 0.003 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 2 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.22825, top3:  0.56181, macro-F1:  0.22500, RMSE:  9.42374, elapse: 0.040 min
+  - (Validation)  loglikelihood: -12.00008, accuracy:  0.25045, top3:  0.59859, macro-F1:  0.24454, RMSE:  9.57947, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 3 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.27372, top3:  0.62632, macro-F1:  0.27165, RMSE:  9.42063, elapse: 0.039 min
+  - (Validation)  loglikelihood: -12.13567, accuracy:  0.29709, top3:  0.65239, macro-F1:  0.29443, RMSE:  9.57792, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 4 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.32765, top3:  0.67850, macro-F1:  0.32627, RMSE:  9.42127, elapse: 0.039 min
+  - (Validation)  loglikelihood: -12.47038, accuracy:  0.35457, top3:  0.70322, macro-F1:  0.35341, RMSE:  9.58041, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 5 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.38565, top3:  0.72182, macro-F1:  0.38519, RMSE:  9.42205, elapse: 0.048 min
+  - (Validation)  loglikelihood: -12.84349, accuracy:  0.41528, top3:  0.73337, macro-F1:  0.41482, RMSE:  9.57633, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 6 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.42788, top3:  0.74386, macro-F1:  0.42771, RMSE:  9.42057, elapse: 0.047 min
+  - (Validation)  loglikelihood: -12.98012, accuracy:  0.44166, top3:  0.74477, macro-F1:  0.44136, RMSE:  9.58070, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 7 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.44560, top3:  0.75136, macro-F1:  0.44549, RMSE:  9.42018, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.08113, accuracy:  0.45379, top3:  0.75025, macro-F1:  0.45342, RMSE:  9.57777, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 8 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.43397, top3:  0.74427, macro-F1:  0.43385, RMSE:  9.42080, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.09906, accuracy:  0.43844, top3:  0.74239, macro-F1:  0.43824, RMSE:  9.58018, elapse: 0.002 min
+
+[ Epoch 9 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.45149, top3:  0.75426, macro-F1:  0.45139, RMSE:  9.41977, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.08208, accuracy:  0.45879, top3:  0.75080, macro-F1:  0.45870, RMSE:  9.57576, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 10 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.45714, top3:  0.75615, macro-F1:  0.45700, RMSE:  9.41948, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.08817, accuracy:  0.46141, top3:  0.75563, macro-F1:  0.46126, RMSE:  9.57645, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 11 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.45884, top3:  0.75819, macro-F1:  0.45874, RMSE:  9.41980, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.04957, accuracy:  0.43877, top3:  0.74570, macro-F1:  0.43853, RMSE:  9.57478, elapse: 0.002 min
+
+[ Epoch 12 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.45981, top3:  0.75933, macro-F1:  0.45969, RMSE:  9.41946, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.14900, accuracy:  0.46387, top3:  0.75616, macro-F1:  0.46350, RMSE:  9.57671, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 13 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.46582, top3:  0.76347, macro-F1:  0.46569, RMSE:  9.42007, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.15906, accuracy:  0.46236, top3:  0.75608, macro-F1:  0.46208, RMSE:  9.57681, elapse: 0.002 min
+
+[ Epoch 14 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.46905, top3:  0.76557, macro-F1:  0.46894, RMSE:  9.41991, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.17045, accuracy:  0.46558, top3:  0.75673, macro-F1:  0.46547, RMSE:  9.57649, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 15 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.46985, top3:  0.76688, macro-F1:  0.46973, RMSE:  9.41898, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.21431, accuracy:  0.46633, top3:  0.75535, macro-F1:  0.46621, RMSE:  9.57392, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 16 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47133, top3:  0.76814, macro-F1:  0.47121, RMSE:  9.41901, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.01215, accuracy:  0.45239, top3:  0.75068, macro-F1:  0.45221, RMSE:  9.57439, elapse: 0.002 min
+
+[ Epoch 17 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.46190, top3:  0.76165, macro-F1:  0.46178, RMSE:  9.41727, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.18796, accuracy:  0.46307, top3:  0.75704, macro-F1:  0.46268, RMSE:  9.57392, elapse: 0.002 min
+
+[ Epoch 18 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.46749, top3:  0.76575, macro-F1:  0.46734, RMSE:  9.41908, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.18671, accuracy:  0.43053, top3:  0.74214, macro-F1:  0.42995, RMSE:  9.57025, elapse: 0.002 min
+
+[ Epoch 19 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.46537, top3:  0.76411, macro-F1:  0.46525, RMSE:  9.41859, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.20871, accuracy:  0.46412, top3:  0.75915, macro-F1:  0.46380, RMSE:  9.57692, elapse: 0.002 min
+
+[ Epoch 20 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47304, top3:  0.76972, macro-F1:  0.47293, RMSE:  9.41883, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.20891, accuracy:  0.46834, top3:  0.75899, macro-F1:  0.46819, RMSE:  9.57682, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 21 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47405, top3:  0.77189, macro-F1:  0.47392, RMSE:  9.41833, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.20352, accuracy:  0.46897, top3:  0.75864, macro-F1:  0.46888, RMSE:  9.57428, elapse: 0.002 min
+  - [Checkpoint] Saved best model → checkpoints/checkpoint_best.pt
+
+[ Epoch 22 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47526, top3:  0.77339, macro-F1:  0.47514, RMSE:  9.41852, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.19288, accuracy:  0.46673, top3:  0.75854, macro-F1:  0.46663, RMSE:  9.57349, elapse: 0.002 min
+
+[ Epoch 23 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.46912, top3:  0.76873, macro-F1:  0.46898, RMSE:  9.41629, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.22917, accuracy:  0.46304, top3:  0.75945, macro-F1:  0.46279, RMSE:  9.57107, elapse: 0.002 min
+
+[ Epoch 24 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47229, top3:  0.77237, macro-F1:  0.47217, RMSE:  9.41636, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.19852, accuracy:  0.46598, top3:  0.75917, macro-F1:  0.46591, RMSE:  9.57247, elapse: 0.002 min
+
+[ Epoch 25 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47471, top3:  0.77429, macro-F1:  0.47459, RMSE:  9.41685, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.21695, accuracy:  0.46528, top3:  0.75932, macro-F1:  0.46506, RMSE:  9.57346, elapse: 0.002 min
+
+[ Epoch 26 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47540, top3:  0.77608, macro-F1:  0.47528, RMSE:  9.41712, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.22281, accuracy:  0.46513, top3:  0.75809, macro-F1:  0.46482, RMSE:  9.57345, elapse: 0.002 min
+
+[ Epoch 27 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47742, top3:  0.77704, macro-F1:  0.47731, RMSE:  9.41750, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.28704, accuracy:  0.46543, top3:  0.75947, macro-F1:  0.46518, RMSE:  9.57521, elapse: 0.002 min
+
+[ Epoch 28 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47865, top3:  0.77760, macro-F1:  0.47852, RMSE:  9.41722, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.23071, accuracy:  0.46693, top3:  0.75736, macro-F1:  0.46677, RMSE:  9.57378, elapse: 0.002 min
+
+[ Epoch 29 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47787, top3:  0.77711, macro-F1:  0.47775, RMSE:  9.41766, elapse: 0.045 min
+  - (Validation)  loglikelihood: -13.28530, accuracy:  0.46442, top3:  0.75874, macro-F1:  0.46410, RMSE:  9.57443, elapse: 0.002 min
+
+[ Epoch 30 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48003, top3:  0.77872, macro-F1:  0.47992, RMSE:  9.41758, elapse: 0.045 min
+  - (Validation)  loglikelihood: -13.28314, accuracy:  0.46789, top3:  0.75950, macro-F1:  0.46764, RMSE:  9.57412, elapse: 0.002 min
+
+[ Epoch 31 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48163, top3:  0.78101, macro-F1:  0.48150, RMSE:  9.41777, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.23755, accuracy:  0.46706, top3:  0.75910, macro-F1:  0.46694, RMSE:  9.57514, elapse: 0.002 min
+
+[ Epoch 32 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48241, top3:  0.78084, macro-F1:  0.48229, RMSE:  9.41810, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.36025, accuracy:  0.46520, top3:  0.75930, macro-F1:  0.46489, RMSE:  9.57084, elapse: 0.002 min
+
+[ Epoch 33 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48381, top3:  0.78376, macro-F1:  0.48370, RMSE:  9.41741, elapse: 0.048 min
+  - (Validation)  loglikelihood: -13.35230, accuracy:  0.46704, top3:  0.75802, macro-F1:  0.46660, RMSE:  9.57483, elapse: 0.002 min
+
+[ Epoch 34 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47880, top3:  0.77856, macro-F1:  0.47867, RMSE:  9.41780, elapse: 0.050 min
+  - (Validation)  loglikelihood: -13.30531, accuracy:  0.46505, top3:  0.75756, macro-F1:  0.46477, RMSE:  9.57440, elapse: 0.002 min
+
+[ Epoch 35 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48480, top3:  0.78305, macro-F1:  0.48467, RMSE:  9.41755, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.38429, accuracy:  0.46696, top3:  0.75857, macro-F1:  0.46677, RMSE:  9.57558, elapse: 0.002 min
+
+[ Epoch 36 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48591, top3:  0.78571, macro-F1:  0.48579, RMSE:  9.41772, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.37293, accuracy:  0.46450, top3:  0.75807, macro-F1:  0.46410, RMSE:  9.57753, elapse: 0.002 min
+
+[ Epoch 37 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48662, top3:  0.78682, macro-F1:  0.48650, RMSE:  9.41810, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.36824, accuracy:  0.46636, top3:  0.75839, macro-F1:  0.46628, RMSE:  9.57448, elapse: 0.002 min
+
+[ Epoch 38 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48813, top3:  0.78845, macro-F1:  0.48800, RMSE:  9.41789, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.39031, accuracy:  0.46450, top3:  0.75741, macro-F1:  0.46423, RMSE:  9.57330, elapse: 0.002 min
+
+[ Epoch 39 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48929, top3:  0.78931, macro-F1:  0.48917, RMSE:  9.41775, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.43629, accuracy:  0.46455, top3:  0.75854, macro-F1:  0.46415, RMSE:  9.57557, elapse: 0.002 min
+
+[ Epoch 40 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.47867, top3:  0.77914, macro-F1:  0.47855, RMSE:  9.41861, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.36022, accuracy:  0.46796, top3:  0.75930, macro-F1:  0.46782, RMSE:  9.57516, elapse: 0.002 min
+
+[ Epoch 41 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48428, top3:  0.78496, macro-F1:  0.48417, RMSE:  9.41847, elapse: 0.048 min
+  - (Validation)  loglikelihood: -13.34045, accuracy:  0.45191, top3:  0.74927, macro-F1:  0.45173, RMSE:  9.57220, elapse: 0.002 min
+
+[ Epoch 42 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48204, top3:  0.78299, macro-F1:  0.48192, RMSE:  9.41740, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.38702, accuracy:  0.46480, top3:  0.75779, macro-F1:  0.46456, RMSE:  9.57404, elapse: 0.002 min
+
+[ Epoch 43 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48387, top3:  0.78515, macro-F1:  0.48374, RMSE:  9.41761, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.41815, accuracy:  0.45867, top3:  0.75452, macro-F1:  0.45857, RMSE:  9.57287, elapse: 0.002 min
+
+[ Epoch 44 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48791, top3:  0.78901, macro-F1:  0.48780, RMSE:  9.41744, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.45733, accuracy:  0.46415, top3:  0.75746, macro-F1:  0.46399, RMSE:  9.57404, elapse: 0.002 min
+
+[ Epoch 45 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49138, top3:  0.79131, macro-F1:  0.49125, RMSE:  9.41788, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.46501, accuracy:  0.46515, top3:  0.75666, macro-F1:  0.46505, RMSE:  9.57492, elapse: 0.002 min
+
+[ Epoch 46 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49273, top3:  0.79346, macro-F1:  0.49262, RMSE:  9.41777, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.54667, accuracy:  0.46256, top3:  0.75691, macro-F1:  0.46217, RMSE:  9.57301, elapse: 0.002 min
+
+[ Epoch 47 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49478, top3:  0.79582, macro-F1:  0.49466, RMSE:  9.41820, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.52680, accuracy:  0.46641, top3:  0.75616, macro-F1:  0.46623, RMSE:  9.57458, elapse: 0.002 min
+
+[ Epoch 48 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49602, top3:  0.79607, macro-F1:  0.49591, RMSE:  9.41761, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.61534, accuracy:  0.46111, top3:  0.75508, macro-F1:  0.46091, RMSE:  9.57476, elapse: 0.002 min
+
+[ Epoch 49 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49068, top3:  0.79241, macro-F1:  0.49057, RMSE:  9.41786, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.45619, accuracy:  0.45643, top3:  0.74975, macro-F1:  0.45626, RMSE:  9.57545, elapse: 0.002 min
+
+[ Epoch 50 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.48937, top3:  0.79053, macro-F1:  0.48926, RMSE:  9.41855, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.49312, accuracy:  0.46073, top3:  0.75450, macro-F1:  0.46057, RMSE:  9.57383, elapse: 0.002 min
+
+[ Epoch 51 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49666, top3:  0.79696, macro-F1:  0.49654, RMSE:  9.41805, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.59058, accuracy:  0.46369, top3:  0.75495, macro-F1:  0.46348, RMSE:  9.57415, elapse: 0.002 min
+
+[ Epoch 52 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49909, top3:  0.79938, macro-F1:  0.49898, RMSE:  9.41816, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.67811, accuracy:  0.46156, top3:  0.75344, macro-F1:  0.46146, RMSE:  9.57496, elapse: 0.002 min
+
+[ Epoch 53 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49377, top3:  0.79531, macro-F1:  0.49366, RMSE:  9.41746, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.60099, accuracy:  0.46191, top3:  0.75399, macro-F1:  0.46173, RMSE:  9.57481, elapse: 0.002 min
+
+[ Epoch 54 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49334, top3:  0.79399, macro-F1:  0.49321, RMSE:  9.41784, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.64141, accuracy:  0.45960, top3:  0.75508, macro-F1:  0.45938, RMSE:  9.57670, elapse: 0.002 min
+
+[ Epoch 55 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.49996, top3:  0.80053, macro-F1:  0.49984, RMSE:  9.41796, elapse: 0.048 min
+  - (Validation)  loglikelihood: -13.63706, accuracy:  0.45879, top3:  0.75289, macro-F1:  0.45864, RMSE:  9.57338, elapse: 0.002 min
+
+[ Epoch 56 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50117, top3:  0.80137, macro-F1:  0.50107, RMSE:  9.41806, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.70890, accuracy:  0.45935, top3:  0.75209, macro-F1:  0.45915, RMSE:  9.57451, elapse: 0.002 min
+
+[ Epoch 57 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50307, top3:  0.80399, macro-F1:  0.50296, RMSE:  9.41791, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.72952, accuracy:  0.45839, top3:  0.75234, macro-F1:  0.45829, RMSE:  9.57426, elapse: 0.002 min
+
+[ Epoch 58 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50525, top3:  0.80496, macro-F1:  0.50515, RMSE:  9.41764, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.77837, accuracy:  0.45884, top3:  0.75028, macro-F1:  0.45872, RMSE:  9.57448, elapse: 0.002 min
+
+[ Epoch 59 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50595, top3:  0.80686, macro-F1:  0.50585, RMSE:  9.41787, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.78860, accuracy:  0.45814, top3:  0.75043, macro-F1:  0.45792, RMSE:  9.57526, elapse: 0.002 min
+
+[ Epoch 60 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50703, top3:  0.80764, macro-F1:  0.50693, RMSE:  9.41801, elapse: 0.041 min
+  - (Validation)  loglikelihood: -13.84191, accuracy:  0.45535, top3:  0.75083, macro-F1:  0.45519, RMSE:  9.57565, elapse: 0.002 min
+
+[ Epoch 61 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50859, top3:  0.80897, macro-F1:  0.50849, RMSE:  9.41771, elapse: 0.038 min
+  - (Validation)  loglikelihood: -13.87306, accuracy:  0.45485, top3:  0.74985, macro-F1:  0.45463, RMSE:  9.57580, elapse: 0.002 min
+
+[ Epoch 62 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50977, top3:  0.80972, macro-F1:  0.50968, RMSE:  9.41787, elapse: 0.045 min
+  - (Validation)  loglikelihood: -13.93684, accuracy:  0.45563, top3:  0.74942, macro-F1:  0.45553, RMSE:  9.57333, elapse: 0.002 min
+
+[ Epoch 63 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51091, top3:  0.81089, macro-F1:  0.51082, RMSE:  9.41771, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.85757, accuracy:  0.45477, top3:  0.74736, macro-F1:  0.45470, RMSE:  9.57565, elapse: 0.002 min
+
+[ Epoch 64 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51107, top3:  0.81129, macro-F1:  0.51097, RMSE:  9.41800, elapse: 0.045 min
+  - (Validation)  loglikelihood: -13.90793, accuracy:  0.45128, top3:  0.74503, macro-F1:  0.45109, RMSE:  9.57554, elapse: 0.002 min
+
+[ Epoch 65 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50720, top3:  0.80718, macro-F1:  0.50709, RMSE:  9.41699, elapse: 0.046 min
+  - (Validation)  loglikelihood: -13.95597, accuracy:  0.45402, top3:  0.74847, macro-F1:  0.45380, RMSE:  9.57497, elapse: 0.002 min
+
+[ Epoch 66 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51135, top3:  0.81183, macro-F1:  0.51127, RMSE:  9.41746, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.95870, accuracy:  0.45457, top3:  0.74824, macro-F1:  0.45440, RMSE:  9.57513, elapse: 0.002 min
+
+[ Epoch 67 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.50389, top3:  0.80544, macro-F1:  0.50379, RMSE:  9.41825, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.91778, accuracy:  0.45550, top3:  0.74761, macro-F1:  0.45535, RMSE:  9.57483, elapse: 0.002 min
+
+[ Epoch 68 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51226, top3:  0.81220, macro-F1:  0.51216, RMSE:  9.41810, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.95412, accuracy:  0.45505, top3:  0.74701, macro-F1:  0.45492, RMSE:  9.57395, elapse: 0.002 min
+
+[ Epoch 69 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51576, top3:  0.81549, macro-F1:  0.51568, RMSE:  9.41756, elapse: 0.047 min
+  - (Validation)  loglikelihood: -13.97968, accuracy:  0.45314, top3:  0.74520, macro-F1:  0.45302, RMSE:  9.57512, elapse: 0.002 min
+
+[ Epoch 70 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51759, top3:  0.81653, macro-F1:  0.51751, RMSE:  9.41752, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.08746, accuracy:  0.45241, top3:  0.74482, macro-F1:  0.45228, RMSE:  9.57466, elapse: 0.002 min
+
+[ Epoch 71 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51925, top3:  0.81815, macro-F1:  0.51916, RMSE:  9.41804, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.13958, accuracy:  0.45141, top3:  0.74289, macro-F1:  0.45131, RMSE:  9.57385, elapse: 0.002 min
+
+[ Epoch 72 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51996, top3:  0.81875, macro-F1:  0.51986, RMSE:  9.41779, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.18921, accuracy:  0.45214, top3:  0.74475, macro-F1:  0.45199, RMSE:  9.57409, elapse: 0.002 min
+
+[ Epoch 73 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51994, top3:  0.81865, macro-F1:  0.51986, RMSE:  9.41764, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.15981, accuracy:  0.44902, top3:  0.74136, macro-F1:  0.44882, RMSE:  9.57616, elapse: 0.002 min
+
+[ Epoch 74 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51509, top3:  0.81563, macro-F1:  0.51499, RMSE:  9.41803, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.14647, accuracy:  0.45156, top3:  0.74389, macro-F1:  0.45144, RMSE:  9.57481, elapse: 0.002 min
+
+[ Epoch 75 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.51987, top3:  0.82051, macro-F1:  0.51979, RMSE:  9.41791, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.22532, accuracy:  0.45141, top3:  0.74166, macro-F1:  0.45125, RMSE:  9.57587, elapse: 0.002 min
+
+[ Epoch 76 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.52219, top3:  0.82058, macro-F1:  0.52210, RMSE:  9.41798, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.26446, accuracy:  0.44945, top3:  0.74256, macro-F1:  0.44925, RMSE:  9.57460, elapse: 0.002 min
+
+[ Epoch 77 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.52409, top3:  0.82260, macro-F1:  0.52400, RMSE:  9.41776, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.28181, accuracy:  0.44907, top3:  0.74382, macro-F1:  0.44896, RMSE:  9.57509, elapse: 0.002 min
+
+[ Epoch 78 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.52634, top3:  0.82427, macro-F1:  0.52627, RMSE:  9.41771, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.34901, accuracy:  0.44920, top3:  0.74204, macro-F1:  0.44911, RMSE:  9.57491, elapse: 0.002 min
+
+[ Epoch 79 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.52683, top3:  0.82474, macro-F1:  0.52675, RMSE:  9.41765, elapse: 0.045 min
+  - (Validation)  loglikelihood: -14.38073, accuracy:  0.44759, top3:  0.74053, macro-F1:  0.44747, RMSE:  9.57470, elapse: 0.002 min
+
+[ Epoch 80 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.52739, top3:  0.82594, macro-F1:  0.52733, RMSE:  9.41758, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.42096, accuracy:  0.44751, top3:  0.73942, macro-F1:  0.44735, RMSE:  9.57415, elapse: 0.002 min
+
+[ Epoch 81 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.52896, top3:  0.82709, macro-F1:  0.52890, RMSE:  9.41759, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.44146, accuracy:  0.44859, top3:  0.73952, macro-F1:  0.44841, RMSE:  9.57545, elapse: 0.002 min
+
+[ Epoch 82 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.52797, top3:  0.82630, macro-F1:  0.52791, RMSE:  9.41766, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.39956, accuracy:  0.44693, top3:  0.73997, macro-F1:  0.44679, RMSE:  9.57386, elapse: 0.002 min
+
+[ Epoch 83 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.52910, top3:  0.82734, macro-F1:  0.52904, RMSE:  9.41759, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.41476, accuracy:  0.44656, top3:  0.73764, macro-F1:  0.44640, RMSE:  9.57353, elapse: 0.002 min
+
+[ Epoch 84 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53145, top3:  0.82863, macro-F1:  0.53138, RMSE:  9.41770, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.48078, accuracy:  0.44618, top3:  0.73824, macro-F1:  0.44602, RMSE:  9.57323, elapse: 0.002 min
+
+[ Epoch 85 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53230, top3:  0.82922, macro-F1:  0.53224, RMSE:  9.41765, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.56749, accuracy:  0.44533, top3:  0.73729, macro-F1:  0.44508, RMSE:  9.57541, elapse: 0.002 min
+
+[ Epoch 86 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53376, top3:  0.83056, macro-F1:  0.53369, RMSE:  9.41761, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.59139, accuracy:  0.44206, top3:  0.73415, macro-F1:  0.44195, RMSE:  9.57480, elapse: 0.002 min
+
+[ Epoch 87 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53400, top3:  0.83131, macro-F1:  0.53392, RMSE:  9.41781, elapse: 0.049 min
+  - (Validation)  loglikelihood: -14.63514, accuracy:  0.44329, top3:  0.73874, macro-F1:  0.44316, RMSE:  9.57486, elapse: 0.002 min
+
+[ Epoch 88 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53537, top3:  0.83133, macro-F1:  0.53530, RMSE:  9.41780, elapse: 0.046 min
+  - (Validation)  loglikelihood: -14.61673, accuracy:  0.44302, top3:  0.73606, macro-F1:  0.44285, RMSE:  9.57462, elapse: 0.002 min
+
+[ Epoch 89 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53625, top3:  0.83231, macro-F1:  0.53620, RMSE:  9.41759, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.69301, accuracy:  0.44166, top3:  0.73651, macro-F1:  0.44148, RMSE:  9.57602, elapse: 0.002 min
+
+[ Epoch 90 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53638, top3:  0.83287, macro-F1:  0.53632, RMSE:  9.41790, elapse: 0.041 min
+  - (Validation)  loglikelihood: -14.66396, accuracy:  0.44073, top3:  0.73427, macro-F1:  0.44054, RMSE:  9.57525, elapse: 0.002 min
+
+[ Epoch 91 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53872, top3:  0.83379, macro-F1:  0.53866, RMSE:  9.41767, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.74300, accuracy:  0.44018, top3:  0.73364, macro-F1:  0.44000, RMSE:  9.57592, elapse: 0.002 min
+
+[ Epoch 92 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53840, top3:  0.83416, macro-F1:  0.53834, RMSE:  9.41768, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.71523, accuracy:  0.44103, top3:  0.73437, macro-F1:  0.44085, RMSE:  9.57501, elapse: 0.002 min
+
+[ Epoch 93 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53909, top3:  0.83578, macro-F1:  0.53903, RMSE:  9.41768, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.79691, accuracy:  0.44035, top3:  0.73397, macro-F1:  0.44016, RMSE:  9.57480, elapse: 0.002 min
+
+[ Epoch 94 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.53998, top3:  0.83584, macro-F1:  0.53992, RMSE:  9.41781, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.78487, accuracy:  0.43844, top3:  0.73332, macro-F1:  0.43825, RMSE:  9.57372, elapse: 0.002 min
+
+[ Epoch 95 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54057, top3:  0.83589, macro-F1:  0.54051, RMSE:  9.41767, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.80410, accuracy:  0.43985, top3:  0.73364, macro-F1:  0.43968, RMSE:  9.57472, elapse: 0.002 min
+
+[ Epoch 96 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54163, top3:  0.83668, macro-F1:  0.54157, RMSE:  9.41759, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.86411, accuracy:  0.43862, top3:  0.73367, macro-F1:  0.43848, RMSE:  9.57532, elapse: 0.002 min
+
+[ Epoch 97 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54210, top3:  0.83770, macro-F1:  0.54205, RMSE:  9.41771, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.89306, accuracy:  0.43802, top3:  0.73231, macro-F1:  0.43786, RMSE:  9.57355, elapse: 0.002 min
+
+[ Epoch 98 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54234, top3:  0.83780, macro-F1:  0.54229, RMSE:  9.41752, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.89105, accuracy:  0.43701, top3:  0.73138, macro-F1:  0.43685, RMSE:  9.57461, elapse: 0.002 min
+
+[ Epoch 99 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54419, top3:  0.83878, macro-F1:  0.54413, RMSE:  9.41777, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.94093, accuracy:  0.43613, top3:  0.73126, macro-F1:  0.43599, RMSE:  9.57471, elapse: 0.002 min
+
+[ Epoch 100 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54512, top3:  0.83941, macro-F1:  0.54508, RMSE:  9.41751, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.90564, accuracy:  0.43693, top3:  0.73146, macro-F1:  0.43677, RMSE:  9.57540, elapse: 0.002 min
+
+[ Epoch 101 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54443, top3:  0.84043, macro-F1:  0.54439, RMSE:  9.41749, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.97810, accuracy:  0.43518, top3:  0.73090, macro-F1:  0.43505, RMSE:  9.57434, elapse: 0.002 min
+
+[ Epoch 102 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54546, top3:  0.84055, macro-F1:  0.54541, RMSE:  9.41744, elapse: 0.047 min
+  - (Validation)  loglikelihood: -14.97222, accuracy:  0.43500, top3:  0.73111, macro-F1:  0.43488, RMSE:  9.57487, elapse: 0.002 min
+
+[ Epoch 103 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54684, top3:  0.84098, macro-F1:  0.54677, RMSE:  9.41772, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.04010, accuracy:  0.43410, top3:  0.73050, macro-F1:  0.43398, RMSE:  9.57432, elapse: 0.002 min
+
+[ Epoch 104 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54813, top3:  0.84117, macro-F1:  0.54807, RMSE:  9.41773, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.06347, accuracy:  0.43490, top3:  0.72967, macro-F1:  0.43470, RMSE:  9.57390, elapse: 0.002 min
+
+[ Epoch 105 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54812, top3:  0.84157, macro-F1:  0.54807, RMSE:  9.41763, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.06061, accuracy:  0.43457, top3:  0.72774, macro-F1:  0.43443, RMSE:  9.57438, elapse: 0.002 min
+
+[ Epoch 106 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54858, top3:  0.84228, macro-F1:  0.54851, RMSE:  9.41753, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.09557, accuracy:  0.43495, top3:  0.72947, macro-F1:  0.43480, RMSE:  9.57468, elapse: 0.002 min
+
+[ Epoch 107 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.54936, top3:  0.84288, macro-F1:  0.54931, RMSE:  9.41751, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.11779, accuracy:  0.43344, top3:  0.72955, macro-F1:  0.43322, RMSE:  9.57408, elapse: 0.002 min
+
+[ Epoch 108 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55005, top3:  0.84294, macro-F1:  0.55000, RMSE:  9.41760, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.17900, accuracy:  0.43236, top3:  0.72892, macro-F1:  0.43225, RMSE:  9.57391, elapse: 0.002 min
+
+[ Epoch 109 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55098, top3:  0.84379, macro-F1:  0.55094, RMSE:  9.41756, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.17474, accuracy:  0.43286, top3:  0.72879, macro-F1:  0.43271, RMSE:  9.57358, elapse: 0.002 min
+
+[ Epoch 110 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55115, top3:  0.84402, macro-F1:  0.55111, RMSE:  9.41749, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.16035, accuracy:  0.43369, top3:  0.72774, macro-F1:  0.43358, RMSE:  9.57471, elapse: 0.002 min
+
+[ Epoch 111 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55140, top3:  0.84444, macro-F1:  0.55135, RMSE:  9.41755, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.21877, accuracy:  0.43291, top3:  0.72721, macro-F1:  0.43282, RMSE:  9.57406, elapse: 0.002 min
+
+[ Epoch 112 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55178, top3:  0.84478, macro-F1:  0.55173, RMSE:  9.41754, elapse: 0.048 min
+  - (Validation)  loglikelihood: -15.20312, accuracy:  0.43216, top3:  0.72656, macro-F1:  0.43198, RMSE:  9.57493, elapse: 0.002 min
+
+[ Epoch 113 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55207, top3:  0.84506, macro-F1:  0.55203, RMSE:  9.41748, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.22915, accuracy:  0.43171, top3:  0.72819, macro-F1:  0.43161, RMSE:  9.57500, elapse: 0.002 min
+
+[ Epoch 114 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55208, top3:  0.84552, macro-F1:  0.55204, RMSE:  9.41770, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.24159, accuracy:  0.43103, top3:  0.72761, macro-F1:  0.43088, RMSE:  9.57429, elapse: 0.002 min
+
+[ Epoch 115 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55198, top3:  0.84539, macro-F1:  0.55192, RMSE:  9.41755, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.24610, accuracy:  0.43103, top3:  0.72734, macro-F1:  0.43091, RMSE:  9.57454, elapse: 0.002 min
+
+[ Epoch 116 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55375, top3:  0.84583, macro-F1:  0.55372, RMSE:  9.41764, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.27218, accuracy:  0.43151, top3:  0.72653, macro-F1:  0.43136, RMSE:  9.57455, elapse: 0.002 min
+
+[ Epoch 117 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55396, top3:  0.84723, macro-F1:  0.55391, RMSE:  9.41755, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.28907, accuracy:  0.42985, top3:  0.72698, macro-F1:  0.42970, RMSE:  9.57479, elapse: 0.002 min
+
+[ Epoch 118 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55462, top3:  0.84654, macro-F1:  0.55458, RMSE:  9.41748, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.29369, accuracy:  0.43045, top3:  0.72683, macro-F1:  0.43030, RMSE:  9.57447, elapse: 0.002 min
+
+[ Epoch 119 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55498, top3:  0.84672, macro-F1:  0.55494, RMSE:  9.41740, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.32506, accuracy:  0.43013, top3:  0.72746, macro-F1:  0.42995, RMSE:  9.57452, elapse: 0.002 min
+
+[ Epoch 120 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55480, top3:  0.84702, macro-F1:  0.55476, RMSE:  9.41758, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.34027, accuracy:  0.42967, top3:  0.72686, macro-F1:  0.42952, RMSE:  9.57455, elapse: 0.002 min
+
+[ Epoch 121 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55487, top3:  0.84751, macro-F1:  0.55483, RMSE:  9.41758, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.31509, accuracy:  0.43083, top3:  0.72648, macro-F1:  0.43066, RMSE:  9.57442, elapse: 0.002 min
+
+[ Epoch 122 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55538, top3:  0.84774, macro-F1:  0.55534, RMSE:  9.41753, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.34954, accuracy:  0.42940, top3:  0.72628, macro-F1:  0.42927, RMSE:  9.57435, elapse: 0.002 min
+
+[ Epoch 123 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55697, top3:  0.84815, macro-F1:  0.55691, RMSE:  9.41751, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.34868, accuracy:  0.42997, top3:  0.72646, macro-F1:  0.42986, RMSE:  9.57446, elapse: 0.002 min
+
+[ Epoch 124 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55708, top3:  0.84760, macro-F1:  0.55705, RMSE:  9.41740, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.36207, accuracy:  0.42930, top3:  0.72593, macro-F1:  0.42913, RMSE:  9.57479, elapse: 0.002 min
+
+[ Epoch 125 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55636, top3:  0.84805, macro-F1:  0.55633, RMSE:  9.41756, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.39258, accuracy:  0.42930, top3:  0.72683, macro-F1:  0.42915, RMSE:  9.57429, elapse: 0.002 min
+
+[ Epoch 126 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55784, top3:  0.84813, macro-F1:  0.55780, RMSE:  9.41748, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.37187, accuracy:  0.42945, top3:  0.72588, macro-F1:  0.42932, RMSE:  9.57450, elapse: 0.002 min
+
+[ Epoch 127 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55717, top3:  0.84852, macro-F1:  0.55713, RMSE:  9.41739, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.38335, accuracy:  0.42940, top3:  0.72533, macro-F1:  0.42926, RMSE:  9.57453, elapse: 0.002 min
+
+[ Epoch 128 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55808, top3:  0.84898, macro-F1:  0.55803, RMSE:  9.41735, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.39543, accuracy:  0.42932, top3:  0.72729, macro-F1:  0.42920, RMSE:  9.57469, elapse: 0.002 min
+
+[ Epoch 129 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55810, top3:  0.84973, macro-F1:  0.55806, RMSE:  9.41754, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.41802, accuracy:  0.43020, top3:  0.72606, macro-F1:  0.43008, RMSE:  9.57443, elapse: 0.002 min
+
+[ Epoch 130 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55875, top3:  0.84946, macro-F1:  0.55872, RMSE:  9.41750, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.41937, accuracy:  0.42920, top3:  0.72611, macro-F1:  0.42905, RMSE:  9.57449, elapse: 0.002 min
+
+[ Epoch 131 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55785, top3:  0.84935, macro-F1:  0.55780, RMSE:  9.41758, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.42136, accuracy:  0.42915, top3:  0.72676, macro-F1:  0.42900, RMSE:  9.57460, elapse: 0.002 min
+
+[ Epoch 132 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55791, top3:  0.84961, macro-F1:  0.55787, RMSE:  9.41761, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.43708, accuracy:  0.42915, top3:  0.72585, macro-F1:  0.42902, RMSE:  9.57457, elapse: 0.002 min
+
+[ Epoch 133 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55875, top3:  0.84958, macro-F1:  0.55872, RMSE:  9.41763, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.43571, accuracy:  0.42942, top3:  0.72555, macro-F1:  0.42928, RMSE:  9.57443, elapse: 0.002 min
+
+[ Epoch 134 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55851, top3:  0.84908, macro-F1:  0.55847, RMSE:  9.41766, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.44382, accuracy:  0.42872, top3:  0.72623, macro-F1:  0.42858, RMSE:  9.57419, elapse: 0.002 min
+
+[ Epoch 135 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55895, top3:  0.85028, macro-F1:  0.55893, RMSE:  9.41746, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.44816, accuracy:  0.42897, top3:  0.72525, macro-F1:  0.42884, RMSE:  9.57445, elapse: 0.002 min
+
+[ Epoch 136 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55908, top3:  0.84948, macro-F1:  0.55904, RMSE:  9.41749, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.44655, accuracy:  0.42920, top3:  0.72548, macro-F1:  0.42906, RMSE:  9.57453, elapse: 0.002 min
+
+[ Epoch 137 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55939, top3:  0.84978, macro-F1:  0.55936, RMSE:  9.41748, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.44970, accuracy:  0.42889, top3:  0.72533, macro-F1:  0.42877, RMSE:  9.57461, elapse: 0.002 min
+
+[ Epoch 138 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55916, top3:  0.85029, macro-F1:  0.55912, RMSE:  9.41770, elapse: 0.049 min
+  - (Validation)  loglikelihood: -15.45266, accuracy:  0.42837, top3:  0.72543, macro-F1:  0.42823, RMSE:  9.57467, elapse: 0.002 min
+
+[ Epoch 139 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55976, top3:  0.85006, macro-F1:  0.55972, RMSE:  9.41769, elapse: 0.050 min
+  - (Validation)  loglikelihood: -15.45776, accuracy:  0.42889, top3:  0.72555, macro-F1:  0.42876, RMSE:  9.57456, elapse: 0.002 min
+
+[ Epoch 140 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55916, top3:  0.85016, macro-F1:  0.55911, RMSE:  9.41755, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.45956, accuracy:  0.42882, top3:  0.72470, macro-F1:  0.42870, RMSE:  9.57450, elapse: 0.002 min
+
+[ Epoch 141 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55943, top3:  0.84991, macro-F1:  0.55941, RMSE:  9.41754, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.46374, accuracy:  0.42869, top3:  0.72480, macro-F1:  0.42856, RMSE:  9.57442, elapse: 0.002 min
+
+[ Epoch 142 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55925, top3:  0.85084, macro-F1:  0.55921, RMSE:  9.41751, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.46413, accuracy:  0.42864, top3:  0.72480, macro-F1:  0.42852, RMSE:  9.57441, elapse: 0.002 min
+
+[ Epoch 143 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55940, top3:  0.85023, macro-F1:  0.55937, RMSE:  9.41746, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.46586, accuracy:  0.42867, top3:  0.72495, macro-F1:  0.42854, RMSE:  9.57441, elapse: 0.002 min
+
+[ Epoch 144 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55922, top3:  0.85018, macro-F1:  0.55918, RMSE:  9.41743, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.46328, accuracy:  0.42884, top3:  0.72487, macro-F1:  0.42872, RMSE:  9.57445, elapse: 0.002 min
+
+[ Epoch 145 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.56033, top3:  0.85038, macro-F1:  0.56029, RMSE:  9.41750, elapse: 0.049 min
+  - (Validation)  loglikelihood: -15.46299, accuracy:  0.42852, top3:  0.72482, macro-F1:  0.42839, RMSE:  9.57451, elapse: 0.002 min
+
+[ Epoch 146 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55997, top3:  0.85044, macro-F1:  0.55994, RMSE:  9.41757, elapse: 0.046 min
+  - (Validation)  loglikelihood: -15.46426, accuracy:  0.42862, top3:  0.72508, macro-F1:  0.42849, RMSE:  9.57451, elapse: 0.002 min
+
+[ Epoch 147 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55952, top3:  0.85044, macro-F1:  0.55948, RMSE:  9.41760, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.46565, accuracy:  0.42854, top3:  0.72500, macro-F1:  0.42842, RMSE:  9.57451, elapse: 0.002 min
+
+[ Epoch 148 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55955, top3:  0.85070, macro-F1:  0.55950, RMSE:  9.41743, elapse: 0.048 min
+  - (Validation)  loglikelihood: -15.46574, accuracy:  0.42862, top3:  0.72505, macro-F1:  0.42849, RMSE:  9.57450, elapse: 0.002 min
+
+[ Epoch 149 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.56045, top3:  0.85080, macro-F1:  0.56042, RMSE:  9.41760, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.46582, accuracy:  0.42867, top3:  0.72505, macro-F1:  0.42854, RMSE:  9.57450, elapse: 0.002 min
+
+[ Epoch 150 ]
+  - (Training)    loglikelihood:  0.00000, accuracy:  0.55985, top3:  0.85050, macro-F1:  0.55982, RMSE:  9.41752, elapse: 0.047 min
+  - (Validation)  loglikelihood: -15.46583, accuracy:  0.42867, top3:  0.72497, macro-F1:  0.42854, RMSE:  9.57450, elapse: 0.002 min

@@ -1,0 +1,30 @@
+Using device: cuda
+DataFrame shape: (1300, 3)
+Columns: ['event_times', 'event_types', 'cluster']
+加载了 1300 个序列
+检测到 8 种事件类型: [0, 1, 2, 3, 4, 5, 6, 7]
+第一个序列长度: 80
+[Hawkes Cold Start][001/005] train_nll/event=4.329365 val_nll/event=3.929863 max_grad=1.8302
+[Hawkes Cold Start][002/005] train_nll/event=3.517812 val_nll/event=3.414127 max_grad=0.7399
+[Hawkes Cold Start][003/005] train_nll/event=3.161782 val_nll/event=3.164692 max_grad=0.3878
+[Hawkes Cold Start][004/005] train_nll/event=2.983574 val_nll/event=3.044560 max_grad=0.2385
+[Hawkes Cold Start][005/005] train_nll/event=2.897385 val_nll/event=2.989479 max_grad=0.1816
+[Hawkes Cold Start] checkpoint saved to /home/xinye/Hawkes-Memory/HawkesMemory/checkpoints/hawkes_backbone_init.pt
+[Hawkes Cold Start] spectral_radius=0.695644, min_mu=9.087375e-03
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/xinye/Hawkes-Memory/HawkesMemory/Memory/Train/Train.py", line 26, in <module>
+    main()
+  File "/home/xinye/Hawkes-Memory/HawkesMemory/Memory/Train/TrainingCLI.py", line 945, in main
+    mapped = initialize_tree_from_h_tree_file(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/xinye/Hawkes-Memory/HawkesMemory/Memory/AttentionEncoderAdapter.py", line 225, in initialize_tree_from_h_tree_file
+    return initialize_node_embeddings_from_h_tree(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/xinye/.local/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/xinye/Hawkes-Memory/HawkesMemory/Memory/AttentionEncoderAdapter.py", line 183, in initialize_node_embeddings_from_h_tree
+    raise ValueError(
+ValueError: tree.node_dim=1213 must equal H_tree dim=128; set --node-dim to the encoder d_model

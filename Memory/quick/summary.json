@@ -1,0 +1,441 @@
+{
+  "checkpoint": "/home/xinye/HawkesMemory_wfy/Memory/Checkpoints/dws_13_controller_v3_e10_s42.pt",
+  "data_path": "/home/xinye/HawkesMemory_wfy/Data/tree_13/hawkes_dataset_13.csv",
+  "data_sha256": "f5f4a866b1b503b56f0d8466836581b19028a27cbc556ca9c3c792e00dae0824",
+  "split_seed": 42,
+  "test_source_indices": [
+    3,
+    4,
+    117,
+    118,
+    200,
+    202,
+    306,
+    307,
+    401,
+    404,
+    515,
+    516,
+    609,
+    610,
+    702,
+    713,
+    802,
+    811,
+    900,
+    909,
+    1000,
+    1004,
+    1104,
+    1105,
+    1201,
+    1202
+  ],
+  "type_map": {
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+    "6": 6,
+    "7": 7
+  },
+  "variants": {
+    "semantic_only": {
+      "events": 2080,
+      "sequences": 26,
+      "nll_per_event": 2.7377638746563417,
+      "nll_bootstrap_95ci": [
+        2.484173919270352,
+        2.9833553671456268
+      ],
+      "sequence_macro_nll": 2.7377638746563417,
+      "perplexity": 15.452392947074118,
+      "local_time_mae": 5.295504151707372,
+      "local_time_rmse": 10.065015166362297,
+      "local_time_median_ae": 0.770294189453125,
+      "memory_hit_fraction": 0.0,
+      "mean_retrieval_alpha_mass": 0.0,
+      "mean_retrieval_alpha_per_visited_node": 0.0,
+      "mean_retrieval_effective_k": 0.0,
+      "mean_retrieval_null_alpha": 0.0,
+      "mean_episodic_residual_norm": 0.0,
+      "accuracy": 0.25769230769230766,
+      "error_rate": 0.7423076923076923,
+      "top3_accuracy": 0.5870192307692308,
+      "macro_f1": 0.2573788442209121,
+      "micro_f1": 0.25769230769230766,
+      "cross_entropy": 1.8807907090966944,
+      "brier_score": 0.8175759246384741,
+      "ece_10bin": 0.028835672935327666,
+      "confusion_matrix": [
+        [
+          127,
+          24,
+          12,
+          24,
+          46,
+          20,
+          11,
+          13
+        ],
+        [
+          98,
+          59,
+          17,
+          25,
+          28,
+          29,
+          18,
+          21
+        ],
+        [
+          94,
+          14,
+          46,
+          30,
+          30,
+          7,
+          14,
+          28
+        ],
+        [
+          93,
+          22,
+          15,
+          58,
+          34,
+          5,
+          9,
+          9
+        ],
+        [
+          102,
+          16,
+          11,
+          16,
+          75,
+          8,
+          12,
+          19
+        ],
+        [
+          77,
+          18,
+          10,
+          14,
+          26,
+          59,
+          17,
+          28
+        ],
+        [
+          83,
+          26,
+          27,
+          25,
+          25,
+          5,
+          30,
+          15
+        ],
+        [
+          103,
+          4,
+          5,
+          25,
+          14,
+          16,
+          7,
+          82
+        ]
+      ],
+      "elapsed_seconds": 34.779536572285,
+      "events_per_second": 59.80528221464295
+    },
+    "full_frozen": {
+      "events": 2080,
+      "sequences": 26,
+      "nll_per_event": 2.7375529695035836,
+      "nll_bootstrap_95ci": [
+        2.4839368431824433,
+        2.983144582906747
+      ],
+      "sequence_macro_nll": 2.737552969503584,
+      "perplexity": 15.449134301423795,
+      "local_time_mae": 5.295540632443646,
+      "local_time_rmse": 10.065160163303407,
+      "local_time_median_ae": 0.7698593139648438,
+      "memory_hit_fraction": 1.0,
+      "mean_retrieval_alpha_mass": 9.549999961314294,
+      "mean_retrieval_alpha_per_visited_node": 1.8046302566899697,
+      "mean_retrieval_effective_k": 62.855288461538464,
+      "mean_retrieval_null_alpha": 0.0,
+      "mean_episodic_residual_norm": 0.005742765446820368,
+      "accuracy": 0.25817307692307695,
+      "error_rate": 0.741826923076923,
+      "top3_accuracy": 0.5860576923076923,
+      "macro_f1": 0.257785128933609,
+      "micro_f1": 0.25817307692307695,
+      "cross_entropy": 1.8805705817798926,
+      "brier_score": 0.8175173557790391,
+      "ece_10bin": 0.02913059645260755,
+      "confusion_matrix": [
+        [
+          127,
+          23,
+          12,
+          24,
+          46,
+          20,
+          12,
+          13
+        ],
+        [
+          98,
+          59,
+          17,
+          25,
+          28,
+          29,
+          18,
+          21
+        ],
+        [
+          94,
+          14,
+          46,
+          31,
+          29,
+          7,
+          14,
+          28
+        ],
+        [
+          93,
+          22,
+          15,
+          58,
+          34,
+          5,
+          9,
+          9
+        ],
+        [
+          101,
+          16,
+          11,
+          16,
+          76,
+          8,
+          12,
+          19
+        ],
+        [
+          77,
+          18,
+          10,
+          14,
+          26,
+          59,
+          17,
+          28
+        ],
+        [
+          83,
+          26,
+          27,
+          25,
+          25,
+          5,
+          30,
+          15
+        ],
+        [
+          103,
+          4,
+          5,
+          24,
+          14,
+          17,
+          7,
+          82
+        ]
+      ],
+      "elapsed_seconds": 43.807315866462886,
+      "events_per_second": 47.48065383280796
+    },
+    "full_online": {
+      "events": 2080,
+      "sequences": 26,
+      "nll_per_event": 2.7375483773147256,
+      "nll_bootstrap_95ci": [
+        2.4839273148798378,
+        2.983147921795115
+      ],
+      "sequence_macro_nll": 2.7375483773147256,
+      "perplexity": 15.449063356244286,
+      "local_time_mae": 5.2954700970520765,
+      "local_time_rmse": 10.06509201293736,
+      "local_time_median_ae": 0.7698440551757812,
+      "memory_hit_fraction": 1.0,
+      "mean_retrieval_alpha_mass": 9.54999971429889,
+      "mean_retrieval_alpha_per_visited_node": 1.8046302075801426,
+      "mean_retrieval_effective_k": 26.29423076923077,
+      "mean_retrieval_null_alpha": 0.0,
+      "mean_episodic_residual_norm": 0.005399313449575297,
+      "accuracy": 0.25817307692307695,
+      "error_rate": 0.741826923076923,
+      "top3_accuracy": 0.5865384615384616,
+      "macro_f1": 0.257785128933609,
+      "micro_f1": 0.25817307692307695,
+      "cross_entropy": 1.8805673907968519,
+      "brier_score": 0.8175166021239849,
+      "ece_10bin": 0.029127315969134742,
+      "confusion_matrix": [
+        [
+          127,
+          23,
+          12,
+          24,
+          46,
+          20,
+          12,
+          13
+        ],
+        [
+          98,
+          59,
+          17,
+          25,
+          28,
+          29,
+          18,
+          21
+        ],
+        [
+          94,
+          14,
+          46,
+          31,
+          29,
+          7,
+          14,
+          28
+        ],
+        [
+          93,
+          22,
+          15,
+          58,
+          34,
+          5,
+          9,
+          9
+        ],
+        [
+          101,
+          16,
+          11,
+          16,
+          76,
+          8,
+          12,
+          19
+        ],
+        [
+          77,
+          18,
+          10,
+          14,
+          26,
+          59,
+          17,
+          28
+        ],
+        [
+          83,
+          26,
+          27,
+          25,
+          25,
+          5,
+          30,
+          15
+        ],
+        [
+          103,
+          4,
+          5,
+          24,
+          14,
+          17,
+          7,
+          82
+        ]
+      ],
+      "elapsed_seconds": 49.67772859800607,
+      "events_per_second": 41.86986922915565
+    }
+  },
+  "ablations": [
+    {
+      "comparison": "total_memory_gain",
+      "baseline": "semantic_only",
+      "target": "full_frozen",
+      "events": 2080,
+      "mean_nll_gain": 0.00021090515275808196,
+      "median_nll_gain": -2.5540590286254883e-05,
+      "improved_event_fraction": 0.4793269230769231,
+      "negative_gain_fraction": 0.520673076923077,
+      "bootstrap_95ci": [
+        0.000152490729949652,
+        0.0002778518604687773
+      ],
+      "retrieval_gain_correlation": 0.02415752044606836
+    },
+    {
+      "comparison": "online_vs_frozen_gain",
+      "baseline": "full_frozen",
+      "target": "full_online",
+      "events": 2080,
+      "mean_nll_gain": 4.592188857853986e-06,
+      "median_nll_gain": 0.0,
+      "improved_event_fraction": 0.4860576923076923,
+      "negative_gain_fraction": 0.47451923076923075,
+      "bootstrap_95ci": [
+        -1.8466205801814795e-06,
+        1.144736441067205e-05
+      ]
+    }
+  ],
+  "tree": {
+    "node_count": 15,
+    "leaf_count": 8,
+    "max_depth": 7,
+    "mean_leaf_depth": 4.375,
+    "leaf_depth_std": 2.117634293262177,
+    "owner_entropy": 2.0568126195067826,
+    "normalized_owner_entropy": 0.8018920972156566,
+    "effective_owner_count": 7.821001532034788,
+    "owner_top1_share": 0.22596153846153846,
+    "unvisited_leaf_fraction": 0.25,
+    "total_memory_rows": 552,
+    "internal_memory_rows": 459,
+    "leaf_memory_rows": 93,
+    "mean_branch_size_imbalance": 0.5091836734693878,
+    "mean_leaf_semantic_distance": 31.365258744784764,
+    "min_leaf_semantic_distance": 4.4327311515808105
+  },
+  "routing_labels": {
+    "available": true,
+    "sequence_count": 26,
+    "owner_purity": 0.3076923076923077,
+    "nmi": 0.6345721069444085,
+    "ari": 0.18050234142188165
+  },
+  "checkpoint_history_epochs": 10,
+  "note": "Memory/Controller held-out split; the reused upstream H-tree was built from full data.",
+  "warnings": []
+}

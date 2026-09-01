@@ -1,0 +1,219 @@
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import sys
+from pathlib import Path
+
+_TRANSFORMER_DIR = str(Path(__file__).resolve().parent)
+if _TRANSFORMER_DIR not in sys.path:
+    sys.path.insert(0, _TRANSFORMER_DIR)
+from TransformerModel import Constants
+from TransformerModel.Layers import EncoderLayer
+
+
+def get_non_pad_mask(seq):
+    """ Get the non-padding positions. """
+
+    assert seq.dim() == 2
+    return seq.ne(Constants.PAD).type(torch.float).unsqueeze(-1)
+
+
+def get_attn_key_pad_mask(seq_k, seq_q):
+    """ For masking out the padding part of key sequence. """
+
+    # expand to fit the shape of key query attention matrix
+    len_q = seq_q.size(1)
+    padding_mask = seq_k.eq(Constants.PAD)
+    padding_mask = padding_mask.unsqueeze(1).expand(-1, len_q, -1)  # b x lq x lk
+    return padding_mask
+
+
+def get_subsequent_mask(seq):
+    """ For masking out the subsequent info, i.e., masked self-attention. """
+
+    sz_b, len_s = seq.size()
+    subsequent_mask = torch.triu(
+        torch.ones((len_s, len_s), device=seq.device, dtype=torch.uint8), diagonal=1)
+    subsequent_mask = subsequent_mask.unsqueeze(0).expand(sz_b, -1, -1)  # b x ls x ls
+    return subsequent_mask
+
+
+class Encoder(nn.Module):
+    """ A encoder model with self attention mechanism. """
+
+    def __init__(
+            self,
+            num_types, d_model, d_inner,
+            n_layers, n_head, d_k, d_v, dropout):
+        super().__init__()
+
+        self.d_model = d_model
+
+        # position vector, used for temporal encoding
+        # Registered as buffer so it auto-moves with model.to(device)
+        pos_vec = torch.tensor(
+            [math.pow(10000.0, 2.0 * (i // 2) / d_model) for i in range(d_model)]
+        )
+        self.register_buffer("position_vec", pos_vec)
+
+        # event type embedding
+        self.event_emb = nn.Embedding(num_types + 1, d_model, padding_idx=Constants.PAD)
+
+        self.layer_stack = nn.ModuleList([
+            EncoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout, normalize_before=False)
+            for _ in range(n_layers)])
+
+    def temporal_enc(self, time, non_pad_mask):
+        """
+        Input: batch*seq_len.
+        Output: batch*seq_len*d_model.
+        """
+
+        result = time.unsqueeze(-1) / self.position_vec
+        result[:, :, 0::2] = torch.sin(result[:, :, 0::2])
+        result[:, :, 1::2] = torch.cos(result[:, :, 1::2])
+        return result * non_pad_mask
+
+    def forward(self, event_type, event_time, non_pad_mask, extra_input=None):
+        """ Encode event sequences via masked self-attention. """
+
+        # prepare attention masks
+        # slf_attn_mask is where we cannot look, i.e., the future and the padding
+        slf_attn_mask_subseq = get_subsequent_mask(event_type)
+        slf_attn_mask_keypad = get_attn_key_pad_mask(seq_k=event_type, seq_q=event_type)
+        slf_attn_mask_keypad = slf_attn_mask_keypad.type_as(slf_attn_mask_subseq)
+        slf_attn_mask = (slf_attn_mask_keypad + slf_attn_mask_subseq).gt(0)
+
+        tem_enc = self.temporal_enc(event_time, non_pad_mask)
+        enc_output = self.event_emb(event_type) + tem_enc
+        if extra_input is not None:
+            enc_output = enc_output + extra_input * non_pad_mask
+
+        for enc_layer in self.layer_stack:
+            enc_output, _ = enc_layer(
+                enc_output,
+                non_pad_mask=non_pad_mask,
+                slf_attn_mask=slf_attn_mask)
+        return enc_output
+
+
+class RNN_layers(nn.Module):
+    """
+    Optional recurrent layers. This is inspired by the fact that adding
+    recurrent layers on top of the Transformer helps language modeling.
+    """
+
+    def __init__(self, d_model, d_rnn):
+        super().__init__()
+
+        self.rnn = nn.LSTM(d_model, d_rnn, num_layers=1, batch_first=True)
+        self.projection = nn.Linear(d_rnn, d_model)
+
+    def forward(self, data, non_pad_mask):
+        lengths = non_pad_mask.squeeze(2).long().sum(1).cpu()
+        pack_enc_output = nn.utils.rnn.pack_padded_sequence(
+            data, lengths, batch_first=True, enforce_sorted=False)
+        temp = self.rnn(pack_enc_output)[0]
+        out = nn.utils.rnn.pad_packed_sequence(temp, batch_first=True)[0]
+
+        out = self.projection(out)
+        return out
+
+
+class MultiAttenEncoder(nn.Module):
+    """ A sequence to sequence model with attention mechanism. """
+
+    def __init__(
+            self,
+            num_types, d_model=256, d_rnn=128, d_inner=1024,
+            n_layers=4, n_head=4, d_k=64, d_v=64, dropout=0.1,
+            use_time_gap=True):
+        super().__init__()
+
+        self.encoder = Encoder(
+            num_types=num_types,
+            d_model=d_model,
+            d_inner=d_inner,
+            n_layers=n_layers,
+            n_head=n_head,
+            d_k=d_k,
+            d_v=d_v,
+            dropout=dropout,
+        )
+
+        self.num_types = num_types
+        self.use_time_gap = use_time_gap
+
+        # Hawkes dynamics depend strongly on elapsed time. Absolute-time
+        # sinusoidal encoding alone does not expose short inter-event gaps
+        # cleanly, so encode log(1 + gap) and add it to the event input.
+        self.gap_proj = (
+            nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
+            if use_time_gap
+            else None
+        )
+
+        # convert hidden vectors into a scalar
+        self.linear = nn.Linear(d_model, num_types)
+
+        # parameter for the weight of time difference
+        self.alpha = nn.Parameter(torch.tensor(-0.1))
+
+        # Unconstrained parameter. Utils converts it to a positive softplus
+        # scale before evaluating the intensity.
+        self.beta = nn.Parameter(torch.tensor(0.5413248546))
+
+        # OPTIONAL recurrent layer, this sometimes helps
+        self.rnn = RNN_layers(d_model, d_rnn)
+
+        # Project hidden state to predicted time gap (single scalar per position)
+        self.time_proj = nn.Linear(d_model, 1)
+
+    @staticmethod
+    def derive_time_gap(event_time):
+        """Derive non-negative inter-event gaps from cumulative event times."""
+        time_gap = torch.zeros_like(event_time)
+        time_gap[:, 0] = event_time[:, 0].clamp_min(0.0)
+        time_gap[:, 1:] = (event_time[:, 1:] - event_time[:, :-1]).clamp_min(0.0)
+        return time_gap
+
+    def forward(self, event_type, event_time, time_gap=None):
+        """
+        Return the hidden representations and predictions.
+        For a sequence (l_1, l_2, ..., l_N), we predict (l_2, ..., l_N, l_{N+1}).
+        Input: event_type: batch*seq_len;
+               event_time: batch*seq_len.
+        Output:
+            enc_output:      [B, L, d_model]  hidden representations
+            type_prediction: [B, L, num_types] raw type logits
+            time_prediction: [B, L, 1]         predicted time gaps (positive via softplus)
+        """
+
+        non_pad_mask = get_non_pad_mask(event_type)
+
+        gap_feature = None
+        if self.gap_proj is not None:
+            if time_gap is None:
+                time_gap = self.derive_time_gap(event_time)
+            gap_feature = self.gap_proj(torch.log1p(time_gap.clamp_min(0.0)).unsqueeze(-1))
+        enc_output = self.encoder(
+            event_type,
+            event_time,
+            non_pad_mask,
+            extra_input=gap_feature,
+        )
+        enc_output = self.rnn(enc_output, non_pad_mask)
+
+        # Type prediction: raw logits for each position
+        type_pred = self.linear(enc_output)                     # [B, L, num_types]
+
+        # Time gap prediction: ensure positivity with softplus
+        time_pred = F.softplus(self.time_proj(enc_output))     # [B, L, 1]
+
+        return enc_output, (type_pred, time_pred)

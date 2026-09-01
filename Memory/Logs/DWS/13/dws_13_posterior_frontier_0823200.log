@@ -1,0 +1,7 @@
+Using device: cuda
+DataFrame shape: (1300, 3)
+Columns: ['event_times', 'event_types', 'cluster']
+加载了 1300 个序列
+检测到 8 种事件类型: [0, 1, 2, 3, 4, 5, 6, 7]
+第一个序列长度: 80
+[Hawkes Cold Start][001/005] train_nll/event=4.329365 val_nll/event=3.929863 max_grad=1.8302
