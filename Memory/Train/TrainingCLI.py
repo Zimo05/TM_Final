@@ -67,15 +67,25 @@ def _parse_args():
     parser.add_argument("--cold-start-epochs", type=int, default=5)
     parser.add_argument(
         "--prototype-duplicate-threshold", type=float, default=0.98,
-        help="Law-key cosine at which a persistent prototype is refreshed in place.",
+        help=(
+            "Cold-start duplicate cosine prior; mode-local Q90 distances take "
+            "over after calibration."
+        ),
     )
     parser.add_argument(
         "--prototype-mode-threshold", type=float, default=0.90,
-        help="Law-key cosine at which a residual belongs to an existing dynamics mode.",
+        help=(
+            "Cold-start dynamics cosine prior; mode-local Q95 distances take "
+            "over after calibration."
+        ),
     )
     parser.add_argument(
         "--prototype-mode-capacity", type=int, default=12,
         help="Maximum high-resolution prototypes retained per active dynamics mode.",
+    )
+    parser.add_argument(
+        "--prototype-context-alias-capacity", type=int, default=3,
+        help="Maximum retrieval/context aliases retained per law prototype.",
     )
     parser.add_argument(
         "--count-similarity-low",
@@ -1405,6 +1415,7 @@ def main() -> None:
             prototype_duplicate_threshold=args.prototype_duplicate_threshold,
             prototype_mode_threshold=args.prototype_mode_threshold,
             prototype_mode_capacity=args.prototype_mode_capacity,
+            prototype_context_alias_capacity=args.prototype_context_alias_capacity,
             lambda_route_mi=args.route_mi_weight,
             lambda_route_posterior=args.route_posterior_weight,
             lambda_route_distill=args.route_distill_weight,

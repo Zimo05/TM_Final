@@ -446,6 +446,7 @@ def run_variant(
     resume_partial: bool = False,
     prototype_duplicate_threshold: float | None = None,
     prototype_mode_threshold: float | None = None,
+    prototype_context_alias_capacity: int | None = None,
 ) -> tuple[list[dict], MemoryTreeInference, float]:
     settings = VARIANTS[variant]
     inference = MemoryTreeInference.from_checkpoint(
@@ -461,6 +462,7 @@ def run_variant(
             write_probe_seed=42,
             prototype_duplicate_threshold=prototype_duplicate_threshold,
             prototype_mode_threshold=prototype_mode_threshold,
+            prototype_context_alias_capacity=prototype_context_alias_capacity,
         ),
     )
     if not settings["episodic"]:
@@ -637,6 +639,7 @@ def preflight_checkpoint(
     device: str | None,
     prototype_duplicate_threshold: float | None = None,
     prototype_mode_threshold: float | None = None,
+    prototype_context_alias_capacity: int | None = None,
 ) -> None:
     """Exercise one causal sequence before starting expensive ablations."""
     inference = MemoryTreeInference.from_checkpoint(
@@ -648,6 +651,7 @@ def preflight_checkpoint(
             update_memory_usage=False,
             prototype_duplicate_threshold=prototype_duplicate_threshold,
             prototype_mode_threshold=prototype_mode_threshold,
+            prototype_context_alias_capacity=prototype_context_alias_capacity,
         ),
     )
     result = inference.run_sequence(sequence)
@@ -1405,6 +1409,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--prototype-duplicate-threshold", type=float, default=None)
     parser.add_argument("--prototype-mode-threshold", type=float, default=None)
+    parser.add_argument(
+        "--prototype-context-alias-capacity", type=int, default=None,
+        help="Override the number of retrieval/context aliases per law prototype.",
+    )
     parser.add_argument("--max-test-sequences", type=int, default=None)
     parser.add_argument("--split-manifest", type=Path, default=None)
     parser.add_argument("--quick-per-cluster", type=int, default=None)
@@ -1494,6 +1502,7 @@ def main() -> None:
         args.device,
         args.prototype_duplicate_threshold,
         args.prototype_mode_threshold,
+        args.prototype_context_alias_capacity,
     )
     print("[Preflight] passed")
     variants = args.variants
@@ -1520,6 +1529,7 @@ def main() -> None:
                 inference_config=InferenceConfig(
                     prototype_duplicate_threshold=args.prototype_duplicate_threshold,
                     prototype_mode_threshold=args.prototype_mode_threshold,
+                    prototype_context_alias_capacity=args.prototype_context_alias_capacity,
                 ),
             )
             elapsed = 0.0
@@ -1530,6 +1540,7 @@ def main() -> None:
                 resume_partial=args.resume,
                 prototype_duplicate_threshold=args.prototype_duplicate_threshold,
                 prototype_mode_threshold=args.prototype_mode_threshold,
+                prototype_context_alias_capacity=args.prototype_context_alias_capacity,
             )
             completed_path.write_text(json.dumps(_jsonable(rows)), encoding="utf-8")
         all_rows[variant] = rows
@@ -1622,6 +1633,7 @@ def main() -> None:
             args.device,
             prototype_duplicate_threshold=args.prototype_duplicate_threshold,
             prototype_mode_threshold=args.prototype_mode_threshold,
+            prototype_context_alias_capacity=args.prototype_context_alias_capacity,
         )
         expected_frozen_sha = frozen_event_sha256(base_rows)
         expected_frozen_sources = actual_frozen_sources

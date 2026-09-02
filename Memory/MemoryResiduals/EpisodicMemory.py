@@ -63,6 +63,16 @@ class TreeEpisodicMemory(nn.Module):
             "retention_usage_weight": 0.5,
             "retention_stale_weight": 1.0,
             "retention_age_weight": 0.1,
+            "adaptive_history_size": 64,
+            "adaptive_min_samples": 8,
+            "duplicate_quantile": 0.90,
+            "mode_quantile": 0.95,
+            "radius_margin": 1e-3,
+            "gain_quantile": 0.95,
+            "gain_ema_decay": 0.8,
+            "gain_confirmation_min_count": 2,
+            "gain_floor": 0.0,
+            "context_alias_capacity": 3,
         }
         self.query_net = (
             MemoryQueryNet(input_dim=query_input_dim, key_dim=key_dim)
@@ -107,7 +117,11 @@ class TreeEpisodicMemory(nn.Module):
         """Make module.to(...) move dynamic memory tensors as well."""
         super()._apply(fn)
         for bank in self.banks.values():
+            bank._ensure_prototype_state()
             bank.keys = fn(bank.keys)
+            bank.context_keys = fn(bank.context_keys)
+            bank.context_valid = fn(bank.context_valid)
+            bank.context_support = fn(bank.context_support)
             bank.deltas = fn(bank.deltas)
             bank.write_quality = fn(bank.write_quality)
             bank.queue_weight = fn(bank.queue_weight)
@@ -136,8 +150,8 @@ class TreeEpisodicMemory(nn.Module):
                         "hawkes_interval_stats",
                     ):
                         cached = getattr(window, cache_name, None)
-                    if cached is not None:
-                        setattr(window, cache_name, fn(cached))
+                        if cached is not None:
+                            setattr(window, cache_name, fn(cached))
         self._packed_mirror_signature = None
         self._packed_mirror = None
         return self
@@ -159,12 +173,16 @@ class TreeEpisodicMemory(nn.Module):
             if bank is None:
                 rows.append((node_id, None))
                 continue
+            bank._ensure_prototype_state()
             rows.append((
                 node_id,
                 id(bank),
                 len(bank),
                 bank._age_reference_clock,
                 self._tensor_state_signature(bank.keys),
+                self._tensor_state_signature(bank.context_keys),
+                self._tensor_state_signature(bank.context_valid),
+                self._tensor_state_signature(bank.context_support),
                 self._tensor_state_signature(bank.deltas),
                 self._tensor_state_signature(bank.write_quality),
                 self._tensor_state_signature(bank.usage),
@@ -210,6 +228,21 @@ class TreeEpisodicMemory(nn.Module):
             ),
         )
         keys = reference.new_zeros(node_count, capacity, self.key_dim)
+        max_aliases = max(
+            (int(getattr(self.banks[node_id], "context_alias_capacity", 3))
+             for node_id in node_ids if node_id in self.banks),
+            default=3,
+        )
+        context_keys = reference.new_zeros(
+            node_count, capacity, max_aliases, self.key_dim
+        )
+        context_valid = torch.zeros(
+            node_count, capacity, max_aliases,
+            dtype=torch.bool, device=reference.device,
+        )
+        context_support = reference.new_zeros(
+            node_count, capacity, max_aliases
+        )
         deltas = reference.new_zeros(node_count, capacity, self.param_dim)
         quality = reference.new_zeros(node_count, capacity)
         usage = reference.new_zeros(node_count, capacity)
@@ -231,6 +264,10 @@ class TreeEpisodicMemory(nn.Module):
                 continue
             width = len(bank)
             keys[node_index, :width] = bank.keys[:width]
+            alias_width = int(bank.context_alias_capacity)
+            context_keys[node_index, :width, :alias_width] = bank.context_keys[:width]
+            context_valid[node_index, :width, :alias_width] = bank.context_valid[:width]
+            context_support[node_index, :width, :alias_width] = bank.context_support[:width]
             deltas[node_index, :width] = bank.deltas[:width]
             quality[node_index, :width] = bank.write_quality[:width]
             usage[node_index, :width] = bank.usage[:width]
@@ -239,6 +276,9 @@ class TreeEpisodicMemory(nn.Module):
             valid[node_index, :width] = True
         self._packed_mirror = {
             "keys": keys,
+            "context_keys": context_keys,
+            "context_valid": context_valid,
+            "context_support": context_support,
             "deltas": deltas,
             "quality": quality,
             "usage": usage,
@@ -331,6 +371,8 @@ class TreeEpisodicMemory(nn.Module):
         semantic_theta: Optional[Tensor] = None,
         decays: Optional[Tensor] = None,
         law_key: Optional[Tensor] = None,
+        prediction_gain: Optional[float | Tensor] = None,
+        force_new_mode_confirmation: bool = False,
     ) -> Dict[str, int | float | str]:
         bank = self.get_bank(node_id)
         # A newly written item must have age zero at the current event clock,
@@ -358,6 +400,8 @@ class TreeEpisodicMemory(nn.Module):
             window=window,
             write_quality=write_quality,
             queue_weight=queue_weight,
+            prediction_gain=prediction_gain,
+            force_new_mode_confirmation=force_new_mode_confirmation,
             law_key=law_key,
             law_key_builder=law_key_builder,
         )
@@ -373,6 +417,7 @@ class TreeEpisodicMemory(nn.Module):
         semantic_theta: Optional[Tensor] = None,
         decays: Optional[Tensor] = None,
         law_keys: Optional[Tensor] = None,
+        prediction_gain: Optional[float | Tensor] = None,
     ) -> list[Dict[str, int | float | str]]:
         """Batch node-local memory writes before touching the persistent bank."""
         bank = self.get_bank(node_id)
@@ -400,6 +445,7 @@ class TreeEpisodicMemory(nn.Module):
             windows=windows,
             write_quality=write_quality,
             queue_weight=queue_weight,
+            prediction_gain=prediction_gain,
             law_keys=law_keys,
             law_key_builder=law_key_builder,
         )
@@ -435,6 +481,7 @@ class TreeEpisodicMemory(nn.Module):
                 raise ValueError(
                     f"query is on {query.device}, memory bank is on {bank.device}"
                 )
+            bank._ensure_prototype_state()
             active_node_ids.append(node_id)
             active_banks.append(bank)
 
@@ -459,6 +506,36 @@ class TreeEpisodicMemory(nn.Module):
                     torch.nn.functional.pad(
                         getattr(bank, attribute),
                         (0, 0, 0, max_width - len(bank)),
+                    )
+                    for bank in active_banks
+                ],
+                dim=0,
+            )
+
+        max_aliases = max(
+            int(bank.context_alias_capacity) for bank in active_banks
+        )
+
+        def pad_context_keys() -> Tensor:
+            return torch.stack(
+                [
+                    torch.nn.functional.pad(
+                        bank.context_keys,
+                        (0, 0, 0, max_aliases - bank.context_alias_capacity,
+                         0, max_width - len(bank)),
+                    )
+                    for bank in active_banks
+                ],
+                dim=0,
+            )
+
+        def pad_context_valid() -> Tensor:
+            return torch.stack(
+                [
+                    torch.nn.functional.pad(
+                        bank.context_valid,
+                        (0, max_aliases - bank.context_alias_capacity,
+                         0, max_width - len(bank)),
                     )
                     for bank in active_banks
                 ],
@@ -493,7 +570,7 @@ class TreeEpisodicMemory(nn.Module):
         )
         batched_delta, batched_info = self.retriever.forward_batched(
             query=query.reshape(1, -1).expand(row_count, -1),
-            keys=pad_matrix("keys"),
+            keys=pad_context_keys(),
             deltas=pad_matrix("deltas"),
             usage=pad_vector("usage"),
             age=age,
@@ -514,6 +591,7 @@ class TreeEpisodicMemory(nn.Module):
                 ])
             ),
             null_logit=null_logit,
+            context_valid=pad_context_valid(),
         )
 
         vector_fields = (
@@ -601,6 +679,8 @@ class TreeEpisodicMemory(nn.Module):
             if null_logit is None:
                 raise ValueError("null_logit is required with keep_gate")
         keys = mirror["keys"]
+        context_keys = mirror["context_keys"]
+        context_valid = mirror["context_valid"]
         deltas = mirror["deltas"]
         quality = mirror["quality"]
         usage = mirror["usage"]
@@ -619,6 +699,8 @@ class TreeEpisodicMemory(nn.Module):
             valid.index_select(0, flat_nodes)
             & node_mask.reshape(-1, 1)
         )
+        gathered_context_valid = context_valid.index_select(0, flat_nodes)
+        gathered_context_valid = gathered_context_valid & node_mask.reshape(-1, 1, 1)
         flat_query = query[:, None, :].expand(
             -1, node_indices.size(1), -1
         ).reshape(-1, self.key_dim)
@@ -626,6 +708,7 @@ class TreeEpisodicMemory(nn.Module):
         active_rows = torch.nonzero(active, as_tuple=False).flatten()
         active_nodes = flat_nodes.index_select(0, active_rows)
         active_valid = gathered_valid.index_select(0, active_rows)
+        active_context_valid = gathered_context_valid.index_select(0, active_rows)
         flat_delta = query.new_zeros(
             flat_query.size(0), self.param_dim
         )
@@ -641,7 +724,7 @@ class TreeEpisodicMemory(nn.Module):
         # the zero-row, synchronization-free path while halving that peak.
         retrieved, retrieval_info = self.retriever.forward_batched(
             query=flat_query.index_select(0, active_rows),
-            keys=keys.index_select(0, active_nodes),
+            keys=context_keys.index_select(0, active_nodes),
             # Keep the large [node, capacity, param] residual mirror shared.
             # ``active_nodes`` tells the retriever which bank each visit uses,
             # avoiding a multi-GiB [visit, capacity, param] materialization.
@@ -657,6 +740,7 @@ class TreeEpisodicMemory(nn.Module):
                 else keep_gate.index_select(0, active_nodes)
             ),
             null_logit=null_logit,
+            context_valid=active_context_valid,
         )
         flat_delta = flat_delta.index_copy(0, active_rows, retrieved)
         alpha.index_copy_(0, active_rows, retrieval_info["alpha"])
@@ -720,16 +804,23 @@ class TreeEpisodicMemory(nn.Module):
             raise ValueError("invalid novelty/count hyperparameters")
 
         mirror = self._packed_bank_mirror(node_ids, query)
-        keys = mirror["keys"].index_select(0, node_indices)
+        keys = mirror["context_keys"].index_select(0, node_indices)
+        context_valid = mirror["context_valid"].index_select(0, node_indices)
         valid = mirror["valid"].index_select(0, node_indices)
         normalized_query = F.normalize(query, dim=-1)
         normalized_keys = F.normalize(keys, dim=-1)
-        similarity = torch.einsum(
-            "bcd,bd->bc",
+        alias_similarity = torch.einsum(
+            "bckd,bd->bck",
             normalized_keys,
             normalized_query,
         )
-        logits = temperature * similarity
+        similarity = alias_similarity.masked_fill(
+            ~context_valid, -torch.inf
+        ).max(dim=-1).values
+        similarity_clean = torch.where(
+            valid, similarity, torch.zeros_like(similarity)
+        )
+        logits = temperature * similarity_clean
         row_has_memory = valid.any(dim=-1)
         safe_logits = logits.masked_fill(~valid, -torch.inf)
         safe_logits = torch.where(
@@ -739,7 +830,7 @@ class TreeEpisodicMemory(nn.Module):
         )
         beta = F.softmax(safe_logits, dim=-1) * valid.to(logits.dtype)
         beta = beta / beta.sum(dim=-1, keepdim=True).clamp_min(eps)
-        weighted_similarity = (beta * similarity).sum(dim=-1)
+        weighted_similarity = (beta * similarity_clean).sum(dim=-1)
         weighted_similarity = torch.where(
             row_has_memory,
             weighted_similarity,
@@ -748,7 +839,7 @@ class TreeEpisodicMemory(nn.Module):
         novelty = (1.0 - weighted_similarity) / 2.0
 
         normalized_count, _ = local_recurrence_count(
-            similarity,
+            similarity_clean,
             valid_mask=valid,
             similarity_low=count_similarity_low,
             similarity_high=count_similarity_high,
@@ -1027,13 +1118,38 @@ class TreeEpisodicMemory(nn.Module):
         """Read one bank with an appended ephemeral row and no state mutation."""
         bank = self.banks.get(node_id)
         if bank is None or len(bank) == 0:
-            keys = key.reshape(1, -1).to(query)
+            alias_capacity = int(self._prototype_policy.get("context_alias_capacity", 3))
+            context_keys = query.new_zeros(1, alias_capacity, self.key_dim)
+            context_keys[0, 0] = F.normalize(key.reshape(1, -1).to(query), dim=-1)
+            context_valid = torch.zeros(
+                1, alias_capacity, dtype=torch.bool, device=query.device
+            )
+            context_valid[0, 0] = True
             deltas = delta.reshape(1, -1).to(query)
             usage = query.new_tensor([float(torch.as_tensor(virtual_usage))])
             age = query.new_tensor([float(torch.as_tensor(virtual_age))])
             qualities = query.new_tensor([float(torch.as_tensor(write_quality))])
         else:
-            keys = torch.cat([bank.keys.to(query), key.reshape(1, -1).to(query)], 0)
+            bank._ensure_prototype_state()
+            context_keys = torch.cat(
+                [
+                    bank.context_keys.to(query),
+                    query.new_zeros(1, bank.context_alias_capacity, self.key_dim),
+                ],
+                0,
+            )
+            context_keys[-1, 0] = F.normalize(key.reshape(1, -1).to(query), dim=-1)
+            context_valid = torch.cat(
+                [
+                    bank.context_valid.to(query.device),
+                    torch.zeros(
+                        1, bank.context_alias_capacity,
+                        dtype=torch.bool, device=query.device,
+                    ),
+                ],
+                0,
+            )
+            context_valid[-1, 0] = True
             deltas = torch.cat([bank.deltas.to(query), delta.reshape(1, -1).to(query)], 0)
             usage = torch.cat([
                 bank.usage.to(query), query.new_tensor([float(torch.as_tensor(virtual_usage))])
@@ -1047,7 +1163,8 @@ class TreeEpisodicMemory(nn.Module):
                 query.new_tensor([float(torch.as_tensor(write_quality))]),
             ])
         return self.retriever(
-            query=query, keys=keys, deltas=deltas, usage=usage, age=age,
+            query=query, keys=context_keys, context_valid=context_valid,
+            deltas=deltas, usage=usage, age=age,
             write_quality=qualities,
         )
 
@@ -1068,11 +1185,16 @@ class TreeEpisodicMemory(nn.Module):
         bank = self.banks.get(node_id)
         if bank is None or len(bank) == 0:
             return query.new_zeros(self.param_dim), {}
+        bank._ensure_prototype_state()
         normalized_key = F.normalize(key.detach().reshape(1, -1).to(bank.keys), dim=-1)
         candidate_delta = delta.detach().reshape(1, -1).to(bank.deltas)
-        matches = torch.isclose(
-            bank.keys, normalized_key, rtol=1e-5, atol=1e-7
-        ).all(dim=-1) & torch.isclose(
+        alias_matches = torch.isclose(
+            bank.context_keys,
+            normalized_key.unsqueeze(1),
+            rtol=1e-5,
+            atol=1e-7,
+        ).all(dim=-1) & bank.context_valid
+        matches = alias_matches.any(dim=-1) & torch.isclose(
             bank.deltas, candidate_delta, rtol=1e-5, atol=1e-7
         ).all(dim=-1)
         indices = torch.nonzero(matches, as_tuple=False).flatten()
@@ -1088,7 +1210,8 @@ class TreeEpisodicMemory(nn.Module):
             }
         result, info = self.retriever(
             query=query,
-            keys=bank.keys[keep].to(query),
+            keys=bank.context_keys[keep].to(query),
+            context_valid=bank.context_valid[keep].to(query.device),
             deltas=bank.deltas[keep].to(query),
             usage=bank.usage[keep].to(query),
             age=bank.effective_age(self._age_clock)[keep].to(query),
@@ -1100,9 +1223,14 @@ class TreeEpisodicMemory(nn.Module):
 
     def get_extra_state(self):
         """Save effective ages so checkpoints remain format-compatible."""
+        for bank in self.banks.values():
+            bank._ensure_prototype_state()
         return {
             node_id: {
                 "keys": bank.keys.detach().cpu(),
+                "context_keys": bank.context_keys.detach().cpu(),
+                "context_valid": bank.context_valid.detach().cpu(),
+                "context_support": bank.context_support.detach().cpu(),
                 "deltas": bank.deltas.detach().cpu(),
                 "write_quality": bank.write_quality.detach().cpu(),
                 "queue_weight": bank.queue_weight.detach().cpu(),
@@ -1113,6 +1241,22 @@ class TreeEpisodicMemory(nn.Module):
                 "mode_ids": bank.mode_ids.detach().cpu(),
                 "mode_compressed": bank.mode_compressed.detach().cpu(),
                 "next_mode_id": int(bank._next_mode_id),
+                "adaptive_state": {
+                    "duplicate_distances": {
+                        int(mode): list(values)
+                        for mode, values in bank._mode_duplicate_distances.items()
+                    },
+                    "mode_distances": {
+                        int(mode): list(values)
+                        for mode, values in bank._mode_distances.items()
+                    },
+                    "normal_gains": {
+                        int(mode): list(values)
+                        for mode, values in bank._mode_normal_gains.items()
+                    },
+                    "pending_gain_ema": dict(bank._mode_pending_gain_ema),
+                    "pending_gain_count": dict(bank._mode_pending_gain_count),
+                },
                 "usage": bank.usage.detach().cpu(),
                 "cycle_usage": bank.cycle_usage.detach().cpu(),
                 "stale_cycles": bank.stale_cycles.detach().cpu(),
@@ -1134,11 +1278,47 @@ class TreeEpisodicMemory(nn.Module):
         # Stored ages are already effective at checkpoint time; rebasing the
         # logical clock to zero preserves all future age differences.
         self._age_clock = 0
+        # A short-lived intermediate checkpoint format stored context aliases
+        # but not the tree-level prototype policy.  Recover a consistent
+        # alias width for future banks when every serialized bank agrees.
+        has_stored_policy = any(
+            isinstance(bank_state, Mapping)
+            and "prototype_policy" in bank_state
+            for bank_state in state.values()
+        )
+        if not has_stored_policy:
+            stored_widths = {
+                int(bank_state["context_keys"].size(1))
+                for bank_state in state.values()
+                if isinstance(bank_state, Mapping)
+                and torch.is_tensor(bank_state.get("context_keys"))
+                and bank_state["context_keys"].ndim == 3
+                and bank_state["context_keys"].size(-1) == self.key_dim
+            }
+            if len(stored_widths) == 1:
+                self._prototype_policy["context_alias_capacity"] = stored_widths.pop()
         for node_id, bank_state in state.items():
             bank = self.get_bank(node_id)
+            if "prototype_policy" in bank_state:
+                self._prototype_policy.update(bank_state["prototype_policy"])
+                # The bank is empty at this point, so a checkpoint can
+                # legitimately restore a different alias capacity.
+                bank.configure_prototype_policy(**self._prototype_policy)
             bank.keys = bank_state["keys"].to(self.device)
             bank.deltas = bank_state["deltas"].to(self.device)
             memory_count = bank_state["keys"].shape[0]
+            stored_context_keys = bank_state.get("context_keys")
+            if stored_context_keys is not None:
+                stored_context_keys = stored_context_keys.to(self.device)
+                if stored_context_keys.ndim == 3 and stored_context_keys.size(-1) == self.key_dim:
+                    bank.context_alias_capacity = int(stored_context_keys.size(1))
+                    bank.context_keys = stored_context_keys
+            stored_context_valid = bank_state.get("context_valid")
+            if stored_context_valid is not None:
+                bank.context_valid = stored_context_valid.to(self.device)
+            stored_context_support = bank_state.get("context_support")
+            if stored_context_support is not None:
+                bank.context_support = stored_context_support.to(self.device)
             bank.write_quality = bank_state.get(
                 "write_quality",
                 torch.ones(memory_count),
@@ -1166,9 +1346,29 @@ class TreeEpisodicMemory(nn.Module):
                 "mode_compressed", torch.zeros(memory_count, dtype=torch.bool)
             ).to(self.device)
             bank._next_mode_id = int(bank_state.get("next_mode_id", memory_count))
-            if "prototype_policy" in bank_state:
-                self._prototype_policy.update(bank_state["prototype_policy"])
-                bank.configure_prototype_policy(**self._prototype_policy)
+            adaptive_state = bank_state.get("adaptive_state", {})
+            bank._mode_duplicate_distances = {
+                int(mode): [float(value) for value in values]
+                for mode, values in adaptive_state.get(
+                    "duplicate_distances", {}
+                ).items()
+            }
+            bank._mode_distances = {
+                int(mode): [float(value) for value in values]
+                for mode, values in adaptive_state.get("mode_distances", {}).items()
+            }
+            bank._mode_normal_gains = {
+                int(mode): [float(value) for value in values]
+                for mode, values in adaptive_state.get("normal_gains", {}).items()
+            }
+            bank._mode_pending_gain_ema = {
+                int(mode): float(value)
+                for mode, value in adaptive_state.get("pending_gain_ema", {}).items()
+            }
+            bank._mode_pending_gain_count = {
+                int(mode): int(value)
+                for mode, value in adaptive_state.get("pending_gain_count", {}).items()
+            }
             bank.usage = bank_state["usage"].to(self.device)
             # Backward-compatible defaults for checkpoints written before
             # cycle-level pruning state was introduced.
@@ -1185,3 +1385,5 @@ class TreeEpisodicMemory(nn.Module):
                 int(bank_state.get("capacity", self.capacity_per_node)),
                 int(memory_count),
             )
+            bank._ensure_prototype_state()
+            bank._invalidate_fixed_storage()

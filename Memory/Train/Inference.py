@@ -43,6 +43,7 @@ class InferenceConfig:
     write_probe_seed: int = 42
     prototype_duplicate_threshold: Optional[float] = None
     prototype_mode_threshold: Optional[float] = None
+    prototype_context_alias_capacity: Optional[int] = None
     # Local Write acceptance only creates an invisible probation candidate.
     # Persistent admission requires reuse evidence from independent sequences.
     probation_capacity: int = 1024
@@ -123,6 +124,11 @@ class MemoryTreeInference:
                 else self.config.prototype_mode_threshold
             ),
             mode_capacity=self.wake_config.prototype_mode_capacity,
+            context_alias_capacity=(
+                self.wake_config.prototype_context_alias_capacity
+                if self.config.prototype_context_alias_capacity is None
+                else self.config.prototype_context_alias_capacity
+            ),
         )
         self.tree.episodic_memory.rebuild_law_keys(
             self.tree.semantic_theta,
@@ -732,6 +738,7 @@ class MemoryTreeInference:
                         queue_weight=request["queue_weight"],
                         semantic_theta=self.tree.semantic_theta(owner_id).detach(),
                         decays=self.hawkes.decays.detach(),
+                        force_new_mode_confirmation=True,
                     )
                     request["_physical_probe_memory"] = treatment_memory
                     request["_physical_probe_clock"] = original_clock
@@ -814,6 +821,7 @@ class MemoryTreeInference:
                 raise RuntimeError("write evidence is missing its residual candidate")
             item.write_quality = float(evidence["bounded_gain"].detach().cpu())
             item.queue_weight = float(request["queue_weight"])
+            item.prediction_gain = float(evidence["write_gain"].detach().cpu())
             records.append((owner_id, item))
 
         grouped_items = {}
@@ -821,7 +829,7 @@ class MemoryTreeInference:
             grouped_items.setdefault(owner_id, []).append(item)
         for owner_id, owner_items in grouped_items.items():
             reference = owner_items[0].key
-            self.tree.episodic_memory.add_memory_batch(
+            admission = self.tree.episodic_memory.add_memory_batch(
                 owner_id,
                 torch.stack([
                     item.key.reshape(-1).to(
@@ -844,11 +852,17 @@ class MemoryTreeInference:
                     device=reference.device,
                     dtype=reference.dtype,
                 ),
+                prediction_gain=torch.as_tensor(
+                    [item.prediction_gain for item in owner_items],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
                 semantic_theta=self.tree.semantic_theta(owner_id).detach(),
                 decays=self.hawkes.decays.detach(),
             )
-        for owner_id, item in records:
-            self.controller.split_queues[owner_id] += item.queue_weight
+            for item, result in zip(owner_items, admission):
+                if result["action"] != "queue":
+                    self.controller.split_queues[owner_id] += item.queue_weight
 
     def _enqueue_probation_candidate(
         self,
@@ -1067,13 +1081,14 @@ class MemoryTreeInference:
         # synchronizations, while the metadata report below retains the
         # original global order.
         grouped_promotions = {}
+        admission_by_token: Dict[Any, Dict[str, Any]] = {}
         for candidate, quality in promotable:
             grouped_promotions.setdefault(candidate.owner_id, []).append(
                 (candidate, quality)
             )
         for owner_id, owner_candidates in grouped_promotions.items():
             reference = owner_candidates[0][0].key
-            self.tree.episodic_memory.add_memory_batch(
+            admission = self.tree.episodic_memory.add_memory_batch(
                 owner_id,
                 torch.stack([
                     candidate.key.reshape(-1).to(
@@ -1098,11 +1113,23 @@ class MemoryTreeInference:
                     device=reference.device,
                     dtype=reference.dtype,
                 ),
+                prediction_gain=torch.as_tensor(
+                    [candidate.gain_mean for candidate, _ in owner_candidates],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
                 semantic_theta=self.tree.semantic_theta(owner_id).detach(),
                 decays=self.hawkes.decays.detach(),
             )
+            for (candidate, _), result in zip(owner_candidates, admission):
+                admission_by_token[candidate.token] = result
 
         for candidate, quality in promotable:
+            admission = admission_by_token[candidate.token]
+            if admission["action"] == "queue":
+                # Keep the independently validated candidate in probation;
+                # a later recurrence supplies the persistence confirmation.
+                continue
             # This is the sole probation-to-Split bridge. Before promotion the
             # candidate is absent from both the bank and the trigger queue.
             self.controller.split_queues[
@@ -1288,11 +1315,18 @@ class MemoryTreeInference:
                     alpha = info.get("alpha")
                     if item is None or bank is None or alpha is None or not len(bank):
                         continue
-                    key = item.key.to(bank.keys)
+                    bank._ensure_prototype_state()
+                    key = F.normalize(
+                        item.key.to(bank.context_keys).reshape(1, -1), dim=-1
+                    ).reshape(-1)
                     delta = item.delta_theta.to(bank.deltas)
-                    matches = torch.isclose(
-                        bank.keys, key.unsqueeze(0), rtol=1e-5, atol=1e-7
-                    ).all(dim=-1) & torch.isclose(
+                    alias_matches = torch.isclose(
+                        bank.context_keys,
+                        key.unsqueeze(0).unsqueeze(1),
+                        rtol=1e-5,
+                        atol=1e-7,
+                    ).all(dim=-1) & bank.context_valid
+                    matches = alias_matches.any(dim=-1) & torch.isclose(
                         bank.deltas, delta.unsqueeze(0), rtol=1e-5, atol=1e-7
                     ).all(dim=-1)
                     indices = torch.nonzero(matches, as_tuple=False).flatten()

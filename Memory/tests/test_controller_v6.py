@@ -133,6 +133,9 @@ class ControllerV6Tests(unittest.TestCase):
         first_delta = torch.ones(6)
         second_delta = -torch.ones(6)
         memory.add_memory("root", first_key, first_delta, write_quality=0.8)
+        # A law-radius outlier is queued once for prediction confirmation
+        # before it is allowed to create a new dynamics mode.
+        memory.add_memory("root", second_key, second_delta, write_quality=0.9)
         memory.add_memory("root", second_key, second_delta, write_quality=0.9)
         bank = memory.banks["root"]
         before = {

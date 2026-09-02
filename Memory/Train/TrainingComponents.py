@@ -126,6 +126,9 @@ class WakeObjectiveConfig:
     prototype_duplicate_threshold: float = 0.98
     prototype_mode_threshold: float = 0.90
     prototype_mode_capacity: int = 12
+    # Number of independent context/retrieval aliases retained per physical
+    # law prototype.  Three is the small default used by Dual Identity.
+    prototype_context_alias_capacity: int = 3
     # Deprecated threshold-controller fields retained so old YAML/checkpoints
     # still deserialize. The sequential controller no longer branches on them.
     write_surrogate_temperature: float = 0.25

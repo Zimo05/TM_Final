@@ -6,12 +6,69 @@ from MemoryResiduals.EpisodicMemory import TreeEpisodicMemory
 from MemoryResiduals.MemoryBank import (
     EventWindow,
     MemoryBank,
+    SmoothSparseRetriever,
     effective_hawkes_law_key,
 )
 from Sleep.Split import SplitModule
 
 
 class PrototypeMemoryTests(unittest.TestCase):
+    def test_duplicate_context_aliases_use_online_redundancy(self):
+        bank = MemoryBank(device="cpu", key_dim=4, param_dim=2, capacity=8)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.98,
+            mode_threshold=0.90,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=1,
+            context_alias_capacity=3,
+        )
+        basis = torch.eye(4)
+        for key in (basis[0], basis[0], basis[1]):
+            bank.add(
+                key,
+                torch.zeros(2),
+                law_key=basis[0],
+                prediction_gain=1.0,
+                force_new_mode_confirmation=True,
+            )
+        result = bank.add(
+            basis[2],
+            torch.zeros(2),
+            law_key=basis[0],
+            prediction_gain=1.0,
+            force_new_mode_confirmation=True,
+        )
+
+        self.assertEqual(result["match_type"], "duplicate")
+        self.assertEqual(result["context_action"], "merge_append")
+        self.assertEqual(int(bank.context_valid[0].sum()), 3)
+        self.assertAlmostEqual(float(bank.context_support[0].sum()), 4.0)
+        self.assertAlmostEqual(float(bank.support[0]), 4.0)
+        self.assertTrue(torch.allclose(bank.law_keys[0], basis[0]))
+
+    def test_retrieval_scores_the_best_context_alias(self):
+        bank = MemoryBank(device="cpu", key_dim=3, param_dim=2, capacity=8)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.98,
+            mode_threshold=0.90,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=1,
+        )
+        basis = torch.eye(3)
+        bank.add(
+            basis[0], torch.tensor([1.0, 0.0]), law_key=basis[0],
+            prediction_gain=1.0,
+        )
+        bank.add(
+            basis[1], torch.tensor([0.0, 1.0]), law_key=basis[0],
+            prediction_gain=1.0,
+            force_new_mode_confirmation=True,
+        )
+        _, info = bank.retrieve(
+            basis[1], SmoothSparseRetriever(), update_state=False
+        )
+        self.assertAlmostEqual(float(info["sim"][0]), 1.0, places=6)
+
     def test_effective_law_key_is_invariant_to_semantic_rebase(self):
         semantic = torch.tensor([0.2, -0.4])
         delta = torch.tensor([0.3, 0.7])
@@ -65,6 +122,8 @@ class PrototypeMemoryTests(unittest.TestCase):
             duplicate_threshold=0.98,
             mode_threshold=0.90,
             mode_capacity=3,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=1,
         )
         basis = torch.eye(8)
         delta = torch.arange(4, dtype=torch.float32)
@@ -87,6 +146,128 @@ class PrototypeMemoryTests(unittest.TestCase):
         self.assertEqual(float(bank.support.sum()), 6.0)
         rows = bank.mode_ids == archive_mode
         self.assertFalse(bool(bank.mode_compressed[rows].any()))
+
+    def test_new_mode_requires_persistent_prediction_confirmation(self):
+        bank = MemoryBank(device="cpu", key_dim=3, param_dim=2, capacity=8)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.98,
+            mode_threshold=0.90,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=2,
+        )
+        basis = torch.eye(3)
+        bank.add(
+            basis[0], torch.zeros(2), law_key=basis[0], prediction_gain=0.2
+        )
+
+        first = bank.add(
+            basis[1], torch.ones(2), law_key=basis[1], prediction_gain=0.9
+        )
+        self.assertEqual(first["action"], "queue")
+        self.assertEqual(first["match_type"], "pending_new_dynamics")
+        self.assertEqual(len(bank), 1)
+
+        second = bank.add(
+            basis[1], torch.ones(2), law_key=basis[1], prediction_gain=0.9
+        )
+        self.assertEqual(second["action"], "append")
+        self.assertEqual(second["match_type"], "new_dynamics")
+        self.assertEqual(len(bank), 2)
+        self.assertNotEqual(second["mode_id"], first["mode_id"])
+
+    def test_batched_admission_uses_the_same_causal_confirmation(self):
+        bank = MemoryBank(device="cpu", key_dim=3, param_dim=2, capacity=8)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.98,
+            mode_threshold=0.90,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=2,
+        )
+        basis = torch.eye(3)
+        first = bank.add_batch(
+            keys=basis[:2],
+            delta_theta=torch.stack([torch.zeros(2), torch.ones(2)]),
+            law_keys=basis[:2],
+            prediction_gain=torch.tensor([0.2, 0.9]),
+        )
+        self.assertEqual([row["action"] for row in first], ["append", "queue"])
+        self.assertEqual(len(bank), 1)
+
+        second = bank.add_batch(
+            keys=basis[1:2],
+            delta_theta=torch.ones(1, 2),
+            law_keys=basis[1:2],
+            prediction_gain=torch.tensor([0.9]),
+        )
+        self.assertEqual(second[0]["action"], "append")
+        self.assertEqual(len(bank), 2)
+
+    def test_mode_local_radii_are_rolling_quantiles(self):
+        bank = MemoryBank(device="cpu", key_dim=4, param_dim=2, capacity=8)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.90,
+            mode_threshold=0.70,
+            adaptive_history_size=4,
+            adaptive_min_samples=3,
+        )
+        base = torch.tensor([1.0, 0.0, 0.0, 0.0])
+        bank.add(base, torch.zeros(2), law_key=base, prediction_gain=0.2)
+        for cosine in (0.99, 0.98, 0.97):
+            candidate = torch.tensor([
+                cosine,
+                (1.0 - cosine**2) ** 0.5,
+                0.0,
+                0.0,
+            ])
+            result = bank.add(
+                candidate,
+                torch.zeros(2),
+                law_key=candidate,
+                prediction_gain=0.2,
+            )
+            self.assertEqual(result["action"], "refresh")
+
+        mode_id = int(bank.mode_ids[0])
+        duplicate_radius, mode_radius = bank.adaptive_radii(mode_id)
+        expected = MemoryBank._rolling_quantile(
+            bank._mode_duplicate_distances[mode_id], 0.90
+        )
+        self.assertAlmostEqual(duplicate_radius, expected, places=7)
+        self.assertGreaterEqual(
+            mode_radius, duplicate_radius + bank.radius_margin - 1e-12
+        )
+
+        memory = TreeEpisodicMemory(
+            key_dim=4,
+            num_event_types=1,
+            num_basis=1,
+            capacity_per_node=8,
+            device="cpu",
+        )
+        memory.banks["root"] = bank
+        memory.configure_prototype_memory(
+            duplicate_threshold=0.90,
+            mode_threshold=0.70,
+            adaptive_history_size=4,
+            adaptive_min_samples=3,
+        )
+        restored = TreeEpisodicMemory(
+            key_dim=4,
+            num_event_types=1,
+            num_basis=1,
+            capacity_per_node=8,
+            device="cpu",
+        )
+        restored.set_extra_state(memory.get_extra_state())
+        restored_bank = restored.get_bank("root")
+        self.assertEqual(
+            restored_bank._mode_duplicate_distances,
+            bank._mode_duplicate_distances,
+        )
+        self.assertEqual(
+            restored_bank.adaptive_radii(mode_id),
+            (duplicate_radius, mode_radius),
+        )
 
     def test_split_uses_observation_support_after_physical_compression(self):
         memory = TreeEpisodicMemory(

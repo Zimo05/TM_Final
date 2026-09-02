@@ -1584,13 +1584,16 @@ class TrainingWakeSupportMixin:
             item.queue_weight = float(
                 packed["queue_weight"][probe_index].detach().cpu()
             )
+            item.prediction_gain = float(
+                evidence["write_gain"][probe_index].detach().cpu()
+            )
 
         grouped_items = {}
         for item, owner_id in zip(selected_items, owner_ids):
             grouped_items.setdefault(owner_id, []).append(item)
         for owner_id, owner_items in grouped_items.items():
             reference = owner_items[0].key
-            self.tree.episodic_memory.add_memory_batch(
+            admission = self.tree.episodic_memory.add_memory_batch(
                 node_id=owner_id,
                 keys=torch.stack([
                     item.key.reshape(-1).to(
@@ -1613,11 +1616,17 @@ class TrainingWakeSupportMixin:
                     device=reference.device,
                     dtype=reference.dtype,
                 ),
+                prediction_gain=torch.as_tensor(
+                    [item.prediction_gain for item in owner_items],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
                 semantic_theta=self.tree.semantic_theta(owner_id).detach(),
                 decays=self.hawkes.decays.detach(),
             )
-            for item in owner_items:
-                self.controller.split_queues[owner_id] += item.queue_weight
+            for item, result in zip(owner_items, admission):
+                if result["action"] != "queue":
+                    self.controller.split_queues[owner_id] += item.queue_weight
 
         def request_token(probe_index: int) -> tuple[int, int]:
             sequence_row = int(sequence_rows[probe_index].detach().cpu())
@@ -1641,6 +1650,9 @@ class TrainingWakeSupportMixin:
                 packed["queue_weight"][probe_index]
                 * evidence["confidence"][probe_index]
             ).detach().cpu())
+            item.prediction_gain = float(
+                evidence["write_gain"][probe_index].detach().cpu()
+            )
             shadow_records.append({
                 "token": request_token(probe_index),
                 "owner_id": owner_id,
@@ -2065,19 +2077,22 @@ class TrainingWakeSupportMixin:
             raise RuntimeError("write evidence is missing its residual candidate")
         item.write_quality = write_quality
         item.queue_weight = queue_weight
-        self.tree.episodic_memory.add_memory(
+        item.prediction_gain = float(evidence["write_gain"].detach().cpu())
+        admission = self.tree.episodic_memory.add_memory(
             node_id=owner_id,
             key=item.key,
             delta_theta=item.delta_theta,
             window=item.window,
             write_quality=item.write_quality,
             queue_weight=item.queue_weight,
+            prediction_gain=item.prediction_gain,
             semantic_theta=self.tree.semantic_theta(owner_id).detach(),
             decays=self.hawkes.decays.detach(),
         )
-        self.controller.split_queues[
-            owner_id
-        ] += item.queue_weight
+        if admission["action"] != "queue":
+            self.controller.split_queues[
+                owner_id
+            ] += item.queue_weight
 
     def _commit_write_requests_batch(
         self,
@@ -2103,6 +2118,9 @@ class TrainingWakeSupportMixin:
                 raise RuntimeError("write evidence is missing its residual candidate")
             item.write_quality = float(evidence["bounded_gain"].detach().cpu())
             item.queue_weight = float(request["queue_weight"].detach().cpu())
+            item.prediction_gain = float(
+                evidence["write_gain"].detach().cpu()
+            )
             items.append(item)
         # Group the physical writes by owner node.  The candidate/evidence
         # work above is already batched; keeping each node's keys, residuals,
@@ -2134,18 +2152,24 @@ class TrainingWakeSupportMixin:
                 device=reference.device,
                 dtype=reference.dtype,
             )
-            self.tree.episodic_memory.add_memory_batch(
+            admission = self.tree.episodic_memory.add_memory_batch(
                 node_id=owner_id,
                 keys=owner_keys,
                 delta_theta=owner_deltas,
                 windows=[item.window for item in owner_items],
                 write_quality=owner_quality,
                 queue_weight=owner_queue,
+                prediction_gain=torch.as_tensor(
+                    [item.prediction_gain for item in owner_items],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
                 semantic_theta=self.tree.semantic_theta(owner_id).detach(),
                 decays=self.hawkes.decays.detach(),
             )
-            for item in owner_items:
-                self.controller.split_queues[owner_id] += item.queue_weight
+            for item, result in zip(owner_items, admission):
+                if result["action"] != "queue":
+                    self.controller.split_queues[owner_id] += item.queue_weight
 
     def _encode_memory_event(
         self,

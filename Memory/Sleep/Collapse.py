@@ -17,6 +17,40 @@ from torch import Tensor
 from MemoryResiduals.MemoryBank import MemoryBank
 
 
+# Keep topology-created banks on the same adaptive two-radius and Dual
+# Identity configuration as the source bank.  Collapse can run on banks loaded
+# from older checkpoints, so every field has a conservative constructor
+# fallback rather than assuming the attribute was serialized.
+_PROTOTYPE_POLICY_DEFAULTS = {
+    "duplicate_threshold": 0.98,
+    "mode_threshold": 0.90,
+    "mode_capacity": 12,
+    "ema_beta_min": 0.01,
+    "ema_beta_max": 0.25,
+    "retention_support_weight": 1.0,
+    "retention_usage_weight": 0.5,
+    "retention_stale_weight": 1.0,
+    "retention_age_weight": 0.1,
+    "adaptive_history_size": 64,
+    "adaptive_min_samples": 8,
+    "duplicate_quantile": 0.90,
+    "mode_quantile": 0.95,
+    "radius_margin": 1e-3,
+    "gain_quantile": 0.95,
+    "gain_ema_decay": 0.8,
+    "gain_confirmation_min_count": 2,
+    "gain_floor": 0.0,
+    "context_alias_capacity": 3,
+}
+
+
+def _prototype_policy_from_bank(bank: MemoryBank) -> dict:
+    return {
+        name: getattr(bank, name, default)
+        for name, default in _PROTOTYPE_POLICY_DEFAULTS.items()
+    }
+
+
 @dataclass(frozen=True)
 class CollapseCommitResult:
     parent_id: str
@@ -77,11 +111,15 @@ def collapse_snapshot_signature(tree, parent_id: str) -> tuple:
         bank = tree.episodic_memory.banks.get(node_id)
         bank_signature = None
         if bank is not None:
+            bank._ensure_prototype_state()
             bank_signature = (
                 id(bank),
                 len(bank),
                 int(bank._age_reference_clock),
                 _tensor_signature(bank.keys),
+                _tensor_signature(bank.context_keys),
+                _tensor_signature(bank.context_valid),
+                _tensor_signature(bank.context_support),
                 _tensor_signature(bank.deltas),
                 _tensor_signature(bank.write_quality),
                 _tensor_signature(bank.queue_weight),
@@ -150,7 +188,14 @@ def _empty_replacement_bank(
         capacity=max(int(capacity), 1),
     )
     # Preserve storage dtype without adding a synthetic row.
+    parent_bank._ensure_prototype_state()
+    replacement.configure_prototype_policy(
+        **_prototype_policy_from_bank(parent_bank)
+    )
     replacement.keys = parent_bank.keys[:0]
+    replacement.context_keys = parent_bank.context_keys[:0]
+    replacement.context_valid = parent_bank.context_valid[:0]
+    replacement.context_support = parent_bank.context_support[:0]
     replacement.deltas = parent_bank.deltas[:0]
     replacement.write_quality = parent_bank.write_quality[:0]
     replacement.queue_weight = parent_bank.queue_weight[:0]
@@ -170,6 +215,19 @@ def _transient_empty_bank(memory) -> MemoryBank:
         param_dim=memory.param_dim,
         capacity=memory.capacity_per_node,
     )
+    # A transient bank participates in the same collapse transaction as the
+    # tree's persistent banks.  Carry the tree-level policy into it so a
+    # missing/empty parent or child does not silently fall back to global
+    # thresholds or the default alias width.
+    memory_policy = getattr(memory, "_prototype_policy", None)
+    policy = _prototype_policy_from_bank(bank)
+    if isinstance(memory_policy, dict):
+        policy.update({
+            name: memory_policy[name]
+            for name in _PROTOTYPE_POLICY_DEFAULTS
+            if name in memory_policy
+        })
+    bank.configure_prototype_policy(**policy)
     bank._age_reference_clock = memory._age_clock
     return bank
 

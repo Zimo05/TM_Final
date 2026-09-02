@@ -43,6 +43,9 @@ class TrainingLifecycleMixin:
             duplicate_threshold=self.wake_config.prototype_duplicate_threshold,
             mode_threshold=self.wake_config.prototype_mode_threshold,
             mode_capacity=self.wake_config.prototype_mode_capacity,
+            context_alias_capacity=(
+                self.wake_config.prototype_context_alias_capacity
+            ),
         )
         self.tree.episodic_memory.rebuild_law_keys(
             self.tree.semantic_theta,

@@ -332,14 +332,23 @@ def branch_support_and_gain(
         device=branch_bank.device,
         dtype=torch.long,
     )
-    replay_keys = torch.nn.functional.normalize(
-        branch_bank.keys.index_select(0, index_tensor).to(
+    branch_bank._ensure_prototype_state()
+    replay_context_keys = torch.nn.functional.normalize(
+        branch_bank.context_keys.index_select(0, index_tensor).to(
             device=device,
             dtype=dtype,
         ),
         dim=-1,
     )
-    similarities = replay_keys @ candidate_key
+    replay_context_valid = branch_bank.context_valid.index_select(
+        0, index_tensor
+    ).to(device=device)
+    alias_similarities = torch.einsum(
+        "nkd,d->nk", replay_context_keys, candidate_key
+    )
+    similarities = alias_similarities.masked_fill(
+        ~replay_context_valid, -torch.inf
+    ).max(dim=-1).values
     weights_tensor = torch.sigmoid(
         (similarities - sim_threshold) / temperature
     )

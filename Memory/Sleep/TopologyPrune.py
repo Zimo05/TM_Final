@@ -166,6 +166,8 @@ class _ReplayRow:
 @dataclass(frozen=True)
 class _VirtualBank:
     keys: Tensor
+    context_keys: Tensor
+    context_valid: Tensor
     deltas: Tensor
     write_quality: Tensor
     usage: Tensor
@@ -302,6 +304,9 @@ def _build_virtual_bank(
     qualities = []
     usage = []
     ages = []
+    context_keys = []
+    context_valid = []
+    alias_capacity = 3
     position = 0
     for node_id in (parent_id, *child_ids):
         bank = memory.banks.get(node_id)
@@ -313,6 +318,10 @@ def _build_virtual_bank(
             target_theta,
         )
         keys.append(bank.keys)
+        bank._ensure_prototype_state()
+        alias_capacity = max(alias_capacity, int(bank.context_alias_capacity))
+        context_keys.append(bank.context_keys)
+        context_valid.append(bank.context_valid)
         deltas.append(node_delta)
         qualities.append(bank.write_quality)
         usage.append(bank.usage)
@@ -324,14 +333,28 @@ def _build_virtual_bank(
     if not keys:
         return _VirtualBank(
             keys=reference.new_empty((0, memory.key_dim)),
+            context_keys=reference.new_empty((0, alias_capacity, memory.key_dim)),
+            context_valid=torch.empty(
+                (0, alias_capacity), dtype=torch.bool, device=reference.device
+            ),
             deltas=reference.new_empty((0, memory.param_dim)),
             write_quality=reference.new_empty(0),
             usage=reference.new_empty(0),
             age=reference.new_empty(0),
             source_positions=source_positions,
         )
+    padded_context_keys = [
+        F.pad(value, (0, 0, 0, alias_capacity - value.size(1)))
+        for value in context_keys
+    ]
+    padded_context_valid = [
+        F.pad(value, (0, alias_capacity - value.size(1)))
+        for value in context_valid
+    ]
     return _VirtualBank(
         keys=torch.cat(keys, dim=0),
+        context_keys=torch.cat(padded_context_keys, dim=0),
+        context_valid=torch.cat(padded_context_valid, dim=0),
         deltas=torch.cat(deltas, dim=0),
         write_quality=torch.cat(qualities, dim=0),
         usage=torch.cat(usage, dim=0),
@@ -383,7 +406,9 @@ def _retrieve_virtual_loo(
     if bool(active.any().item()):
         active_delta, info = tree.episodic_memory.retriever.forward_batched(
             query=queries[active],
-            keys=virtual.keys.unsqueeze(0).expand(replay_count, -1, -1)[active],
+            keys=virtual.context_keys.unsqueeze(0).expand(
+                replay_count, -1, -1, -1
+            )[active],
             deltas=virtual.deltas.unsqueeze(0).expand(replay_count, -1, -1)[active],
             usage=virtual.usage.unsqueeze(0).expand(replay_count, -1)[active],
             age=virtual.age.unsqueeze(0).expand(replay_count, -1)[active],
@@ -391,6 +416,11 @@ def _retrieve_virtual_loo(
             write_quality=virtual.write_quality.unsqueeze(0).expand(
                 replay_count, -1
             )[active],
+            context_valid=virtual.context_valid.unsqueeze(0).expand(
+                replay_count, -1, -1
+            ).clone()[active].masked_fill(
+                ~valid[active].unsqueeze(-1), False
+            ),
         )
         delta[active] = active_delta
         alpha[active] = info["alpha"]

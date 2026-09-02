@@ -39,6 +39,9 @@ class MemoryItem:
     # Number of independent persistent observations represented by this
     # physical prototype row. Retrieval usage remains a separate statistic.
     support: float = 1.0
+    # Signed local prediction improvement used only to confirm a genuinely
+    # new dynamics mode. It is deliberately independent of bounded quality.
+    prediction_gain: float = 0.0
 
 
 def _signed_hash_projection(feature: Tensor, output_dim: int) -> Tensor:
@@ -607,17 +610,38 @@ class SmoothSparseRetriever(nn.Module):
     def forward(
         self,
         query: Tensor,       # [d_k]
-        keys: Tensor,        # [M, d_k]
+        keys: Tensor,        # [M, d_k] or [M, K_ctx, d_k]
         deltas: Tensor,      # [M, param_dim]
         usage: Tensor,       # [M]
         age: Tensor,         # [M]
         write_quality: Optional[Tensor] = None,  # [M]
         keep_gate: Optional[Tensor] = None,      # [M]
         null_logit: Optional[float | Tensor] = None,
+        context_valid: Optional[Tensor] = None,  # [M, K_ctx]
     ):
+        if keys.ndim not in (2, 3):
+            raise ValueError("keys must have shape [M, d_k] or [M, K_ctx, d_k]")
         if keys.shape[0] == 0:
             param_dim = deltas.shape[-1]
             return query.new_zeros(param_dim), {}
+
+        if keys.ndim == 2:
+            if context_valid is not None:
+                raise ValueError(
+                    "context_valid is only supported with alias keys [M, K_ctx, d_k]"
+                )
+        else:
+            if context_valid is None:
+                context_valid = torch.ones(
+                    keys.shape[:2], device=keys.device, dtype=torch.bool
+                )
+            if context_valid.shape != keys.shape[:2]:
+                raise ValueError("context_valid must have shape [M, K_ctx]")
+            if context_valid.dtype != torch.bool:
+                raise ValueError("context_valid must be boolean")
+            context_valid = context_valid.to(device=keys.device)
+            if not bool(context_valid.any(dim=-1).all()):
+                raise ValueError("each memory row needs at least one valid context alias")
 
         if query.numel() != keys.shape[-1]:
             raise ValueError(
@@ -647,7 +671,16 @@ class SmoothSparseRetriever(nn.Module):
         query = F.normalize(query.reshape(-1), dim=0)
         keys = F.normalize(keys, dim=-1)
 
-        sim = keys @ query                      # [M]
+        if keys.ndim == 3:
+            alias_sim = torch.einsum("mkd,d->mk", keys, query)
+            alias_any = context_valid.any(dim=-1)
+            sim = alias_sim.masked_fill(~context_valid, -torch.inf).max(dim=-1).values
+            # Keep padded/malformed rows finite before multiplying by the
+            # trainable gamma.  The row mask still excludes them from all
+            # probability mass; finiteness avoids 0 * (-inf) NaN gradients.
+            sim = torch.where(alias_any, sim, torch.zeros_like(sim))
+        else:
+            sim = keys @ query                      # [M]
         attn_logits = gamma * sim               # [M]
 
         sparse_scores = (
@@ -718,7 +751,7 @@ class SmoothSparseRetriever(nn.Module):
     def forward_batched(
         self,
         query: Tensor,       # [R, d_k]
-        keys: Tensor,        # [R, M, d_k]
+        keys: Tensor,        # [R, M, d_k] or [R, M, K_ctx, d_k]
         deltas: Tensor,      # [R, M, P] or shared [B, M, P]
         usage: Tensor,       # [R, M]
         age: Tensor,         # [R, M]
@@ -727,6 +760,7 @@ class SmoothSparseRetriever(nn.Module):
         keep_gate: Optional[Tensor] = None,      # [R, M]
         null_logit: Optional[float | Tensor] = None,
         row_bank_indices: Optional[Tensor] = None,  # [R] into shared B
+        context_valid: Optional[Tensor] = None,  # [R, M, K_ctx]
     ):
         """Retrieve from padded banks with one independently normalized row.
 
@@ -736,8 +770,23 @@ class SmoothSparseRetriever(nn.Module):
         """
         if query.ndim != 2:
             raise ValueError("query must have shape [R, d_k]")
-        if keys.ndim != 3 or keys.shape[:2] != valid_mask.shape:
+        if keys.ndim not in (3, 4) or keys.shape[:2] != valid_mask.shape:
             raise ValueError("keys and valid_mask must align as [R, M, ...]")
+        if keys.ndim == 3:
+            if context_valid is not None:
+                raise ValueError(
+                    "context_valid is only supported with alias keys [R, M, K_ctx, d_k]"
+                )
+        else:
+            if context_valid is None:
+                context_valid = torch.ones(
+                    keys.shape[:3], device=keys.device, dtype=torch.bool
+                )
+            if context_valid.shape != keys.shape[:3]:
+                raise ValueError("context_valid must have shape [R, M, K_ctx]")
+            if context_valid.dtype != torch.bool:
+                raise ValueError("context_valid must be boolean")
+            context_valid = context_valid.to(device=keys.device)
         if row_bank_indices is None:
             if deltas.ndim != 3 or deltas.shape[:2] != valid_mask.shape:
                 raise ValueError(
@@ -778,7 +827,13 @@ class SmoothSparseRetriever(nn.Module):
 
         query = F.normalize(query, dim=-1)
         keys = F.normalize(keys, dim=-1)
-        sim = torch.einsum("rmd,rd->rm", keys, query)
+        if keys.ndim == 4:
+            alias_sim = torch.einsum("rmkd,rd->rmk", keys, query)
+            alias_any = context_valid.any(dim=-1)
+            sim = alias_sim.masked_fill(~context_valid, -torch.inf).max(dim=-1).values
+            sim = torch.where(alias_any, sim, torch.zeros_like(sim))
+        else:
+            sim = torch.einsum("rmd,rd->rm", keys, query)
         attn_logits = gamma * sim
         sparse_scores = (
             attn_logits
@@ -909,7 +964,22 @@ class MemoryBank:
         self.capacity = capacity
         self.device = torch.device(device)
 
+        # A physical law prototype can expose several retrieval/context
+        # aliases.  ``keys`` is retained as a legacy first-alias view for
+        # callers that still inspect the old field; retrieval itself uses the
+        # explicit alias tensors below.
+        self.context_alias_capacity = 3
+
         self.keys = torch.empty(0, key_dim, device=self.device)
+        self.context_keys = torch.empty(
+            0, self.context_alias_capacity, key_dim, device=self.device
+        )
+        self.context_valid = torch.empty(
+            0, self.context_alias_capacity, dtype=torch.bool, device=self.device
+        )
+        self.context_support = torch.empty(
+            0, self.context_alias_capacity, device=self.device
+        )
         self.deltas = torch.empty(0, param_dim, device=self.device)
         self.write_quality = torch.empty(0, device=self.device)
         self.queue_weight = torch.empty(0, device=self.device)
@@ -933,6 +1003,24 @@ class MemoryBank:
         self.retention_usage_weight = 0.5
         self.retention_stale_weight = 1.0
         self.retention_age_weight = 0.1
+        # Adaptive two-radius matching.  The legacy similarity thresholds are
+        # retained only as cold-start priors; once a mode has accumulated
+        # enough accepted observations, its own rolling distance statistics
+        # determine both radii.
+        self.adaptive_history_size = 64
+        self.adaptive_min_samples = 8
+        self.duplicate_quantile = 0.90
+        self.mode_quantile = 0.95
+        self.radius_margin = 1e-3
+        self.gain_quantile = 0.95
+        self.gain_ema_decay = 0.8
+        self.gain_confirmation_min_count = 2
+        self.gain_floor = 0.0
+        self._mode_duplicate_distances: Dict[int, List[float]] = {}
+        self._mode_distances: Dict[int, List[float]] = {}
+        self._mode_normal_gains: Dict[int, List[float]] = {}
+        self._mode_pending_gain_ema: Dict[int, float] = {}
+        self._mode_pending_gain_count: Dict[int, int] = {}
 
         self.windows: List[Optional[EventWindow]] = []
         self.usage = torch.empty(0, device=self.device)
@@ -967,6 +1055,9 @@ class MemoryBank:
     def _tensor_state_fields() -> Tuple[str, ...]:
         return (
             "keys",
+            "context_keys",
+            "context_valid",
+            "context_support",
             "deltas",
             "write_quality",
             "queue_weight",
@@ -1129,6 +1220,12 @@ class MemoryBank:
             self._bind_fixed_storage_views(start)
 
         self._storage_keys[start:end].copy_(keys.to(self._storage_keys))
+        self._storage_context_keys[start:end].zero_()
+        self._storage_context_keys[start:end, 0].copy_(keys.to(self._storage_context_keys))
+        self._storage_context_valid[start:end].zero_()
+        self._storage_context_valid[start:end, 0] = True
+        self._storage_context_support[start:end].zero_()
+        self._storage_context_support[start:end, 0] = 1.0
         self._storage_deltas[start:end].copy_(deltas.to(self._storage_deltas))
         self._storage_law_keys[start:end].copy_(law_keys.to(self._storage_law_keys))
         self._storage_write_quality[start:end].copy_(quality.to(self._storage_write_quality))
@@ -1158,6 +1255,16 @@ class MemoryBank:
         retention_usage_weight: float = 0.5,
         retention_stale_weight: float = 1.0,
         retention_age_weight: float = 0.1,
+        adaptive_history_size: int = 64,
+        adaptive_min_samples: int = 8,
+        duplicate_quantile: float = 0.90,
+        mode_quantile: float = 0.95,
+        radius_margin: float = 1e-3,
+        gain_quantile: float = 0.95,
+        gain_ema_decay: float = 0.8,
+        gain_confirmation_min_count: int = 2,
+        gain_floor: float = 0.0,
+        context_alias_capacity: int = 3,
     ) -> None:
         if not -1.0 <= mode_threshold < duplicate_threshold <= 1.0:
             raise ValueError(
@@ -1174,6 +1281,37 @@ class MemoryBank:
             retention_age_weight,
         ) < 0.0:
             raise ValueError("retention weights must be non-negative")
+        if adaptive_history_size <= 0:
+            raise ValueError("adaptive_history_size must be positive")
+        if not 1 <= adaptive_min_samples <= adaptive_history_size:
+            raise ValueError(
+                "adaptive_min_samples must be in [1, adaptive_history_size]"
+            )
+        if not 0.0 < duplicate_quantile < 1.0:
+            raise ValueError("duplicate_quantile must lie in (0, 1)")
+        if not 0.0 < mode_quantile < 1.0:
+            raise ValueError("mode_quantile must lie in (0, 1)")
+        if radius_margin <= 0.0:
+            raise ValueError("radius_margin must be positive")
+        if not 0.0 < gain_quantile < 1.0:
+            raise ValueError("gain_quantile must lie in (0, 1)")
+        if not 0.0 <= gain_ema_decay < 1.0:
+            raise ValueError("gain_ema_decay must lie in [0, 1)")
+        if gain_confirmation_min_count <= 0:
+            raise ValueError("gain_confirmation_min_count must be positive")
+        if not math.isfinite(gain_floor):
+            raise ValueError("gain_floor must be finite")
+        if context_alias_capacity <= 0:
+            raise ValueError("context_alias_capacity must be positive")
+        if (
+            len(self) > 0
+            and context_alias_capacity != int(
+                getattr(self, "context_alias_capacity", 3)
+            )
+        ):
+            raise ValueError(
+                "context_alias_capacity cannot change after the bank has entries"
+            )
         self.duplicate_threshold = float(duplicate_threshold)
         self.mode_threshold = float(mode_threshold)
         self.mode_capacity = int(mode_capacity)
@@ -1183,6 +1321,17 @@ class MemoryBank:
         self.retention_usage_weight = float(retention_usage_weight)
         self.retention_stale_weight = float(retention_stale_weight)
         self.retention_age_weight = float(retention_age_weight)
+        self.adaptive_history_size = int(adaptive_history_size)
+        self.adaptive_min_samples = int(adaptive_min_samples)
+        self.duplicate_quantile = float(duplicate_quantile)
+        self.mode_quantile = float(mode_quantile)
+        self.radius_margin = float(radius_margin)
+        self.gain_quantile = float(gain_quantile)
+        self.gain_ema_decay = float(gain_ema_decay)
+        self.gain_confirmation_min_count = int(gain_confirmation_min_count)
+        self.gain_floor = float(gain_floor)
+        self.context_alias_capacity = int(context_alias_capacity)
+        self._trim_adaptive_histories()
 
     @torch.no_grad()
     def _ensure_prototype_state(self) -> None:
@@ -1192,6 +1341,103 @@ class MemoryBank:
             self.law_keys = self.keys.detach().clone()
         if self.support.shape != (count,):
             self.support = self.keys.new_ones(count)
+        configured_capacity = getattr(self, "context_alias_capacity", None)
+        existing_context_keys = getattr(self, "context_keys", None)
+        if (
+            configured_capacity is None
+            and torch.is_tensor(existing_context_keys)
+            and existing_context_keys.ndim == 3
+            and existing_context_keys.size(-1) == self.key_dim
+        ):
+            # A few intermediate checkpoints carried the alias tensor before
+            # the explicit capacity attribute was serialized. Infer the
+            # capacity from that tensor instead of silently truncating it to
+            # the default three slots.
+            configured_capacity = int(existing_context_keys.size(1))
+        context_capacity = int(
+            3 if configured_capacity is None else configured_capacity
+        )
+        if context_capacity <= 0:
+            context_capacity = 3
+        # Intermediate checkpoints may have serialized alias tensors before
+        # the explicit capacity attribute was introduced.  Persist the
+        # inferred width so the policy-default pass below cannot overwrite it
+        # with the default three slots.
+        if getattr(self, "context_alias_capacity", None) is None or int(
+            getattr(self, "context_alias_capacity", context_capacity)
+        ) <= 0:
+            self.context_alias_capacity = context_capacity
+        expected_context_shape = (count, context_capacity, self.key_dim)
+        context_repaired = False
+        if existing_context_keys is None or self.context_keys.shape != expected_context_shape:
+            context_keys = self.keys.new_zeros(expected_context_shape)
+            if count:
+                context_keys[:, 0] = F.normalize(self.keys, dim=-1)
+            self.context_keys = context_keys
+            context_repaired = True
+        elif (
+            self.context_keys.device != self.keys.device
+            or self.context_keys.dtype != self.keys.dtype
+        ):
+            self.context_keys = self.context_keys.to(
+                device=self.keys.device, dtype=self.keys.dtype
+            )
+            context_repaired = True
+        if (
+            getattr(self, "context_valid", None) is None
+            or self.context_valid.shape != (count, context_capacity)
+        ):
+            context_valid = torch.zeros(
+                (count, context_capacity), device=self.keys.device, dtype=torch.bool
+            )
+            if count:
+                context_valid[:, 0] = True
+            self.context_valid = context_valid
+            context_repaired = True
+        elif self.context_valid.dtype != torch.bool:
+            self.context_valid = self.context_valid.to(dtype=torch.bool)
+            context_repaired = True
+        if self.context_valid.device != self.keys.device:
+            self.context_valid = self.context_valid.to(device=self.keys.device)
+            context_repaired = True
+        if (
+            getattr(self, "context_support", None) is None
+            or self.context_support.shape != (count, context_capacity)
+        ):
+            context_support = self.keys.new_zeros(count, context_capacity)
+            if count:
+                context_support[:, 0] = self.support
+            self.context_support = context_support
+            context_repaired = True
+        elif (
+            self.context_support.device != self.keys.device
+            or self.context_support.dtype != self.keys.dtype
+        ):
+            self.context_support = self.context_support.to(
+                device=self.keys.device, dtype=self.keys.dtype
+            )
+            context_repaired = True
+        # A malformed/legacy row should always have one usable retrieval
+        # identity.  Keep the first alias synchronized with the legacy key.
+        if count:
+            normalized_keys = F.normalize(self.keys, dim=-1)
+            no_alias = ~self.context_valid.any(dim=-1)
+            if bool(no_alias.any()):
+                self.context_keys[no_alias, 0] = normalized_keys[no_alias]
+                self.context_valid[no_alias, 0] = True
+                self.context_support[no_alias, 0] = self.support[no_alias].clamp_min(1.0)
+                context_repaired = True
+            invalid_support = self.context_valid & (self.context_support <= 0.0)
+            if bool(invalid_support.any()):
+                self.context_support[invalid_support] = 1.0
+                context_repaired = True
+            if context_repaired:
+                for row in range(count):
+                    self._sync_legacy_key(row)
+                # Shape/device repairs replace public tensors; any fixed
+                # append backing store now points at the old views and must
+                # be rebuilt before the next append.
+                self._invalidate_fixed_storage()
         if self.quality_mass.shape != (count,):
             self.quality_mass = self.write_quality * self.support
         if self.split_mass.shape != (count,):
@@ -1204,6 +1450,302 @@ class MemoryBank:
             int(self._next_mode_id),
             int(self.mode_ids.max().item()) + 1 if count else 0,
         )
+        defaults = {
+            "_mode_duplicate_distances": {},
+            "_mode_distances": {},
+            "_mode_normal_gains": {},
+            "_mode_pending_gain_ema": {},
+            "_mode_pending_gain_count": {},
+        }
+        for name, default in defaults.items():
+            if not hasattr(self, name):
+                setattr(self, name, default)
+        policy_defaults = {
+            "adaptive_history_size": 64,
+            "adaptive_min_samples": 8,
+            "duplicate_quantile": 0.90,
+            "mode_quantile": 0.95,
+            "radius_margin": 1e-3,
+            "gain_quantile": 0.95,
+            "gain_ema_decay": 0.8,
+            "gain_confirmation_min_count": 2,
+            "gain_floor": 0.0,
+            "context_alias_capacity": 3,
+        }
+        for name, default in policy_defaults.items():
+            if not hasattr(self, name):
+                setattr(self, name, default)
+
+    @torch.no_grad()
+    def _sync_legacy_key(self, index: int) -> None:
+        """Expose the first valid context alias through legacy ``keys``."""
+        if len(self) == 0:
+            return
+        valid = self.context_valid[index]
+        if bool(valid.any()):
+            alias_index = int(torch.nonzero(valid, as_tuple=False)[0].item())
+            alias = self.context_keys[index, alias_index]
+            if not torch.equal(self.keys[index], alias):
+                self.keys[index].copy_(alias)
+
+    @torch.no_grad()
+    def _update_context_aliases(
+        self,
+        index: int,
+        context_key: Tensor,
+    ) -> Dict[str, int | float | str]:
+        """Update a prototype's retrieval aliases using online redundancy.
+
+        Law matching has already classified the write as a duplicate.  This
+        routine therefore never changes ``law_keys`` or the dynamics mode; it
+        only refreshes, appends, or merges context identities.
+        """
+        self._ensure_prototype_state()
+        query = F.normalize(
+            context_key.detach().reshape(1, -1).to(self.context_keys), dim=-1
+        ).reshape(-1)
+        capacity = int(self.context_alias_capacity)
+        valid_indices = torch.nonzero(
+            self.context_valid[index], as_tuple=False
+        ).flatten()
+        alias_count = int(valid_indices.numel())
+        if alias_count == 0:
+            self.context_keys[index, 0] = query
+            self.context_valid[index, 0] = True
+            self.context_support[index, 0] = 1.0
+            self._sync_legacy_key(index)
+            return {
+                "context_action": "append",
+                "context_alias_index": 0,
+                "context_alias_count": 1,
+                "context_distance": 1.0,
+                "context_redundancy_distance": float("inf"),
+            }
+
+        aliases = F.normalize(
+            self.context_keys[index, valid_indices], dim=-1
+        )
+        alias_support = self.context_support[index, valid_indices].clamp_min(1.0)
+        similarities = aliases @ query
+        distances = (1.0 - similarities).clamp(0.0, 2.0)
+        nearest_position = int(torch.argmin(distances).item())
+        nearest_slot = int(valid_indices[nearest_position].item())
+        d_query = float(distances[nearest_position].item())
+
+        # Warm up a prototype with a second alias directly.  This avoids an
+        # arbitrary context threshold before a redundancy estimate exists.
+        if alias_count == 1 and capacity > 1:
+            free_slot = int(
+                torch.nonzero(~self.context_valid[index], as_tuple=False)[0].item()
+            )
+            self.context_keys[index, free_slot] = query
+            self.context_valid[index, free_slot] = True
+            self.context_support[index, free_slot] = 1.0
+            self._sync_legacy_key(index)
+            return {
+                "context_action": "append_warmup",
+                "context_alias_index": free_slot,
+                "context_alias_count": 2,
+                "context_distance": d_query,
+                "context_redundancy_distance": float("inf"),
+            }
+
+        if alias_count >= 2:
+            pairwise = (1.0 - aliases @ aliases.transpose(0, 1)).clamp(0.0, 2.0)
+            pair_mask = torch.triu(
+                torch.ones_like(pairwise, dtype=torch.bool), diagonal=1
+            )
+            pair_positions = torch.nonzero(pair_mask, as_tuple=False)
+            pair_distances = pairwise[pair_mask]
+            pair_position = int(torch.argmin(pair_distances).item())
+            redundant_distance = float(pair_distances[pair_position].item())
+            pair_a_position, pair_b_position = pair_positions[pair_position].tolist()
+        else:
+            redundant_distance = float("inf")
+            pair_a_position = pair_b_position = -1
+
+        if d_query <= redundant_distance:
+            old_support = self.context_support[index, nearest_slot].clamp_min(1.0)
+            beta = torch.clamp(
+                1.0 / (old_support + 1.0),
+                min=self.ema_beta_min,
+                max=self.ema_beta_max,
+            )
+            blended = (
+                (1.0 - beta) * aliases[nearest_position]
+                + beta * query
+            )
+            self.context_keys[index, nearest_slot] = F.normalize(
+                blended.reshape(1, -1), dim=-1
+            ).reshape(-1)
+            self.context_support[index, nearest_slot] = old_support + 1.0
+            self._sync_legacy_key(index)
+            return {
+                "context_action": "refresh",
+                "context_alias_index": nearest_slot,
+                "context_alias_count": alias_count,
+                "context_distance": d_query,
+                "context_redundancy_distance": redundant_distance,
+            }
+
+        if alias_count < capacity:
+            free_slot = int(
+                torch.nonzero(~self.context_valid[index], as_tuple=False)[0].item()
+            )
+            self.context_keys[index, free_slot] = query
+            self.context_valid[index, free_slot] = True
+            self.context_support[index, free_slot] = 1.0
+            self._sync_legacy_key(index)
+            return {
+                "context_action": "append",
+                "context_alias_index": free_slot,
+                "context_alias_count": alias_count + 1,
+                "context_distance": d_query,
+                "context_redundancy_distance": redundant_distance,
+            }
+
+        # The alias bank is full and the new context is more distinct than
+        # the closest existing pair. Merge that pair by support, then use the
+        # freed slot for the new context.
+        slot_a = int(valid_indices[pair_a_position].item())
+        slot_b = int(valid_indices[pair_b_position].item())
+        support_a = self.context_support[index, slot_a].clamp_min(1.0)
+        support_b = self.context_support[index, slot_b].clamp_min(1.0)
+        merged = (
+            support_a * F.normalize(
+                self.context_keys[index, slot_a].reshape(1, -1), dim=-1
+            ).reshape(-1)
+            + support_b * F.normalize(
+                self.context_keys[index, slot_b].reshape(1, -1), dim=-1
+            ).reshape(-1)
+        )
+        self.context_keys[index, slot_a] = F.normalize(
+            merged.reshape(1, -1), dim=-1
+        ).reshape(-1)
+        self.context_support[index, slot_a] = support_a + support_b
+        self.context_keys[index, slot_b] = query
+        self.context_support[index, slot_b] = 1.0
+        self.context_valid[index, slot_a] = True
+        self.context_valid[index, slot_b] = True
+        self._sync_legacy_key(index)
+        return {
+            "context_action": "merge_append",
+            "context_alias_index": slot_b,
+            "context_alias_count": capacity,
+            "context_distance": d_query,
+            "context_redundancy_distance": redundant_distance,
+        }
+
+    def _trim_adaptive_histories(self) -> None:
+        if not hasattr(self, "_mode_duplicate_distances"):
+            return
+        for values_by_mode in (
+            self._mode_duplicate_distances,
+            self._mode_distances,
+            self._mode_normal_gains,
+        ):
+            for mode_id, values in list(values_by_mode.items()):
+                values_by_mode[int(mode_id)] = list(values)[
+                    -self.adaptive_history_size:
+                ]
+
+    @staticmethod
+    def _rolling_quantile(values: Sequence[float], quantile: float) -> float:
+        if not values:
+            raise ValueError("cannot compute a quantile from an empty history")
+        tensor = torch.tensor(tuple(values), dtype=torch.float64)
+        return float(torch.quantile(tensor, quantile).item())
+
+    def _append_adaptive_value(
+        self,
+        values_by_mode: Dict[int, List[float]],
+        mode_id: int,
+        value: float,
+    ) -> None:
+        if not math.isfinite(value):
+            raise FloatingPointError("adaptive matching statistics must be finite")
+        history = values_by_mode.setdefault(int(mode_id), [])
+        history.append(float(value))
+        if len(history) > self.adaptive_history_size:
+            del history[:-self.adaptive_history_size]
+
+    def adaptive_radii(self, mode_id: int) -> Tuple[float, float]:
+        """Return data-calibrated duplicate and local-variation radii."""
+        self._ensure_prototype_state()
+        duplicate_prior = max(0.0, 1.0 - self.duplicate_threshold)
+        mode_prior = max(duplicate_prior + self.radius_margin, 1.0 - self.mode_threshold)
+        duplicate_history = self._mode_duplicate_distances.get(int(mode_id), [])
+        mode_history = self._mode_distances.get(int(mode_id), [])
+        duplicate_radius = (
+            self._rolling_quantile(duplicate_history, self.duplicate_quantile)
+            if len(duplicate_history) >= self.adaptive_min_samples
+            else duplicate_prior
+        )
+        mode_radius = (
+            self._rolling_quantile(mode_history, self.mode_quantile)
+            if len(mode_history) >= self.adaptive_min_samples
+            else mode_prior
+        )
+        duplicate_radius = min(
+            max(duplicate_radius, 0.0),
+            max(0.0, 2.0 - self.radius_margin),
+        )
+        mode_radius = min(
+            max(mode_radius, duplicate_radius + self.radius_margin), 2.0
+        )
+        return duplicate_radius, mode_radius
+
+    def _gain_threshold(self, mode_id: int) -> float:
+        history = self._mode_normal_gains.get(int(mode_id), [])
+        if not history:
+            return self.gain_floor
+        return max(
+            self.gain_floor,
+            self._rolling_quantile(history, self.gain_quantile),
+        )
+
+    def _record_in_mode_observation(
+        self,
+        mode_id: int,
+        *,
+        distance: float,
+        prediction_gain: float,
+        duplicate: bool,
+    ) -> None:
+        distances = (
+            self._mode_duplicate_distances
+            if duplicate
+            else self._mode_distances
+        )
+        self._append_adaptive_value(distances, mode_id, distance)
+        self._append_adaptive_value(
+            self._mode_normal_gains, mode_id, prediction_gain
+        )
+        self._mode_pending_gain_ema.pop(int(mode_id), None)
+        self._mode_pending_gain_count.pop(int(mode_id), None)
+
+    def _confirm_new_mode(
+        self,
+        mode_id: int,
+        prediction_gain: float,
+    ) -> Tuple[bool, float, float, int]:
+        mode_id = int(mode_id)
+        previous = self._mode_pending_gain_ema.get(mode_id)
+        gain_ema = (
+            float(prediction_gain)
+            if previous is None
+            else self.gain_ema_decay * previous
+            + (1.0 - self.gain_ema_decay) * float(prediction_gain)
+        )
+        count = self._mode_pending_gain_count.get(mode_id, 0) + 1
+        self._mode_pending_gain_ema[mode_id] = gain_ema
+        self._mode_pending_gain_count[mode_id] = count
+        threshold = self._gain_threshold(mode_id)
+        confirmed = (
+            count >= self.gain_confirmation_min_count
+            and gain_ema > threshold
+        )
+        return confirmed, gain_ema, threshold, count
 
     @torch.no_grad()
     def _refresh_prototype(
@@ -1225,8 +1767,7 @@ class MemoryBank:
             max=self.ema_beta_max,
         )
         self.deltas[index].mul_(1.0 - beta).add_(delta_theta.reshape(-1), alpha=float(beta))
-        blended_key = (1.0 - beta) * self.keys[index] + beta * key.reshape(-1)
-        self.keys[index] = F.normalize(blended_key.reshape(1, -1), dim=-1).reshape(-1)
+        context_result = self._update_context_aliases(index, key.reshape(-1))
         if law_key_builder is not None:
             refreshed_law = law_key_builder(self.deltas[index])
         else:
@@ -1243,12 +1784,14 @@ class MemoryBank:
         self.stale_cycles[index] = 0.0
         if window is not None:
             self.windows[index] = window
-        return {
+        result = {
             "action": "refresh",
             "index": int(index),
             "mode_id": int(self.mode_ids[index].item()),
             "support": float(self.support[index].item()),
         }
+        result.update(context_result)
+        return result
 
     def _mode_retention(self, mode_id: int) -> Tensor:
         rows = self.mode_ids == int(mode_id)
@@ -1358,6 +1901,51 @@ class MemoryBank:
         self.stale_cycles[target] = self.stale_cycles[indices].max()
         self.age[target] = (support_average * self.age[indices]).sum()
         self.mode_compressed[target] = True
+
+        # Preserve retrieval identity separately from the compressed law key.
+        # Keep the strongest aliases explicitly and fold any overflow into a
+        # final support-weighted alias so the row's total evidence remains
+        # represented after a mode is archived.
+        alias_keys = self.context_keys[indices]
+        alias_valid = self.context_valid[indices]
+        alias_support = self.context_support[indices].clamp_min(0.0)
+        flat_keys = alias_keys.reshape(-1, self.key_dim)
+        flat_valid = alias_valid.reshape(-1)
+        flat_support = alias_support.reshape(-1)
+        valid_positions = torch.nonzero(flat_valid, as_tuple=False).flatten()
+        self.context_keys[target].zero_()
+        self.context_valid[target].zero_()
+        self.context_support[target].zero_()
+        if valid_positions.numel() > 0:
+            order = torch.argsort(
+                flat_support[valid_positions], descending=True
+            )
+            ordered = valid_positions[order]
+            keep_count = min(self.context_alias_capacity, int(ordered.numel()))
+            if keep_count == self.context_alias_capacity and ordered.numel() > keep_count:
+                direct_count = max(0, keep_count - 1)
+                direct = ordered[:direct_count]
+                remainder = ordered[direct_count:]
+                selected_keys = flat_keys[direct]
+                selected_support = flat_support[direct]
+                rem_weights = flat_support[remainder]
+                rem_support = rem_weights.sum().clamp_min(1.0)
+                rem_key = F.normalize(
+                    (rem_weights[:, None] * flat_keys[remainder]).sum(0, keepdim=True),
+                    dim=-1,
+                ).reshape(-1)
+                selected_keys = torch.cat([selected_keys, rem_key.unsqueeze(0)], dim=0)
+                selected_support = torch.cat([selected_support, rem_support.reshape(1)], dim=0)
+            else:
+                selected = ordered[:keep_count]
+                selected_keys = flat_keys[selected]
+                selected_support = flat_support[selected]
+            self.context_keys[target, :keep_count] = F.normalize(
+                selected_keys, dim=-1
+            )
+            self.context_valid[target, :keep_count] = True
+            self.context_support[target, :keep_count] = selected_support
+        self._sync_legacy_key(target)
         best_window = int(indices[torch.argmax(weights)].item())
         self.windows[target] = self.windows[best_window]
         keep = torch.ones(len(self), device=self.device, dtype=torch.bool)
@@ -1438,6 +2026,27 @@ class MemoryBank:
             raise ValueError(f"{name} must be finite values in [0, 1]")
         return result
 
+    def _batch_prediction_gain(
+        self,
+        value: float | Tensor,
+        *,
+        batch_size: int,
+    ) -> Tensor:
+        result = torch.as_tensor(
+            value,
+            device=self.device,
+            dtype=self.keys.dtype,
+        ).reshape(-1)
+        if result.numel() == 1:
+            result = result.expand(batch_size)
+        elif result.numel() != batch_size:
+            raise ValueError(
+                "prediction_gain must be scalar or contain one value per write"
+            )
+        if not bool(torch.isfinite(result).all()):
+            raise ValueError("prediction_gain must contain only finite values")
+        return result
+
     @torch.no_grad()
     def _add_batch_scalar_fallback(
         self,
@@ -1446,6 +2055,7 @@ class MemoryBank:
         law_keys: Tensor,
         quality: Tensor,
         queue: Tensor,
+        prediction_gain: Optional[Tensor],
         windows: Sequence[Optional[EventWindow]],
         law_key_builder: Optional[Callable[[Tensor], Tensor]],
     ) -> List[Dict[str, int | float | str]]:
@@ -1457,6 +2067,11 @@ class MemoryBank:
                 window=windows[index],
                 write_quality=quality[index],
                 queue_weight=queue[index],
+                prediction_gain=(
+                    None
+                    if prediction_gain is None
+                    else prediction_gain[index]
+                ),
                 law_key=law_keys[index],
                 law_key_builder=law_key_builder,
             )
@@ -1473,15 +2088,14 @@ class MemoryBank:
         queue_weight: float | Tensor = 0.0,
         law_keys: Optional[Tensor] = None,
         law_key_builder: Optional[Callable[[Tensor], Tensor]] = None,
+        prediction_gain: Optional[float | Tensor] = None,
     ) -> List[Dict[str, int | float | str]]:
-        """Admit node-wise writes with one GPU matching/reduction pass.
+        """Admit a node-local batch in causal order.
 
-        Matching is performed against the bank state at the start of the
-        transaction. Duplicate rows targeting the same prototype are reduced
-        with ``index_add_`` and one support-aware EMA update. Batches that
-        would require an order-sensitive mode-capacity or eviction decision
-        fall back to the scalar path, preserving the original admission
-        semantics for those uncommon boundary cases.
+        Adaptive radii and prediction confirmation are updated after every
+        observation, so later rows in the batch must see earlier decisions.
+        Input normalization remains batched; classification delegates to the
+        scalar transaction to preserve exactly that order-dependent state.
         """
         if keys.ndim != 2 or keys.size(-1) != self.key_dim:
             raise ValueError(
@@ -1518,6 +2132,14 @@ class MemoryBank:
         queue = self._batch_statistic(
             queue_weight, name="queue_weight", batch_size=batch_size
         )
+        gain = (
+            None
+            if prediction_gain is None
+            else self._batch_prediction_gain(
+                prediction_gain,
+                batch_size=batch_size,
+            )
+        )
 
         if law_keys is None:
             if law_key_builder is None:
@@ -1550,281 +2172,19 @@ class MemoryBank:
                 "episodic-memory batched key or residual contains NaN or Inf"
             )
 
-        self._ensure_prototype_state()
-        self._ensure_fixed_storage()
-        bank_size = len(self)
-        if bank_size == 0:
-            if batch_size > self.capacity:
-                return self._add_batch_scalar_fallback(
-                    keys, deltas, law_keys, quality, queue, windows,
-                    law_key_builder,
-                )
-            mode_ids = torch.arange(
-                self._next_mode_id,
-                self._next_mode_id + batch_size,
-                device=self.device,
-                dtype=torch.long,
-            )
-            self._next_mode_id += batch_size
-            indices = self._append_batch_rows(
-                keys, deltas, law_keys, quality, queue, mode_ids, windows
-            )
-            indices_cpu = indices.detach().cpu().tolist()
-            mode_ids_cpu = mode_ids.detach().cpu().tolist()
-            return [
-                {
-                    "action": "append",
-                    "index": int(index),
-                    "mode_id": int(mode),
-                    "support": 1.0,
-                }
-                for index, mode in zip(
-                    indices_cpu,
-                    mode_ids_cpu,
-                )
-            ]
-
-        similarities = law_keys @ self.law_keys[:bank_size].transpose(0, 1)
-        best_similarity, best_index = similarities.max(dim=-1)
-        best_mode = self.mode_ids[best_index]
-        duplicate_mask = best_similarity >= self.duplicate_threshold
-        same_mode_mask = (
-            (best_similarity >= self.mode_threshold) & ~duplicate_mask
+        # Adaptive radii and persistence confirmation are causal, mode-local
+        # state.  Process the normalized rows in input order so batched and
+        # scalar admission have exactly the same semantics.
+        return self._add_batch_scalar_fallback(
+            keys,
+            deltas,
+            law_keys,
+            quality,
+            queue,
+            gain,
+            windows,
+            law_key_builder,
         )
-        append_mask = ~duplicate_mask
-        append_positions = torch.nonzero(
-            append_mask, as_tuple=False
-        ).flatten()
-
-        # If incoming rows can match one another, the scalar implementation's
-        # order becomes observable (the later row may refresh the earlier
-        # append). Keep that boundary exact rather than silently changing the
-        # prototype policy for a rare correlated batch.
-        if append_positions.numel() > 1:
-            append_law_keys = law_keys.index_select(0, append_positions)
-            pairwise = append_law_keys @ append_law_keys.transpose(0, 1)
-            if bool(
-                torch.triu(pairwise, diagonal=1).ge(self.mode_threshold).any()
-            ):
-                return self._add_batch_scalar_fallback(
-                    keys, deltas, law_keys, quality, queue, windows,
-                    law_key_builder,
-                )
-
-        same_positions = torch.nonzero(
-            same_mode_mask, as_tuple=False
-        ).flatten()
-        if same_positions.numel():
-            existing_modes, existing_counts = torch.unique(
-                self.mode_ids[:bank_size],
-                sorted=True,
-                return_counts=True,
-            )
-            incoming_modes, incoming_counts = torch.unique(
-                best_mode.index_select(0, same_positions),
-                sorted=True,
-                return_counts=True,
-            )
-            mode_locations = torch.searchsorted(existing_modes, incoming_modes)
-            overflow = (
-                existing_counts.index_select(0, mode_locations)
-                + incoming_counts
-                > self.mode_capacity
-            )
-            if bool(overflow.any()):
-                return self._add_batch_scalar_fallback(
-                    keys, deltas, law_keys, quality, queue, windows,
-                    law_key_builder,
-                )
-
-        if bank_size + append_positions.numel() > self.capacity:
-            return self._add_batch_scalar_fallback(
-                keys, deltas, law_keys, quality, queue, windows,
-                law_key_builder,
-            )
-
-        results: List[Optional[Dict[str, int | float | str]]] = [
-            None
-        ] * batch_size
-
-        # Duplicate refresh: group all writes by their best prototype and do
-        # one support-aware EMA/scatter reduction per target row.
-        duplicate_positions = torch.nonzero(
-            duplicate_mask, as_tuple=False
-        ).flatten()
-        if duplicate_positions.numel():
-            targets, target_inverse = torch.unique(
-                best_index.index_select(0, duplicate_positions),
-                sorted=True,
-                return_inverse=True,
-            )
-            target_count = targets.numel()
-            target_counts = self.support.new_zeros(target_count)
-            target_counts.index_add_(
-                0,
-                target_inverse,
-                self.support.new_ones(duplicate_positions.numel()),
-            )
-            delta_sums = self.deltas.new_zeros(target_count, self.param_dim)
-            delta_sums.index_add_(
-                0,
-                target_inverse,
-                deltas.index_select(0, duplicate_positions),
-            )
-            key_sums = self.keys.new_zeros(target_count, self.key_dim)
-            key_sums.index_add_(
-                0,
-                target_inverse,
-                keys.index_select(0, duplicate_positions),
-            )
-            law_sums = self.law_keys.new_zeros(target_count, self.key_dim)
-            law_sums.index_add_(
-                0,
-                target_inverse,
-                law_keys.index_select(0, duplicate_positions),
-            )
-            mean_delta = delta_sums / target_counts[:, None]
-            mean_key = F.normalize(key_sums, dim=-1)
-            mean_law = F.normalize(law_sums, dim=-1)
-            old_support = self.support.index_select(0, targets).clamp_min(1.0)
-            beta = torch.clamp(
-                1.0 / (old_support + 1.0),
-                min=self.ema_beta_min,
-                max=self.ema_beta_max,
-            )
-            old_delta = self.deltas.index_select(0, targets)
-            old_key = self.keys.index_select(0, targets)
-            refreshed_delta = (
-                (1.0 - beta[:, None]) * old_delta
-                + beta[:, None] * mean_delta
-            )
-            refreshed_key = F.normalize(
-                (1.0 - beta[:, None]) * old_key
-                + beta[:, None] * mean_key,
-                dim=-1,
-            )
-            if law_key_builder is not None:
-                refreshed_law = law_key_builder(refreshed_delta)
-                if refreshed_law.ndim == 1:
-                    refreshed_law = refreshed_law.unsqueeze(0)
-            else:
-                old_law = self.law_keys.index_select(0, targets)
-                refreshed_law = (
-                    (1.0 - beta[:, None]) * old_law
-                    + beta[:, None] * mean_law
-                )
-            refreshed_law = F.normalize(
-                refreshed_law.detach().to(self.law_keys), dim=-1
-            )
-            self.deltas.index_copy_(0, targets, refreshed_delta)
-            self.keys.index_copy_(0, targets, refreshed_key)
-            self.law_keys.index_copy_(0, targets, refreshed_law)
-            quality_sums = self.quality_mass.new_zeros(target_count)
-            quality_sums.index_add_(
-                0,
-                target_inverse,
-                quality.index_select(0, duplicate_positions),
-            )
-            queue_sums = self.split_mass.new_zeros(target_count)
-            queue_sums.index_add_(
-                0,
-                target_inverse,
-                queue.index_select(0, duplicate_positions),
-            )
-            new_support = old_support + target_counts
-            new_quality_mass = (
-                self.quality_mass.index_select(0, targets) + quality_sums
-            )
-            new_split_mass = (
-                self.split_mass.index_select(0, targets) + queue_sums
-            )
-            self.support.index_copy_(0, targets, new_support)
-            self.quality_mass.index_copy_(0, targets, new_quality_mass)
-            self.split_mass.index_copy_(0, targets, new_split_mass)
-            self.write_quality.index_copy_(
-                0, targets, new_quality_mass / new_support
-            )
-            self.queue_weight.index_copy_(
-                0, targets, new_split_mass / new_support
-            )
-            self.age.index_fill_(0, targets, 0.0)
-            self.stale_cycles.index_fill_(0, targets, 0.0)
-            self.mode_compressed.index_fill_(0, targets, False)
-
-            duplicate_positions_cpu = duplicate_positions.detach().cpu().tolist()
-            targets_cpu = best_index.index_select(
-                0, duplicate_positions
-            ).detach().cpu().tolist()
-            support_cpu = self.support.detach().cpu().tolist()
-            mode_ids_cpu = self.mode_ids.detach().cpu().tolist()
-            for position, target in zip(duplicate_positions_cpu, targets_cpu):
-                if windows[position] is not None:
-                    self.windows[target] = windows[position]
-                results[position] = {
-                    "action": "refresh",
-                    "index": int(target),
-                    "mode_id": int(mode_ids_cpu[target]),
-                    "support": float(support_cpu[target]),
-                }
-
-        # A same-mode row clears a compressed archive for the whole mode, just
-        # like scalar add(). The affected-mode loop is over unique modes, not
-        # over writes, and never performs GPU-to-CPU conversion.
-        if same_positions.numel():
-            affected_modes = torch.unique(
-                best_mode.index_select(0, same_positions)
-            )
-            affected_rows = (
-                self.mode_ids[: len(self), None] == affected_modes[None, :]
-            ).any(dim=1)
-            self.mode_compressed[: len(self)][affected_rows] = False
-            self.stale_cycles[: len(self)][affected_rows] = 0.0
-
-        # Non-duplicate rows occupy consecutive fixed-capacity slots. New
-        # modes receive IDs in input order; existing same-mode rows retain the
-        # best-match mode selected above.
-        if append_positions.numel():
-            append_modes = best_mode.index_select(0, append_positions).clone()
-            append_new_mask = ~same_mode_mask.index_select(0, append_positions)
-            new_count = int(append_new_mask.sum().item())
-            if new_count:
-                new_mode_ids = torch.arange(
-                    self._next_mode_id,
-                    self._next_mode_id + new_count,
-                    device=self.device,
-                    dtype=torch.long,
-                )
-                append_modes[append_new_mask] = new_mode_ids
-                self._next_mode_id += new_count
-            append_windows = [
-                windows[index]
-                for index in append_positions.detach().cpu().tolist()
-            ]
-            appended_indices = self._append_batch_rows(
-                keys.index_select(0, append_positions),
-                deltas.index_select(0, append_positions),
-                law_keys.index_select(0, append_positions),
-                quality.index_select(0, append_positions),
-                queue.index_select(0, append_positions),
-                append_modes,
-                append_windows,
-            )
-            append_positions_cpu = append_positions.detach().cpu().tolist()
-            appended_indices_cpu = appended_indices.detach().cpu().tolist()
-            append_modes_cpu = append_modes.detach().cpu().tolist()
-            for position, index, mode in zip(
-                append_positions_cpu, appended_indices_cpu, append_modes_cpu
-            ):
-                results[position] = {
-                    "action": "append",
-                    "index": int(index),
-                    "mode_id": int(mode),
-                    "support": 1.0,
-                }
-
-        if any(result is None for result in results):
-            raise RuntimeError("batched memory admission did not classify every row")
-        return [result for result in results if result is not None]
 
     @torch.no_grad()
     def add(
@@ -1836,6 +2196,8 @@ class MemoryBank:
         queue_weight: float | Tensor = 0.0,
         law_key: Optional[Tensor] = None,
         law_key_builder: Optional[Callable[[Tensor], Tensor]] = None,
+        prediction_gain: Optional[float | Tensor] = None,
+        force_new_mode_confirmation: bool = False,
     ) -> Dict[str, int | float | str]:
         if key.numel() != self.key_dim:
             raise ValueError(
@@ -1886,6 +2248,17 @@ class MemoryBank:
                 raise ValueError(
                     "write_quality and queue_weight must be finite values in [0, 1]"
                 )
+        gain_provided = prediction_gain is not None
+        gain = torch.as_tensor(
+            quality if prediction_gain is None else prediction_gain,
+            device=self.device,
+            dtype=self.keys.dtype,
+        ).reshape(-1)
+        if gain.numel() != 1:
+            raise ValueError("prediction_gain must be scalar")
+        if not bool(torch.isfinite(gain).all()):
+            raise ValueError("prediction_gain must be finite")
+        gain_value = float(gain.item())
 
         # Persistent memory is state, not a retained autograd graph. Gradients
         # still flow through the differentiable retrieval weights.
@@ -1910,15 +2283,26 @@ class MemoryBank:
 
         self._ensure_prototype_state()
         self._ensure_fixed_storage()
+        decision: Dict[str, float | int | str] = {}
+        append_is_duplicate_seed = True
+        match_type = "new_dynamics"
         if len(self) > 0:
             similarities = self.law_keys @ law_key.reshape(-1)
             best_index = int(torch.argmax(similarities).item())
             best_similarity = float(similarities[best_index].item())
+            best_distance = min(max(1.0 - best_similarity, 0.0), 2.0)
             best_mode = int(self.mode_ids[best_index].item())
-            if best_similarity >= self.duplicate_threshold:
+            duplicate_radius, mode_radius = self.adaptive_radii(best_mode)
+            decision = {
+                "distance": best_distance,
+                "duplicate_radius": duplicate_radius,
+                "mode_radius": mode_radius,
+                "prediction_gain": gain_value,
+            }
+            if best_distance <= duplicate_radius:
                 if bool(self.mode_compressed[best_index]):
                     self.mode_compressed[best_index] = False
-                return self._refresh_prototype(
+                result = self._refresh_prototype(
                     best_index,
                     key=key,
                     delta_theta=delta_theta,
@@ -1928,7 +2312,18 @@ class MemoryBank:
                     queue=queue,
                     law_key_builder=law_key_builder,
                 )
-            if best_similarity >= self.mode_threshold:
+                self._record_in_mode_observation(
+                    best_mode,
+                    distance=best_distance,
+                    prediction_gain=gain_value,
+                    duplicate=True,
+                )
+                result.update(decision)
+                result["match_type"] = "duplicate"
+                return result
+            if best_distance <= mode_radius:
+                append_is_duplicate_seed = False
+                match_type = "local_variation"
                 mode_rows = torch.nonzero(
                     self.mode_ids == best_mode, as_tuple=False
                 ).flatten()
@@ -1936,7 +2331,7 @@ class MemoryBank:
                     self.mode_compressed[mode_rows] = False
                     self.stale_cycles[mode_rows] = 0.0
                 if mode_rows.numel() >= self.mode_capacity:
-                    return self._refresh_prototype(
+                    result = self._refresh_prototype(
                         best_index,
                         key=key,
                         delta_theta=delta_theta,
@@ -1946,11 +2341,20 @@ class MemoryBank:
                         queue=queue,
                         law_key_builder=law_key_builder,
                     )
+                    self._record_in_mode_observation(
+                        best_mode,
+                        distance=best_distance,
+                        prediction_gain=gain_value,
+                        duplicate=False,
+                    )
+                    result.update(decision)
+                    result["match_type"] = match_type
+                    return result
                 mode_id = best_mode
                 if len(self) >= self.capacity and not self._make_space(
                     law_key_builder, protected_mode=best_mode
                 ):
-                    return self._refresh_prototype(
+                    result = self._refresh_prototype(
                         best_index,
                         key=key,
                         delta_theta=delta_theta,
@@ -1960,8 +2364,44 @@ class MemoryBank:
                         queue=queue,
                         law_key_builder=law_key_builder,
                     )
+                    self._record_in_mode_observation(
+                        best_mode,
+                        distance=best_distance,
+                        prediction_gain=gain_value,
+                        duplicate=False,
+                    )
+                    result.update(decision)
+                    result["match_type"] = match_type
+                    return result
                 self.mode_compressed[self.mode_ids == best_mode] = False
             else:
+                if gain_provided:
+                    confirmed, gain_ema, gain_threshold, pending_count = (
+                        self._confirm_new_mode(best_mode, gain_value)
+                    )
+                    decision.update({
+                        "gain_ema": gain_ema,
+                        "gain_threshold": gain_threshold,
+                        "confirmation_count": pending_count,
+                    })
+                else:
+                    # Legacy callers do not have the signed local-adaptation
+                    # gain needed by the confirmation gate.  Preserve their
+                    # historical immediate-admission behavior; production
+                    # wake/inference paths pass ``prediction_gain`` and use
+                    # the persistent queue/confirmation policy above.
+                    confirmed = True
+                if not (confirmed or force_new_mode_confirmation):
+                    return {
+                        "action": "queue",
+                        "index": -1,
+                        "mode_id": best_mode,
+                        "support": 0.0,
+                        "match_type": "pending_new_dynamics",
+                        **decision,
+                    }
+                self._mode_pending_gain_ema.pop(best_mode, None)
+                self._mode_pending_gain_count.pop(best_mode, None)
                 mode_id = self._next_mode_id
                 self._next_mode_id += 1
                 self._make_space(law_key_builder)
@@ -1981,12 +2421,26 @@ class MemoryBank:
 
         if len(self) > self.capacity:
             raise RuntimeError("prototype admission exceeded the hard bank capacity")
-        return {
+        if append_is_duplicate_seed:
+            self._append_adaptive_value(
+                self._mode_normal_gains, int(mode_id), gain_value
+            )
+        else:
+            self._record_in_mode_observation(
+                int(mode_id),
+                distance=float(decision["distance"]),
+                prediction_gain=gain_value,
+                duplicate=False,
+            )
+        result = {
             "action": "append",
+            "match_type": match_type,
             "index": int(index),
             "mode_id": int(mode_id),
             "support": 1.0,
         }
+        result.update(decision)
+        return result
         
 
     @torch.no_grad()
@@ -2030,6 +2484,7 @@ class MemoryBank:
     ):
         if self.keys.shape[0] == 0:
             return query.new_zeros(self.param_dim), {}
+        self._ensure_prototype_state()
         if query.device != self.keys.device:
             raise ValueError(
                 f"query is on {query.device}, memory bank is on {self.keys.device}"
@@ -2037,7 +2492,7 @@ class MemoryBank:
 
         delta_epi, info = retriever(
             query=query,
-            keys=self.keys,
+            keys=self.context_keys,
             deltas=self.deltas,
             usage=self.usage,
             age=(
@@ -2046,6 +2501,7 @@ class MemoryBank:
                 else self.effective_age(age_clock)
             ),
             write_quality=self.write_quality,
+            context_valid=self.context_valid,
         )
 
         if update_state:
@@ -2084,6 +2540,9 @@ class MemoryBank:
         self._ensure_prototype_state()
         keep_idx = keep_idx.to(device=self.device, dtype=torch.long).sort().values
         self.keys = self.keys[keep_idx]
+        self.context_keys = self.context_keys[keep_idx]
+        self.context_valid = self.context_valid[keep_idx]
+        self.context_support = self.context_support[keep_idx]
         self.deltas = self.deltas[keep_idx]
         self.write_quality = self.write_quality[keep_idx]
         self.queue_weight = self.queue_weight[keep_idx]
@@ -2098,6 +2557,17 @@ class MemoryBank:
         self.stale_cycles = self.stale_cycles[keep_idx]
         self.age = self.age[keep_idx]
         self.windows = [self.windows[i] for i in keep_idx.detach().cpu().tolist()]
+        remaining_modes = set(self.mode_ids.detach().cpu().tolist())
+        for values_by_mode in (
+            self._mode_duplicate_distances,
+            self._mode_distances,
+            self._mode_normal_gains,
+            self._mode_pending_gain_ema,
+            self._mode_pending_gain_count,
+        ):
+            for mode_id in list(values_by_mode):
+                if int(mode_id) not in remaining_modes:
+                    values_by_mode.pop(mode_id, None)
         self._sync_fixed_storage()
 
     @torch.no_grad()
@@ -2110,16 +2580,39 @@ class MemoryBank:
         node_id: Optional[str] = None,
     ) -> None:
         """Append aligned rows from another bank, optionally replacing deltas."""
-        if self.key_dim != source.key_dim or self.param_dim != source.param_dim:
-            raise ValueError("source and target MemoryBank dimensions must match")
+        # Repair legacy/intermediate banks before inspecting alias width.  A
+        # checkpoint can carry context tensors without the explicit capacity
+        # attribute, in which case ``_ensure_prototype_state`` infers it from
+        # the serialized tensor shape.
         self._ensure_prototype_state()
         source._ensure_prototype_state()
+        target_alias_capacity = int(
+            getattr(self, "context_alias_capacity", 3)
+        )
+        source_alias_capacity = int(
+            getattr(source, "context_alias_capacity", 3)
+        )
+        if (
+            self.key_dim != source.key_dim
+            or self.param_dim != source.param_dim
+            or target_alias_capacity != source_alias_capacity
+        ):
+            raise ValueError("source and target MemoryBank dimensions must match")
         indices = indices.to(device=source.device, dtype=torch.long).sort().values
         selected_deltas = source.deltas[indices] if deltas is None else deltas
         selected_deltas = selected_deltas.to(self.device)
         if selected_deltas.shape != (indices.numel(), self.param_dim):
             raise ValueError("replacement deltas have an invalid shape")
         self.keys = torch.cat([self.keys, source.keys[indices].to(self.device)], dim=0)
+        self.context_keys = torch.cat(
+            [self.context_keys, source.context_keys[indices].to(self.device)], dim=0
+        )
+        self.context_valid = torch.cat(
+            [self.context_valid, source.context_valid[indices].to(self.device)], dim=0
+        )
+        self.context_support = torch.cat(
+            [self.context_support, source.context_support[indices].to(self.device)], dim=0
+        )
         self.deltas = torch.cat([self.deltas, selected_deltas], dim=0)
         self.write_quality = torch.cat(
             [
@@ -2161,6 +2654,23 @@ class MemoryBank:
             self.mode_ids,
             torch.tensor(remapped, device=self.device, dtype=torch.long),
         ])
+        for source_mode, target_mode in mode_map.items():
+            for source_values, target_values in (
+                (source._mode_duplicate_distances, self._mode_duplicate_distances),
+                (source._mode_distances, self._mode_distances),
+                (source._mode_normal_gains, self._mode_normal_gains),
+            ):
+                if int(source_mode) in source_values:
+                    target_values[int(target_mode)] = list(
+                        source_values[int(source_mode)]
+                    )[-self.adaptive_history_size:]
+            if int(source_mode) in source._mode_pending_gain_ema:
+                self._mode_pending_gain_ema[int(target_mode)] = float(
+                    source._mode_pending_gain_ema[int(source_mode)]
+                )
+                self._mode_pending_gain_count[int(target_mode)] = int(
+                    source._mode_pending_gain_count.get(int(source_mode), 0)
+                )
         self.mode_compressed = torch.cat(
             [self.mode_compressed, source.mode_compressed[indices].to(self.device)], dim=0
         )
@@ -2183,6 +2693,9 @@ class MemoryBank:
     def clear(self) -> None:
         """Remove every entry while preserving device, dtype, and dimensions."""
         self.keys = self.keys[:0]
+        self.context_keys = self.context_keys[:0]
+        self.context_valid = self.context_valid[:0]
+        self.context_support = self.context_support[:0]
         self.deltas = self.deltas[:0]
         self.write_quality = self.write_quality[:0]
         self.queue_weight = self.queue_weight[:0]
@@ -2197,6 +2710,11 @@ class MemoryBank:
         self.stale_cycles = self.stale_cycles[:0]
         self.age = self.age[:0]
         self.windows = []
+        self._mode_duplicate_distances.clear()
+        self._mode_distances.clear()
+        self._mode_normal_gains.clear()
+        self._mode_pending_gain_ema.clear()
+        self._mode_pending_gain_count.clear()
         self._bind_fixed_storage_views(0)
     
     @torch.no_grad()

@@ -337,7 +337,17 @@ class Controller(nn.Module):
             weighted_similarity = q_t.new_tensor(-1.0)
             return novelty, count, weighted_similarity
 
-        sims = self.cosine_sims(q_t, bank.keys.to(q_t.device))
+        bank._ensure_prototype_state()
+        aliases = F.normalize(bank.context_keys.to(q_t.device), dim=-1)
+        normalized_query = F.normalize(q_t, dim=0)
+        alias_sims = torch.einsum("mkd,d->mk", aliases, normalized_query)
+        sims = alias_sims.masked_fill(
+            ~bank.context_valid.to(q_t.device), -torch.inf
+        ).max(dim=-1).values
+        # Keep invalid rows out of the softmax/count paths. A valid bank row
+        # always has at least one alias; this fallback only protects malformed
+        # legacy state from propagating NaNs through diagnostics.
+        sims = torch.where(torch.isfinite(sims), sims, torch.zeros_like(sims))
         beta = F.softmax(self.novelty_temperature * sims, dim=0)
         weighted_similarity = (beta * sims).sum()
         novelty = (1.0 - weighted_similarity) / 2.0
@@ -1579,7 +1589,7 @@ class Controller(nn.Module):
                 queue_weight=queue_weight,
             )
 
-            self._require_episodic_memory().add_memory(
+            admission = self._require_episodic_memory().add_memory(
                 node_id=hat_leaf,
                 key=written_item.key,
                 delta_theta=written_item.delta_theta,
@@ -1589,7 +1599,8 @@ class Controller(nn.Module):
                 semantic_theta=sem_params[hat_leaf].detach(),
                 decays=self.nll_fn.decays.detach(),
             )
-            self.split_queues[hat_leaf] += written_item.queue_weight
+            if admission["action"] != "queue":
+                self.split_queues[hat_leaf] += written_item.queue_weight
 
         return {
             "loss": loss_t,
