@@ -1011,13 +1011,21 @@ class SleepCoordinationTests(unittest.TestCase):
             memory_key_dim=3,
             memory_capacity_per_node=2,
         )
+        distinct_keys = (
+            torch.tensor([1.0, 0.0, 0.0]),
+            torch.tensor([0.0, 1.0, 0.0]),
+            torch.tensor([0.0, 0.0, 1.0]),
+            torch.tensor([-1.0, 0.0, 0.0]),
+        )
+        key_index = 0
         for child_id in tree.leaf_ids:
             for index in range(2):
                 tree.episodic_memory.add_memory(
                     child_id,
-                    torch.full((3,), float(index + 1)),
+                    distinct_keys[key_index],
                     torch.zeros(tree.param_dim),
                 )
+                key_index += 1
         collapse_leaf_pair(tree, "root")
         self.assertEqual(len(tree.episodic_memory.get_bank("root")), 4)
         self.assertEqual(tree.episodic_memory.get_bank("root").capacity, 4)

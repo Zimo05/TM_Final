@@ -120,6 +120,11 @@ def _frontier_config_from_checkpoint(
 class WakeObjectiveConfig:
     lambda_wm: float = 1e-3
     lambda_write: float = 1e-3
+    # Persistent-memory identity is matched in effective Hawkes-law space.
+    # duplicate > mode gives: refresh / append-within-mode / new-mode.
+    prototype_duplicate_threshold: float = 0.98
+    prototype_mode_threshold: float = 0.90
+    prototype_mode_capacity: int = 12
     # Deprecated threshold-controller fields retained so old YAML/checkpoints
     # still deserialize. The sequential controller no longer branches on them.
     write_surrogate_temperature: float = 0.25

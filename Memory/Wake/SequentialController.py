@@ -1586,6 +1586,8 @@ class Controller(nn.Module):
                 window=written_item.window,
                 write_quality=written_item.write_quality,
                 queue_weight=written_item.queue_weight,
+                semantic_theta=sem_params[hat_leaf].detach(),
+                decays=self.nll_fn.decays.detach(),
             )
             self.split_queues[hat_leaf] += written_item.queue_weight
 

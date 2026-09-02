@@ -41,6 +41,8 @@ class InferenceConfig:
     probe_write_counterfactuals: bool = False
     write_probe_random_count: int = 16
     write_probe_seed: int = 42
+    prototype_duplicate_threshold: Optional[float] = None
+    prototype_mode_threshold: Optional[float] = None
     # Local Write acceptance only creates an invisible probation candidate.
     # Persistent admission requires reuse evidence from independent sequences.
     probation_capacity: int = 1024
@@ -109,6 +111,23 @@ class MemoryTreeInference:
         self.tree = tree.to(self.device).eval()
         self.hawkes = hawkes.to(self.device).eval()
         self.encoder = encoder.to(self.device).eval()
+        self.tree.episodic_memory.configure_prototype_memory(
+            duplicate_threshold=(
+                self.wake_config.prototype_duplicate_threshold
+                if self.config.prototype_duplicate_threshold is None
+                else self.config.prototype_duplicate_threshold
+            ),
+            mode_threshold=(
+                self.wake_config.prototype_mode_threshold
+                if self.config.prototype_mode_threshold is None
+                else self.config.prototype_mode_threshold
+            ),
+            mode_capacity=self.wake_config.prototype_mode_capacity,
+        )
+        self.tree.episodic_memory.rebuild_law_keys(
+            self.tree.semantic_theta,
+            self.hawkes.decays,
+        )
         self.write_probation = WriteProbationBuffer(
             capacity=self.config.probation_capacity
         )
@@ -711,6 +730,8 @@ class MemoryTreeInference:
                         owner_id, item.key, item.delta_theta,
                         write_quality=base["bounded_gain"],
                         queue_weight=request["queue_weight"],
+                        semantic_theta=self.tree.semantic_theta(owner_id).detach(),
+                        decays=self.hawkes.decays.detach(),
                     )
                     request["_physical_probe_memory"] = treatment_memory
                     request["_physical_probe_clock"] = original_clock
@@ -788,6 +809,8 @@ class MemoryTreeInference:
             item.window,
             write_quality=item.write_quality,
             queue_weight=item.queue_weight,
+            semantic_theta=self.tree.semantic_theta(owner_id).detach(),
+            decays=self.hawkes.decays.detach(),
         )
         self.controller.split_queues[
             owner_id
@@ -1008,6 +1031,8 @@ class MemoryTreeInference:
                 candidate.window,
                 write_quality=quality,
                 queue_weight=candidate.queue_weight,
+                semantic_theta=self.tree.semantic_theta(candidate.owner_id).detach(),
+                decays=self.hawkes.decays.detach(),
             )
             # This is the sole probation-to-Split bridge. Before promotion the
             # candidate is absent from both the bank and the trigger queue.

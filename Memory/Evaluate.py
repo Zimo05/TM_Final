@@ -444,6 +444,8 @@ def run_variant(
     device: str | None,
     progress_dir: Path | None = None,
     resume_partial: bool = False,
+    prototype_duplicate_threshold: float | None = None,
+    prototype_mode_threshold: float | None = None,
 ) -> tuple[list[dict], MemoryTreeInference, float]:
     settings = VARIANTS[variant]
     inference = MemoryTreeInference.from_checkpoint(
@@ -457,6 +459,8 @@ def run_variant(
                 variant in {"full_online", "full_online_no_write"}
             ),
             write_probe_seed=42,
+            prototype_duplicate_threshold=prototype_duplicate_threshold,
+            prototype_mode_threshold=prototype_mode_threshold,
         ),
     )
     if not settings["episodic"]:
@@ -631,6 +635,8 @@ def preflight_checkpoint(
     checkpoint: Path,
     sequence: Mapping[str, Any],
     device: str | None,
+    prototype_duplicate_threshold: float | None = None,
+    prototype_mode_threshold: float | None = None,
 ) -> None:
     """Exercise one causal sequence before starting expensive ablations."""
     inference = MemoryTreeInference.from_checkpoint(
@@ -640,6 +646,8 @@ def preflight_checkpoint(
             adapt_working_memory=True,
             allow_memory_writes=False,
             update_memory_usage=False,
+            prototype_duplicate_threshold=prototype_duplicate_threshold,
+            prototype_mode_threshold=prototype_mode_threshold,
         ),
     )
     result = inference.run_sequence(sequence)
@@ -1395,6 +1403,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bootstrap-samples", type=int, default=1000)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--prototype-duplicate-threshold", type=float, default=None)
+    parser.add_argument("--prototype-mode-threshold", type=float, default=None)
     parser.add_argument("--max-test-sequences", type=int, default=None)
     parser.add_argument("--split-manifest", type=Path, default=None)
     parser.add_argument("--quick-per-cluster", type=int, default=None)
@@ -1478,7 +1488,13 @@ def main() -> None:
     )
     print(f"[Preflight] validating checkpoint on source sequence "
           f"{sequences[0]['source_index']}")
-    preflight_checkpoint(args.checkpoint, sequences[0], args.device)
+    preflight_checkpoint(
+        args.checkpoint,
+        sequences[0],
+        args.device,
+        args.prototype_duplicate_threshold,
+        args.prototype_mode_threshold,
+    )
     print("[Preflight] passed")
     variants = args.variants
     if variants is None:
@@ -1498,13 +1514,22 @@ def main() -> None:
         # be reused safely because each variant starts from the same checkpoint.
         if args.resume and completed_path.is_file():
             rows = json.loads(completed_path.read_text(encoding="utf-8"))
-            inference = MemoryTreeInference.from_checkpoint(args.checkpoint, device=args.device)
+            inference = MemoryTreeInference.from_checkpoint(
+                args.checkpoint,
+                device=args.device,
+                inference_config=InferenceConfig(
+                    prototype_duplicate_threshold=args.prototype_duplicate_threshold,
+                    prototype_mode_threshold=args.prototype_mode_threshold,
+                ),
+            )
             elapsed = 0.0
             print(f"[Resume] reused completed variant {variant}")
         else:
             rows, inference, elapsed = run_variant(
                 args.checkpoint, sequences, variant, args.device, args.output_dir,
                 resume_partial=args.resume,
+                prototype_duplicate_threshold=args.prototype_duplicate_threshold,
+                prototype_mode_threshold=args.prototype_mode_threshold,
             )
             completed_path.write_text(json.dumps(_jsonable(rows)), encoding="utf-8")
         all_rows[variant] = rows
@@ -1591,7 +1616,12 @@ def main() -> None:
                 f"frozen-policy base checkpoint is missing: {frozen_base_path}"
             )
         base_rows, _, _ = run_variant(
-            frozen_base_path, sequences, "full_frozen", args.device
+            frozen_base_path,
+            sequences,
+            "full_frozen",
+            args.device,
+            prototype_duplicate_threshold=args.prototype_duplicate_threshold,
+            prototype_mode_threshold=args.prototype_mode_threshold,
         )
         expected_frozen_sha = frozen_event_sha256(base_rows)
         expected_frozen_sources = actual_frozen_sources

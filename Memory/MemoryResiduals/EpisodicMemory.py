@@ -1,5 +1,5 @@
 from collections.abc import Mapping
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,7 @@ from .MemoryBank import (
     SmoothSparseRetriever,
     TreeMemoryRead,
     UpdateHawkesParameter,
+    effective_hawkes_law_key,
 )
 from .SimilarityFeatures import local_recurrence_count
 
@@ -52,6 +53,17 @@ class TreeEpisodicMemory(nn.Module):
             num_basis=num_basis,
         )
         self.param_dim = self.parameter_update.param_dim
+        self._prototype_policy = {
+            "duplicate_threshold": 0.98,
+            "mode_threshold": 0.90,
+            "mode_capacity": 12,
+            "ema_beta_min": 0.01,
+            "ema_beta_max": 0.25,
+            "retention_support_weight": 1.0,
+            "retention_usage_weight": 0.5,
+            "retention_stale_weight": 1.0,
+            "retention_age_weight": 0.1,
+        }
         self.query_net = (
             MemoryQueryNet(input_dim=query_input_dim, key_dim=key_dim)
             if query_input_dim is not None
@@ -99,6 +111,12 @@ class TreeEpisodicMemory(nn.Module):
             bank.deltas = fn(bank.deltas)
             bank.write_quality = fn(bank.write_quality)
             bank.queue_weight = fn(bank.queue_weight)
+            bank.law_keys = fn(bank.law_keys)
+            bank.support = fn(bank.support)
+            bank.quality_mass = fn(bank.quality_mass)
+            bank.split_mass = fn(bank.split_mass)
+            bank.mode_ids = fn(bank.mode_ids)
+            bank.mode_compressed = fn(bank.mode_compressed)
             bank.usage = fn(bank.usage)
             bank.cycle_usage = fn(bank.cycle_usage)
             bank.stale_cycles = fn(bank.stale_cycles)
@@ -238,9 +256,59 @@ class TreeEpisodicMemory(nn.Module):
                 param_dim=self.param_dim,
                 capacity=self.capacity_per_node,
             )
+            bank.configure_prototype_policy(**self._prototype_policy)
             bank._age_reference_clock = self._age_clock
             self.banks[node_id] = bank
         return self.banks[node_id]
+
+    def configure_prototype_memory(self, **settings) -> None:
+        """Configure two-level dynamics matching for existing and future banks."""
+        merged = dict(self._prototype_policy)
+        merged.update(settings)
+        # Validate through a real bank when one exists, otherwise use a small
+        # temporary instance so bad CLI settings fail at construction time.
+        validator = next(iter(self.banks.values()), None)
+        if validator is None:
+            validator = MemoryBank(
+                device=str(self.device),
+                key_dim=self.key_dim,
+                param_dim=self.param_dim,
+                capacity=self.capacity_per_node,
+            )
+        validator.configure_prototype_policy(**merged)
+        self._prototype_policy = merged
+        for bank in self.banks.values():
+            bank.configure_prototype_policy(**merged)
+
+    @torch.no_grad()
+    def rebuild_law_keys(
+        self,
+        semantic_theta_for_node: Callable[[str], Tensor],
+        decays: Tensor,
+    ) -> None:
+        """Migrate existing/legacy rows to effective-Hawkes-law identity."""
+        for node_id, bank in self.banks.items():
+            bank._ensure_prototype_state()
+            if len(bank) == 0:
+                continue
+            try:
+                semantic_theta = semantic_theta_for_node(node_id).detach()
+            except KeyError:
+                # A delayed topology reconciliation can leave an inaccessible
+                # bank in a checkpoint; it is never read and will be removed
+                # by the normal node synchronization transaction.
+                continue
+            bank.law_keys = torch.stack([
+                effective_hawkes_law_key(
+                    semantic_theta=semantic_theta,
+                    delta_theta=delta,
+                    decays=decays,
+                    num_event_types=self.parameter_update.D,
+                    num_basis=self.parameter_update.M,
+                    key_dim=self.key_dim,
+                ).to(bank.keys)
+                for delta in bank.deltas
+            ])
 
     def sync_nodes(self, node_ids: Iterable[str], remove_stale: bool = False) -> None:
         active_ids = set(node_ids)
@@ -258,17 +326,38 @@ class TreeEpisodicMemory(nn.Module):
         window: Optional[EventWindow] = None,
         write_quality: float | Tensor = 1.0,
         queue_weight: float | Tensor = 0.0,
-    ) -> None:
+        semantic_theta: Optional[Tensor] = None,
+        decays: Optional[Tensor] = None,
+        law_key: Optional[Tensor] = None,
+    ) -> Dict[str, int | float | str]:
         bank = self.get_bank(node_id)
         # A newly written item must have age zero at the current event clock,
         # while existing rows retain their accumulated effective age.
         bank.materialize_age(self._age_clock)
-        bank.add(
+        law_key_builder = None
+        if semantic_theta is not None or decays is not None:
+            if semantic_theta is None or decays is None:
+                raise ValueError("semantic_theta and decays must be provided together")
+
+            def law_key_builder(candidate_delta: Tensor) -> Tensor:
+                return effective_hawkes_law_key(
+                    semantic_theta=semantic_theta,
+                    delta_theta=candidate_delta,
+                    decays=decays,
+                    num_event_types=self.parameter_update.D,
+                    num_basis=self.parameter_update.M,
+                    key_dim=self.key_dim,
+                )
+
+            law_key = law_key_builder(delta_theta)
+        return bank.add(
             key=key,
             delta_theta=delta_theta,
             window=window,
             write_quality=write_quality,
             queue_weight=queue_weight,
+            law_key=law_key,
+            law_key_builder=law_key_builder,
         )
 
     def read_nodes(
@@ -973,6 +1062,13 @@ class TreeEpisodicMemory(nn.Module):
                 "deltas": bank.deltas.detach().cpu(),
                 "write_quality": bank.write_quality.detach().cpu(),
                 "queue_weight": bank.queue_weight.detach().cpu(),
+                "law_keys": bank.law_keys.detach().cpu(),
+                "support": bank.support.detach().cpu(),
+                "quality_mass": bank.quality_mass.detach().cpu(),
+                "split_mass": bank.split_mass.detach().cpu(),
+                "mode_ids": bank.mode_ids.detach().cpu(),
+                "mode_compressed": bank.mode_compressed.detach().cpu(),
+                "next_mode_id": int(bank._next_mode_id),
                 "usage": bank.usage.detach().cpu(),
                 "cycle_usage": bank.cycle_usage.detach().cpu(),
                 "stale_cycles": bank.stale_cycles.detach().cpu(),
@@ -984,6 +1080,7 @@ class TreeEpisodicMemory(nn.Module):
                 # across checkpoints so the restored bank is not immediately
                 # inconsistent with its own capacity before reconciliation.
                 "capacity": int(bank.capacity),
+                "prototype_policy": dict(self._prototype_policy),
             }
             for node_id, bank in self.banks.items()
         }
@@ -1006,6 +1103,28 @@ class TreeEpisodicMemory(nn.Module):
                 "queue_weight",
                 torch.zeros(memory_count),
             ).to(self.device)
+            bank.law_keys = bank_state.get(
+                "law_keys", bank.keys.clone()
+            ).to(self.device)
+            bank.support = bank_state.get(
+                "support", torch.ones(memory_count)
+            ).to(self.device)
+            bank.quality_mass = bank_state.get(
+                "quality_mass", bank.write_quality.cpu() * bank.support.cpu()
+            ).to(self.device)
+            bank.split_mass = bank_state.get(
+                "split_mass", bank.queue_weight.cpu() * bank.support.cpu()
+            ).to(self.device)
+            bank.mode_ids = bank_state.get(
+                "mode_ids", torch.arange(memory_count, dtype=torch.long)
+            ).to(self.device)
+            bank.mode_compressed = bank_state.get(
+                "mode_compressed", torch.zeros(memory_count, dtype=torch.bool)
+            ).to(self.device)
+            bank._next_mode_id = int(bank_state.get("next_mode_id", memory_count))
+            if "prototype_policy" in bank_state:
+                self._prototype_policy.update(bank_state["prototype_policy"])
+                bank.configure_prototype_policy(**self._prototype_policy)
             bank.usage = bank_state["usage"].to(self.device)
             # Backward-compatible defaults for checkpoints written before
             # cycle-level pruning state was introduced.

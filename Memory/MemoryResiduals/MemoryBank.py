@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass, replace
 from numbers import Real
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,58 @@ class MemoryItem:
     age: int = 0
     write_quality: float = 1.0
     queue_weight: float = 0.0
+    # Number of independent persistent observations represented by this
+    # physical prototype row. Retrieval usage remains a separate statistic.
+    support: float = 1.0
+
+
+def _signed_hash_projection(feature: Tensor, output_dim: int) -> Tensor:
+    """Deterministically project a physical-law feature without parameters."""
+    flat = feature.reshape(-1)
+    positions = torch.arange(flat.numel(), device=flat.device, dtype=torch.long)
+    buckets = torch.remainder(positions * 2654435761, output_dim)
+    signs = torch.where(
+        torch.remainder(positions * 2246822519 + 3266489917, 2) == 0,
+        flat.new_ones(()),
+        -flat.new_ones(()),
+    )
+    projected = flat.new_zeros(output_dim)
+    projected.index_add_(0, buckets, signs * flat)
+    return F.normalize(projected.reshape(1, -1), dim=-1).reshape(-1)
+
+
+def effective_hawkes_law_key(
+    semantic_theta: Tensor,
+    delta_theta: Tensor,
+    decays: Tensor,
+    *,
+    num_event_types: int,
+    num_basis: int,
+    key_dim: int,
+) -> Tensor:
+    """Identity of the effective physical Hawkes law.
+
+    The key is derived from ``semantic_theta + delta_theta`` after mapping the
+    unconstrained baseline and kernels to physical parameters.  Consequently
+    a Light-Sleep semantic rebase that preserves the effective law also
+    preserves this identity.
+    """
+    effective = semantic_theta.detach().reshape(-1) + delta_theta.detach().reshape(-1)
+    expected = num_event_types + num_event_types * num_event_types * num_basis
+    if effective.numel() != expected:
+        raise ValueError(f"effective Hawkes theta must contain {expected} values")
+    decay = decays.detach().reshape(-1).to(effective)
+    if decay.numel() != num_basis or bool((decay <= 0).any()):
+        raise ValueError("decays must contain one positive value per basis")
+    raw_mu = effective[:num_event_types]
+    raw_w = effective[num_event_types:].reshape(
+        num_event_types, num_event_types, num_basis
+    )
+    mu = F.softplus(raw_mu)
+    integrated_excitation = (F.softplus(raw_w) / decay.reshape(1, 1, -1)).sum(-1)
+    return _signed_hash_projection(
+        torch.cat([mu, integrated_excitation.reshape(-1)]), key_dim
+    )
 
 
 @dataclass
@@ -834,6 +886,26 @@ class MemoryBank:
         self.deltas = torch.empty(0, param_dim, device=self.device)
         self.write_quality = torch.empty(0, device=self.device)
         self.queue_weight = torch.empty(0, device=self.device)
+        # Prototype/mode state.  ``keys`` remain the retrieval (context)
+        # identity; ``law_keys`` are used only for duplicate and dynamics-mode
+        # matching.
+        self.law_keys = torch.empty(0, key_dim, device=self.device)
+        self.support = torch.empty(0, device=self.device)
+        self.quality_mass = torch.empty(0, device=self.device)
+        self.split_mass = torch.empty(0, device=self.device)
+        self.mode_ids = torch.empty(0, dtype=torch.long, device=self.device)
+        self.mode_compressed = torch.empty(0, dtype=torch.bool, device=self.device)
+        self._next_mode_id = 0
+
+        self.duplicate_threshold = 0.98
+        self.mode_threshold = 0.90
+        self.mode_capacity = 12
+        self.ema_beta_min = 0.01
+        self.ema_beta_max = 0.25
+        self.retention_support_weight = 1.0
+        self.retention_usage_weight = 0.5
+        self.retention_stale_weight = 1.0
+        self.retention_age_weight = 0.1
 
         self.windows: List[Optional[EventWindow]] = []
         self.usage = torch.empty(0, device=self.device)
@@ -852,6 +924,203 @@ class MemoryBank:
 
     def __len__(self) -> int:
         return self.keys.shape[0]
+
+    def configure_prototype_policy(
+        self,
+        *,
+        duplicate_threshold: float,
+        mode_threshold: float,
+        mode_capacity: int = 12,
+        ema_beta_min: float = 0.01,
+        ema_beta_max: float = 0.25,
+        retention_support_weight: float = 1.0,
+        retention_usage_weight: float = 0.5,
+        retention_stale_weight: float = 1.0,
+        retention_age_weight: float = 0.1,
+    ) -> None:
+        if not -1.0 <= mode_threshold < duplicate_threshold <= 1.0:
+            raise ValueError(
+                "prototype thresholds must satisfy -1 <= mode < duplicate <= 1"
+            )
+        if mode_capacity <= 0:
+            raise ValueError("mode_capacity must be positive")
+        if not 0.0 < ema_beta_min <= ema_beta_max <= 1.0:
+            raise ValueError("EMA bounds must satisfy 0 < min <= max <= 1")
+        if min(
+            retention_support_weight,
+            retention_usage_weight,
+            retention_stale_weight,
+            retention_age_weight,
+        ) < 0.0:
+            raise ValueError("retention weights must be non-negative")
+        self.duplicate_threshold = float(duplicate_threshold)
+        self.mode_threshold = float(mode_threshold)
+        self.mode_capacity = int(mode_capacity)
+        self.ema_beta_min = float(ema_beta_min)
+        self.ema_beta_max = float(ema_beta_max)
+        self.retention_support_weight = float(retention_support_weight)
+        self.retention_usage_weight = float(retention_usage_weight)
+        self.retention_stale_weight = float(retention_stale_weight)
+        self.retention_age_weight = float(retention_age_weight)
+
+    @torch.no_grad()
+    def _ensure_prototype_state(self) -> None:
+        """Repair old checkpoints and topology operations lazily."""
+        count = len(self)
+        if self.law_keys.shape != (count, self.key_dim):
+            self.law_keys = self.keys.detach().clone()
+        if self.support.shape != (count,):
+            self.support = self.keys.new_ones(count)
+        if self.quality_mass.shape != (count,):
+            self.quality_mass = self.write_quality * self.support
+        if self.split_mass.shape != (count,):
+            self.split_mass = self.queue_weight * self.support
+        if self.mode_ids.shape != (count,):
+            self.mode_ids = torch.arange(count, device=self.device, dtype=torch.long)
+        if self.mode_compressed.shape != (count,):
+            self.mode_compressed = torch.zeros(count, device=self.device, dtype=torch.bool)
+        self._next_mode_id = max(
+            int(self._next_mode_id),
+            int(self.mode_ids.max().item()) + 1 if count else 0,
+        )
+
+    @torch.no_grad()
+    def _refresh_prototype(
+        self,
+        index: int,
+        *,
+        key: Tensor,
+        delta_theta: Tensor,
+        law_key: Tensor,
+        window: Optional[EventWindow],
+        quality: Tensor,
+        queue: Tensor,
+        law_key_builder: Optional[Callable[[Tensor], Tensor]],
+    ) -> Dict[str, int | float | str]:
+        old_support = self.support[index].clamp_min(1.0)
+        beta = torch.clamp(
+            1.0 / (old_support + 1.0),
+            min=self.ema_beta_min,
+            max=self.ema_beta_max,
+        )
+        self.deltas[index].mul_(1.0 - beta).add_(delta_theta.reshape(-1), alpha=float(beta))
+        blended_key = (1.0 - beta) * self.keys[index] + beta * key.reshape(-1)
+        self.keys[index] = F.normalize(blended_key.reshape(1, -1), dim=-1).reshape(-1)
+        if law_key_builder is not None:
+            refreshed_law = law_key_builder(self.deltas[index])
+        else:
+            refreshed_law = (1.0 - beta) * self.law_keys[index] + beta * law_key.reshape(-1)
+        self.law_keys[index] = F.normalize(
+            refreshed_law.detach().reshape(1, -1).to(self.law_keys), dim=-1
+        ).reshape(-1)
+        self.support[index] = old_support + 1.0
+        self.quality_mass[index] += quality.reshape(())
+        self.split_mass[index] += queue.reshape(())
+        self.write_quality[index] = self.quality_mass[index] / self.support[index]
+        self.queue_weight[index] = self.split_mass[index] / self.support[index]
+        self.age[index] = 0.0
+        self.stale_cycles[index] = 0.0
+        if window is not None:
+            self.windows[index] = window
+        return {
+            "action": "refresh",
+            "index": int(index),
+            "mode_id": int(self.mode_ids[index].item()),
+            "support": float(self.support[index].item()),
+        }
+
+    def _mode_retention(self, mode_id: int) -> Tensor:
+        rows = self.mode_ids == int(mode_id)
+        support = self.support[rows].sum()
+        usage = (self.usage[rows] + self.cycle_usage[rows]).sum()
+        stale = self.stale_cycles[rows].max()
+        age = (self.age[rows] * self.support[rows]).sum() / support.clamp_min(1.0)
+        return (
+            self.retention_support_weight * torch.log1p(support)
+            + self.retention_usage_weight * torch.log1p(usage)
+            - self.retention_stale_weight * stale
+            - self.retention_age_weight * torch.log1p(age)
+        )
+
+    @torch.no_grad()
+    def _compress_mode(
+        self,
+        mode_id: int,
+        law_key_builder: Optional[Callable[[Tensor], Tensor]],
+    ) -> bool:
+        indices = torch.nonzero(self.mode_ids == int(mode_id), as_tuple=False).flatten()
+        if indices.numel() <= 1:
+            return False
+        support = self.support[indices]
+        weights = support * self.write_quality[indices].clamp_min(0.0)
+        if not bool((weights.sum() > 0.0)):
+            weights = support
+        normalized = weights / weights.sum().clamp_min(torch.finfo(weights.dtype).eps)
+        target = int(indices[0].item())
+        compressed_delta = (normalized[:, None] * self.deltas[indices]).sum(0)
+        compressed_key = F.normalize(
+            (normalized[:, None] * self.keys[indices]).sum(0, keepdim=True), dim=-1
+        ).reshape(-1)
+        if law_key_builder is not None:
+            compressed_law = law_key_builder(compressed_delta)
+        else:
+            compressed_law = F.normalize(
+                (normalized[:, None] * self.law_keys[indices]).sum(0, keepdim=True),
+                dim=-1,
+            ).reshape(-1)
+        total_support = support.sum()
+        support_average = support / total_support.clamp_min(1.0)
+        self.keys[target] = compressed_key
+        self.deltas[target] = compressed_delta
+        self.law_keys[target] = compressed_law.to(self.law_keys)
+        self.support[target] = total_support
+        self.quality_mass[target] = self.quality_mass[indices].sum()
+        self.split_mass[target] = self.split_mass[indices].sum()
+        self.write_quality[target] = self.quality_mass[target] / total_support.clamp_min(1.0)
+        self.queue_weight[target] = self.split_mass[target] / total_support.clamp_min(1.0)
+        self.usage[target] = (support_average * self.usage[indices]).sum()
+        self.cycle_usage[target] = (support_average * self.cycle_usage[indices]).sum()
+        self.stale_cycles[target] = self.stale_cycles[indices].max()
+        self.age[target] = (support_average * self.age[indices]).sum()
+        self.mode_compressed[target] = True
+        best_window = int(indices[torch.argmax(weights)].item())
+        self.windows[target] = self.windows[best_window]
+        keep = torch.ones(len(self), device=self.device, dtype=torch.bool)
+        keep[indices[1:]] = False
+        self.keep(torch.nonzero(keep, as_tuple=False).flatten())
+        return True
+
+    @torch.no_grad()
+    def _make_space(
+        self,
+        law_key_builder: Optional[Callable[[Tensor], Tensor]],
+        protected_mode: Optional[int] = None,
+    ) -> bool:
+        while len(self) >= self.capacity:
+            modes = torch.unique(self.mode_ids).detach().cpu().tolist()
+            compressible = [
+                int(mode) for mode in modes
+                if int((self.mode_ids == int(mode)).sum().item()) > 1
+            ]
+            if compressible:
+                victim = min(compressible, key=lambda mode: float(self._mode_retention(mode)))
+                self._compress_mode(victim, law_key_builder)
+                continue
+            # Every mode is already represented by one archive/singleton.
+            # Only now is true eviction unavoidable under the hard bank cap.
+            eviction_candidates = [
+                int(mode) for mode in modes if int(mode) != protected_mode
+            ]
+            if not eviction_candidates:
+                return False
+            victim = min(
+                eviction_candidates,
+                key=lambda mode: float(self._mode_retention(int(mode))),
+            )
+            keep = self.mode_ids != int(victim)
+            self.keep(torch.nonzero(keep, as_tuple=False).flatten())
+            break
+        return True
     
     @torch.no_grad()
     def add(
@@ -861,7 +1130,9 @@ class MemoryBank:
         window: Optional[EventWindow] = None,
         write_quality: float | Tensor = 1.0,
         queue_weight: float | Tensor = 0.0,
-    ) -> None:
+        law_key: Optional[Tensor] = None,
+        law_key_builder: Optional[Callable[[Tensor], Tensor]] = None,
+    ) -> Dict[str, int | float | str]:
         if key.numel() != self.key_dim:
             raise ValueError(
                 f"key must contain {self.key_dim} values, got {key.numel()}"
@@ -916,6 +1187,14 @@ class MemoryBank:
         # still flow through the differentiable retrieval weights.
         key = F.normalize(key.detach().reshape(1, -1), dim=-1)
         delta_theta = delta_theta.detach().reshape(1, -1)
+        if law_key is None:
+            law_key = key.reshape(-1)
+        law_key = F.normalize(
+            law_key.detach().reshape(1, -1).to(device=self.device, dtype=self.keys.dtype),
+            dim=-1,
+        )
+        if law_key.shape != (1, self.key_dim):
+            raise ValueError(f"law_key must contain {self.key_dim} values")
         memory_values_finite = (
             torch.isfinite(key).all()
             & torch.isfinite(delta_theta).all()
@@ -925,8 +1204,80 @@ class MemoryBank:
                 "episodic-memory key or residual contains NaN or Inf"
             )
 
+        self._ensure_prototype_state()
+        if len(self) > 0:
+            similarities = self.law_keys @ law_key.reshape(-1)
+            best_index = int(torch.argmax(similarities).item())
+            best_similarity = float(similarities[best_index].item())
+            best_mode = int(self.mode_ids[best_index].item())
+            if best_similarity >= self.duplicate_threshold:
+                if bool(self.mode_compressed[best_index]):
+                    self.mode_compressed[best_index] = False
+                return self._refresh_prototype(
+                    best_index,
+                    key=key,
+                    delta_theta=delta_theta,
+                    law_key=law_key,
+                    window=window,
+                    quality=quality,
+                    queue=queue,
+                    law_key_builder=law_key_builder,
+                )
+            if best_similarity >= self.mode_threshold:
+                mode_rows = torch.nonzero(
+                    self.mode_ids == best_mode, as_tuple=False
+                ).flatten()
+                if bool(self.mode_compressed[mode_rows].any()):
+                    self.mode_compressed[mode_rows] = False
+                    self.stale_cycles[mode_rows] = 0.0
+                if mode_rows.numel() >= self.mode_capacity:
+                    return self._refresh_prototype(
+                        best_index,
+                        key=key,
+                        delta_theta=delta_theta,
+                        law_key=law_key,
+                        window=window,
+                        quality=quality,
+                        queue=queue,
+                        law_key_builder=law_key_builder,
+                    )
+                mode_id = best_mode
+                if len(self) >= self.capacity and not self._make_space(
+                    law_key_builder, protected_mode=best_mode
+                ):
+                    return self._refresh_prototype(
+                        best_index,
+                        key=key,
+                        delta_theta=delta_theta,
+                        law_key=law_key,
+                        window=window,
+                        quality=quality,
+                        queue=queue,
+                        law_key_builder=law_key_builder,
+                    )
+                self.mode_compressed[self.mode_ids == best_mode] = False
+            else:
+                mode_id = self._next_mode_id
+                self._next_mode_id += 1
+                self._make_space(law_key_builder)
+        else:
+            mode_id = self._next_mode_id
+            self._next_mode_id += 1
+
         self.keys = torch.cat([self.keys, key.to(self.device)], dim=0)
         self.deltas = torch.cat([self.deltas, delta_theta.to(self.device)], dim=0)
+        self.law_keys = torch.cat([self.law_keys, law_key], dim=0)
+        self.support = torch.cat([self.support, torch.ones_like(quality)], dim=0)
+        self.quality_mass = torch.cat([self.quality_mass, quality], dim=0)
+        self.split_mass = torch.cat([self.split_mass, queue], dim=0)
+        self.mode_ids = torch.cat([
+            self.mode_ids,
+            torch.tensor([mode_id], device=self.device, dtype=torch.long),
+        ])
+        self.mode_compressed = torch.cat([
+            self.mode_compressed,
+            torch.zeros(1, device=self.device, dtype=torch.bool),
+        ])
         self.write_quality = torch.cat(
             [self.write_quality, quality],
             dim=0,
@@ -948,7 +1299,13 @@ class MemoryBank:
         self.age = torch.cat([self.age, torch.zeros(1, device=self.device)])
 
         if len(self) > self.capacity:
-            self.prune()
+            raise RuntimeError("prototype admission exceeded the hard bank capacity")
+        return {
+            "action": "append",
+            "index": len(self) - 1,
+            "mode_id": int(mode_id),
+            "support": 1.0,
+        }
         
 
     @torch.no_grad()
@@ -1043,11 +1400,18 @@ class MemoryBank:
     @torch.no_grad()
     def keep(self, keep_idx: Tensor) -> None:
         """Keep selected entries while preserving every aligned state field."""
+        self._ensure_prototype_state()
         keep_idx = keep_idx.to(device=self.device, dtype=torch.long).sort().values
         self.keys = self.keys[keep_idx]
         self.deltas = self.deltas[keep_idx]
         self.write_quality = self.write_quality[keep_idx]
         self.queue_weight = self.queue_weight[keep_idx]
+        self.law_keys = self.law_keys[keep_idx]
+        self.support = self.support[keep_idx]
+        self.quality_mass = self.quality_mass[keep_idx]
+        self.split_mass = self.split_mass[keep_idx]
+        self.mode_ids = self.mode_ids[keep_idx]
+        self.mode_compressed = self.mode_compressed[keep_idx]
         self.usage = self.usage[keep_idx]
         self.cycle_usage = self.cycle_usage[keep_idx]
         self.stale_cycles = self.stale_cycles[keep_idx]
@@ -1066,6 +1430,8 @@ class MemoryBank:
         """Append aligned rows from another bank, optionally replacing deltas."""
         if self.key_dim != source.key_dim or self.param_dim != source.param_dim:
             raise ValueError("source and target MemoryBank dimensions must match")
+        self._ensure_prototype_state()
+        source._ensure_prototype_state()
         indices = indices.to(device=source.device, dtype=torch.long).sort().values
         selected_deltas = source.deltas[indices] if deltas is None else deltas
         selected_deltas = selected_deltas.to(self.device)
@@ -1086,6 +1452,35 @@ class MemoryBank:
                 source.queue_weight[indices].to(self.device),
             ],
             dim=0,
+        )
+        self.law_keys = torch.cat(
+            [self.law_keys, source.law_keys[indices].to(self.device)], dim=0
+        )
+        self.support = torch.cat(
+            [self.support, source.support[indices].to(self.device)], dim=0
+        )
+        self.quality_mass = torch.cat(
+            [self.quality_mass, source.quality_mass[indices].to(self.device)], dim=0
+        )
+        self.split_mass = torch.cat(
+            [self.split_mass, source.split_mass[indices].to(self.device)], dim=0
+        )
+        # Mode ids are local to a bank. Allocate fresh ids so unrelated source
+        # modes cannot collide after a topology split/merge.
+        selected_modes = source.mode_ids[indices]
+        mode_map = {}
+        remapped = []
+        for mode in selected_modes.detach().cpu().tolist():
+            if mode not in mode_map:
+                mode_map[mode] = self._next_mode_id
+                self._next_mode_id += 1
+            remapped.append(mode_map[mode])
+        self.mode_ids = torch.cat([
+            self.mode_ids,
+            torch.tensor(remapped, device=self.device, dtype=torch.long),
+        ])
+        self.mode_compressed = torch.cat(
+            [self.mode_compressed, source.mode_compressed[indices].to(self.device)], dim=0
         )
         self.usage = torch.cat([self.usage, source.usage[indices].to(self.device)], dim=0)
         self.cycle_usage = torch.cat(
@@ -1108,6 +1503,12 @@ class MemoryBank:
         self.deltas = self.deltas[:0]
         self.write_quality = self.write_quality[:0]
         self.queue_weight = self.queue_weight[:0]
+        self.law_keys = self.law_keys[:0]
+        self.support = self.support[:0]
+        self.quality_mass = self.quality_mass[:0]
+        self.split_mass = self.split_mass[:0]
+        self.mode_ids = self.mode_ids[:0]
+        self.mode_compressed = self.mode_compressed[:0]
         self.usage = self.usage[:0]
         self.cycle_usage = self.cycle_usage[:0]
         self.stale_cycles = self.stale_cycles[:0]

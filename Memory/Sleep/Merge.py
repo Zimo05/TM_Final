@@ -463,30 +463,7 @@ def _append_bank_rows(
     indices: Tensor,
     target_node_id: str,
 ) -> None:
-    indices = indices.to(device=source.device, dtype=torch.long).sort().values
-    target.keys = torch.cat([target.keys, source.keys[indices]], dim=0)
-    target.deltas = torch.cat([target.deltas, source.deltas[indices]], dim=0)
-    target.write_quality = torch.cat(
-        [target.write_quality, source.write_quality[indices]],
-        dim=0,
-    )
-    target.queue_weight = torch.cat(
-        [target.queue_weight, source.queue_weight[indices]],
-        dim=0,
-    )
-    target.usage = torch.cat([target.usage, source.usage[indices]], dim=0)
-    target.cycle_usage = torch.cat(
-        [target.cycle_usage, source.cycle_usage[indices]], dim=0
-    )
-    target.stale_cycles = torch.cat(
-        [target.stale_cycles, source.stale_cycles[indices]], dim=0
-    )
-    target.age = torch.cat([target.age, source.age[indices]], dim=0)
-    target.windows.extend(
-        replace(source.windows[index], node_id=target_node_id)
-        if source.windows[index] is not None else None
-        for index in indices.detach().cpu().tolist()
-    )
+    target.append_from(source, indices, node_id=target_node_id)
 
 
 @torch.no_grad()
@@ -1428,27 +1405,11 @@ def _commit_merge_legacy(
             old_theta=child_thetas[child_id],
             new_theta=theta_parent,
         )
-        parent_bank.keys = torch.cat([parent_bank.keys, child_bank.keys], dim=0)
-        parent_bank.deltas = torch.cat([parent_bank.deltas, rebased_deltas], dim=0)
-        parent_bank.write_quality = torch.cat(
-            [parent_bank.write_quality, child_bank.write_quality],
-            dim=0,
-        )
-        parent_bank.queue_weight = torch.cat(
-            [parent_bank.queue_weight, child_bank.queue_weight],
-            dim=0,
-        )
-        parent_bank.usage = torch.cat([parent_bank.usage, child_bank.usage], dim=0)
-        parent_bank.cycle_usage = torch.cat(
-            [parent_bank.cycle_usage, child_bank.cycle_usage], dim=0
-        )
-        parent_bank.stale_cycles = torch.cat(
-            [parent_bank.stale_cycles, child_bank.stale_cycles], dim=0
-        )
-        parent_bank.age = torch.cat([parent_bank.age, child_bank.age], dim=0)
-        parent_bank.windows.extend(
-            replace(window, node_id=parent) if window is not None else None
-            for window in child_bank.windows
+        parent_bank.append_from(
+            child_bank,
+            torch.arange(len(child_bank), device=child_bank.device),
+            deltas=rebased_deltas,
+            node_id=parent,
         )
 
     # Filter only after parent and both child banks have been combined. A

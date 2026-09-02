@@ -89,10 +89,10 @@ class LightDeepSleepTests(unittest.TestCase):
             has_full_history=True,
         )
         delta = self._improving_residual(tree, hawkes, window)
-        for _ in range(3):
+        for memory_key in torch.eye(3):
             tree.episodic_memory.add_memory(
                 "root",
-                torch.tensor([1.0, 0.0, 0.0]),
+                memory_key,
                 delta,
                 window,
                 write_quality=1.0,

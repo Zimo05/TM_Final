@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from HawkesBackbone import HawkesFamily
 from MemoryResiduals.MemoryBank import EventWindow, MemoryBank, MemoryItem
-from MemoryResiduals.Replay import replay_log_likelihood
+from MemoryResiduals.Replay import (
+    ReplayBatchCache,
+    batched_replay_log_likelihood,
+    build_replay_batch_cache,
+    replay_log_likelihood,
+)
 from Wake.HawkesParams import HawkesParams
 from Wake.SequentialController import Controller
 
@@ -32,6 +37,8 @@ class SplitBatch:
     structural_weights: Optional[torch.Tensor] = None
     structural_strength: Optional[torch.Tensor] = None
     effective_sample_size: Optional[torch.Tensor] = None
+    # Independent observation count represented by each physical row.
+    sample_support: Optional[torch.Tensor] = None
 
 
 class SplitCommitState:
@@ -173,6 +180,7 @@ class SplitModule(nn.Module):
         residuals: torch.Tensor,
         weights: torch.Tensor,
         theta_sem: torch.Tensor,
+        sample_support: Optional[torch.Tensor] = None,
     ):
         """
         Implements equations (20)-(23).
@@ -202,17 +210,25 @@ class SplitModule(nn.Module):
         # Eq. (21): child mass is used for prototypes, while child-wise ESS
         # measures whether each candidate is supported by independent replay
         # evidence rather than one dominant weighted memory.
+        support = (
+            torch.ones_like(weights)
+            if sample_support is None
+            else sample_support.to(weights).clamp_min(0.0)
+        )
+        if support.shape != weights.shape:
+            raise ValueError("sample_support and weights must be aligned vectors")
         weighted_q = weights[:, None] * q                      # [R, 2]
-        N_mass = weighted_q.sum(dim=0)                         # [2]
+        N_mass = (support[:, None] * weighted_q).sum(dim=0)    # [2]
         N_eff = N_mass.square() / (
-            weighted_q.square().sum(dim=0) + eps
+            (support[:, None] * weighted_q.square()).sum(dim=0) + eps
         )                                                      # [2]
 
         # Eq. (21): normalized candidate mass.
         pi_bar = N_mass / (N_mass.sum() + eps)                 # [2]
 
         # Eq. (21): candidate residual prototypes.
-        delta_bar = weighted_q.T @ residuals                   # [2, P]
+        aggregate_weighted_q = support[:, None] * weighted_q
+        delta_bar = aggregate_weighted_q.T @ residuals         # [2, P]
         delta_bar = delta_bar / (N_mass[:, None] + eps)        # [2, P]
 
         # Eq. (22): parent-shared residual and child-specific deviations.
@@ -302,6 +318,7 @@ class SplitModule(nn.Module):
         theta_plus: torch.Tensor,
         theta_cand: torch.Tensor,
         hawkes_ll: Optional[HawkesFamily] = None,
+        replay_cache: Optional[ReplayBatchCache] = None,
     ):
         """
         Implements equations (24)-(26).
@@ -328,35 +345,28 @@ class SplitModule(nn.Module):
         log_route_prob = F.log_softmax(route_logits, dim=-1)           # [R, 2]
         route_prob = log_route_prob.exp()
 
-        logp0_list = []
-        logp_child_list = []
-
-        for window in batch.windows:
-            # Parent likelihood log p(w_r | theta_plus)
-            logp0_r = self._window_log_prob(
-                window=window,
-                theta_flat=theta_plus,
-                hawkes_ll=hawkes_ll,
-            )                                                          # scalar
-
-            # Child likelihoods log p(w_r | theta_cand_j), j=1,2
-            logp_child_r = torch.stack(
-                [
-                    self._window_log_prob(
-                        window=window,
-                        theta_flat=theta_cand_j,
-                        hawkes_ll=hawkes_ll,
-                    )
-                    for theta_cand_j in theta_cand
-                ],
-                dim=0,
-            )                                                          # [2]
-
-            logp0_list.append(logp0_r)
-            logp_child_list.append(logp_child_r)
-
-        logp0 = torch.stack(logp0_list, dim=0)                         # [R]
-        logp_child_each = torch.stack(logp_child_list, dim=0)           # [R, 2]
+        if replay_cache is None:
+            replay_cache = build_replay_batch_cache(
+                batch.windows,
+                hawkes_ll,
+                theta_plus,
+            )
+        elif replay_cache.num_windows != len(batch.windows):
+            raise ValueError("replay cache and batch windows must align")
+        theta_models = torch.cat(
+            [theta_plus.reshape(1, -1), theta_cand],
+            dim=0,
+        )                                                               # [3, P]
+        window_nll = batched_replay_log_likelihood(
+            replay_cache,
+            theta_models,
+            hawkes_ll,
+            normalize_by_events=True,
+        )                                                               # [R, 3]
+        # The batched kernel returns negative log likelihoods; preserve the
+        # original log-probability convention used by the relaxed objective.
+        logp0 = -window_nll[:, 0]                                      # [R]
+        logp_child_each = -window_nll[:, 1:3]                          # [R, 2]
 
         # Eq. (25): log child mixture likelihood.
         logp_child_mix = torch.logsumexp(
@@ -481,6 +491,13 @@ class SplitModule(nn.Module):
                     device=reference.device, dtype=reference.dtype
                 )
             ),
+            sample_support=(
+                None
+                if batch.sample_support is None
+                else batch.sample_support.to(
+                    device=reference.device, dtype=reference.dtype
+                )
+            ),
         )
 
     def _module_reference(self, fallback: torch.Tensor) -> torch.Tensor:
@@ -502,7 +519,7 @@ class SplitModule(nn.Module):
             raise ValueError("batch.contexts and batch.residuals must have the same R")
         if batch.weights.shape != (R,):
             raise ValueError(f"batch.weights must have shape [{R}], got {tuple(batch.weights.shape)}")
-        for name in ("base_weights", "structural_weights"):
+        for name in ("base_weights", "structural_weights", "sample_support"):
             value = getattr(batch, name)
             if value is not None and value.shape != (R,):
                 raise ValueError(
@@ -524,6 +541,7 @@ class SplitModule(nn.Module):
         *,
         lambda_T: Optional[float | torch.Tensor] = None,
         delta_complexity: float | torch.Tensor = 1.0,
+        replay_cache: Optional[ReplayBatchCache] = None,
     ):
         """
         Full differentiable split loss for one leaf.
@@ -536,11 +554,17 @@ class SplitModule(nn.Module):
         batch = self._batch_to_device(batch, theta_sem)
         residuals = batch.residuals
         weights = batch.weights
+        sample_support = (
+            torch.ones_like(weights)
+            if batch.sample_support is None
+            else batch.sample_support
+        )
 
         struct = self.compute_soft_residual_structure(
             residuals=residuals,
             weights=weights,
             theta_sem=theta_sem,
+            sample_support=sample_support,
         )
 
         replay = self.compute_replay_loglikelihood(
@@ -548,10 +572,11 @@ class SplitModule(nn.Module):
             theta_plus=struct["theta_plus"],
             theta_cand=struct["theta_cand"],
             hawkes_ll=hawkes_ll,
+            replay_cache=replay_cache,
         )
 
         objective = self.compute_split_training_objective(
-            weights=weights,
+            weights=weights * sample_support,
             ell_split=replay["ell_split"],
             g_split=replay["g_split"],
             N_eff=struct["N_eff"],
@@ -616,6 +641,7 @@ class SplitModule(nn.Module):
     def normalize_split_evidence(
         base_weights: torch.Tensor,
         structural_weights: torch.Tensor,
+        sample_support: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Put Split mass on replay-count scale without hiding weak evidence.
@@ -632,14 +658,22 @@ class SplitModule(nn.Module):
             raise ValueError("eps must be positive")
         base = base_weights.clamp_min(0.0)
         structural = structural_weights.clamp(0.0, 1.0)
-        evidence = base * structural
-        evidence_sum = evidence.sum()
-        normalized = (
-            float(evidence.numel()) * evidence / (evidence_sum + eps)
+        support = (
+            torch.ones_like(base)
+            if sample_support is None
+            else sample_support.to(base).clamp_min(0.0)
         )
-        structural_strength = evidence_sum / (base.sum() + eps)
+        if support.shape != base.shape:
+            raise ValueError("sample_support and base_weights must be aligned vectors")
+        evidence = base * structural
+        evidence_sum = (support * evidence).sum()
+        support_sum = support.sum()
+        normalized = (
+            support_sum * evidence / (evidence_sum + eps)
+        )
+        structural_strength = evidence_sum / ((support * base).sum() + eps)
         effective_sample_size = evidence_sum.square() / (
-            evidence.square().sum() + eps
+            (support * evidence.square()).sum() + eps
         )
         return (
             normalized.detach(),
@@ -684,13 +718,24 @@ class SplitModule(nn.Module):
             ).to(reference)
             for batch in present
         ])
+        sample_support = torch.cat([
+            (
+                torch.ones_like(batch.weights)
+                if batch.sample_support is None
+                else batch.sample_support
+            ).to(reference)
+            for batch in present
+        ])
         windows = [
             window for batch in present for window in batch.windows
         ]
         if max_items is not None and residuals.size(0) > int(max_items):
             selected = torch.topk(
                 base_weights.clamp_min(0.0)
-                * structural_weights.clamp(0.0, 1.0),
+                * structural_weights.clamp(0.0, 1.0)
+                * sample_support.clamp_min(0.0),
+                # Prefer rows representing more independent observations when
+                # a bounded physical-row replay budget is applied.
                 k=int(max_items),
             ).indices
             selected_cpu = selected.detach().cpu().tolist()
@@ -700,11 +745,13 @@ class SplitModule(nn.Module):
             structural_weights = structural_weights.index_select(
                 0, selected
             )
+            sample_support = sample_support.index_select(0, selected)
             windows = [windows[index] for index in selected_cpu]
         weights, structural_strength, effective_sample_size = (
             SplitModule.normalize_split_evidence(
                 base_weights,
                 structural_weights,
+                sample_support,
             )
         )
         return SplitBatch(
@@ -716,6 +763,7 @@ class SplitModule(nn.Module):
             structural_weights=structural_weights.detach(),
             structural_strength=structural_strength,
             effective_sample_size=effective_sample_size,
+            sample_support=sample_support.detach(),
         )
 
     @staticmethod
@@ -756,10 +804,14 @@ class SplitModule(nn.Module):
         structural_weights = base_weights.new_tensor(
             [float(item.queue_weight) for item in valid_items]
         )
+        sample_support = base_weights.new_tensor([
+            float(getattr(item, "support", 1.0)) for item in valid_items
+        ]).clamp_min(0.0)
         weights, structural_strength, effective_sample_size = (
             SplitModule.normalize_split_evidence(
                 base_weights,
                 structural_weights,
+                sample_support,
             )
         )
         windows = [item.window for item in valid_items]
@@ -773,6 +825,7 @@ class SplitModule(nn.Module):
             structural_weights=structural_weights.detach(),
             structural_strength=structural_strength,
             effective_sample_size=effective_sample_size,
+            sample_support=sample_support.detach(),
         )
 
     @staticmethod
@@ -790,6 +843,7 @@ class SplitModule(nn.Module):
         ]
         if not valid_indices:
             return None
+        bank._ensure_prototype_state()
         indices = torch.tensor(valid_indices, device=bank.device, dtype=torch.long)
         residuals = (
             bank.write_quality[indices].unsqueeze(-1)
@@ -801,7 +855,8 @@ class SplitModule(nn.Module):
         strength = residuals.norm(dim=-1) / (residual_norm_ema + 1e-8)
         base_weights = (recency * usage * strength).detach()
         structural_weights = bank.queue_weight[indices].detach()
-        evidence_weights = base_weights * structural_weights
+        sample_support = bank.support[indices].detach().clamp_min(0.0)
+        evidence_weights = base_weights * structural_weights * sample_support
         if max_items is not None and indices.numel() > max_items:
             selected = torch.topk(
                 evidence_weights, k=int(max_items)
@@ -811,10 +866,12 @@ class SplitModule(nn.Module):
             contexts = contexts.index_select(0, selected)
             base_weights = base_weights.index_select(0, selected)
             structural_weights = structural_weights.index_select(0, selected)
+            sample_support = sample_support.index_select(0, selected)
         weights, structural_strength, effective_sample_size = (
             SplitModule.normalize_split_evidence(
                 base_weights,
                 structural_weights,
+                sample_support,
             )
         )
         selected_indices = indices.detach().cpu().tolist()
@@ -827,6 +884,7 @@ class SplitModule(nn.Module):
             structural_weights=structural_weights,
             structural_strength=structural_strength,
             effective_sample_size=effective_sample_size,
+            sample_support=sample_support,
         )
 
     @staticmethod
@@ -950,6 +1008,11 @@ class SplitModule(nn.Module):
         was_training = self.training
         self.train()
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        replay_cache = build_replay_batch_cache(
+            batch.windows,
+            hawkes_ll,
+            theta_sem,
+        )
 
         last_loss = None
         try:
@@ -961,6 +1024,7 @@ class SplitModule(nn.Module):
                     hawkes_ll=hawkes_ll,
                     lambda_T=lambda_T,
                     delta_complexity=delta_complexity,
+                    replay_cache=replay_cache,
                 )
                 loss = out["loss"]
                 if not torch.isfinite(loss):
@@ -978,6 +1042,7 @@ class SplitModule(nn.Module):
                     hawkes_ll=hawkes_ll,
                     lambda_T=lambda_T,
                     delta_complexity=delta_complexity,
+                    replay_cache=replay_cache,
                 )
         finally:
             if not was_training:

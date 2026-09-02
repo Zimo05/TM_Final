@@ -39,6 +39,15 @@ class TrainingLifecycleMixin:
         self.tree = tree.to(self.device)
         self.hawkes = hawkes.to(self.device)
         self.encoder = encoder.to(self.device)
+        self.tree.episodic_memory.configure_prototype_memory(
+            duplicate_threshold=self.wake_config.prototype_duplicate_threshold,
+            mode_threshold=self.wake_config.prototype_mode_threshold,
+            mode_capacity=self.wake_config.prototype_mode_capacity,
+        )
+        self.tree.episodic_memory.rebuild_law_keys(
+            self.tree.semantic_theta,
+            self.hawkes.decays,
+        )
 
         if self.tree.hyper.D != self.hawkes.num_types:
             raise ValueError("tree and Hawkes backbone event dimensions differ")

@@ -30,6 +30,10 @@ H_TREE_OUTPUT="${H_TREE_OUTPUT:-$DATA_ROOT/h_tree_one_circle.pt}"
 
 RUN_NAME="${RUN_NAME:-dws_17_08281630}"
 EPOCHS="${EPOCHS:-10}"
+# Two-level effective-Hawkes-law matching.  Keep duplicate stricter than mode.
+PROTOTYPE_DUP_THRESHOLD="${PROTOTYPE_DUP_THRESHOLD:-0.98}"
+PROTOTYPE_MODE_THRESHOLD="${PROTOTYPE_MODE_THRESHOLD:-0.90}"
+PROTOTYPE_MODE_CAPACITY="${PROTOTYPE_MODE_CAPACITY:-12}"
 SPLIT_SEED="${SPLIT_SEED:-42}"
 SPLIT_MANIFEST="${SPLIT_MANIFEST:-$DATA_ROOT/splits/memory_seed${SPLIT_SEED}.json}"
 BASE_CONTROLLER_CHECKPOINT="${BASE_CONTROLLER_CHECKPOINT:-$PROJECT_ROOT/Memory/Checkpoints/dws_17_controller_v4_best.pt}"
@@ -82,6 +86,7 @@ Usage:
 Optional environment overrides:
   RUN_NAME=name EPOCHS=10 PYTHON=/path/to/python DEVICES=0 ./run_HM.sh <action>
   BASE_CONTROLLER_CHECKPOINT=/path/model.pt CONTROLLER_VERSION=6 ./run_HM.sh controller-finetune
+  PROTOTYPE_DUP_THRESHOLD=0.98 PROTOTYPE_MODE_THRESHOLD=0.90 ./run_HM.sh memory-controller
 EOF
 }
 
@@ -312,6 +317,9 @@ start_memory() {
       --z-dim 50 \
       --node-dim 128 \
       --memory-key-dim 64 \
+      --prototype-duplicate-threshold "$PROTOTYPE_DUP_THRESHOLD" \
+      --prototype-mode-threshold "$PROTOTYPE_MODE_THRESHOLD" \
+      --prototype-mode-capacity "$PROTOTYPE_MODE_CAPACITY" \
       --tree-init-depth 0 \
       --num-basis 2 \
       --decays 0.5 1.5 \
@@ -421,6 +429,8 @@ evaluate_controller() {
   env PYTHONPATH="$MEMORY_PYTHONPATH" "$PYTHON_BIN" -m Evaluate \
     --checkpoint "$checkpoint" --data-path "$HAWKES_DATA" \
     --split-manifest "$SPLIT_MANIFEST" --output-dir "$output" \
+    --prototype-duplicate-threshold "$PROTOTYPE_DUP_THRESHOLD" \
+    --prototype-mode-threshold "$PROTOTYPE_MODE_THRESHOLD" \
     --protocol both --seed "$SPLIT_SEED" ${extra[@]+"${extra[@]}"}
 }
 

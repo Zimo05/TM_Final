@@ -66,6 +66,18 @@ def _parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cold-start-epochs", type=int, default=5)
     parser.add_argument(
+        "--prototype-duplicate-threshold", type=float, default=0.98,
+        help="Law-key cosine at which a persistent prototype is refreshed in place.",
+    )
+    parser.add_argument(
+        "--prototype-mode-threshold", type=float, default=0.90,
+        help="Law-key cosine at which a residual belongs to an existing dynamics mode.",
+    )
+    parser.add_argument(
+        "--prototype-mode-capacity", type=int, default=12,
+        help="Maximum high-resolution prototypes retained per active dynamics mode.",
+    )
+    parser.add_argument(
         "--count-similarity-low",
         type=float,
         default=0.35,
@@ -1390,6 +1402,9 @@ def main() -> None:
         hawkes=hawkes,
         encoder=encoder,
         wake=WakeObjectiveConfig(
+            prototype_duplicate_threshold=args.prototype_duplicate_threshold,
+            prototype_mode_threshold=args.prototype_mode_threshold,
+            prototype_mode_capacity=args.prototype_mode_capacity,
             lambda_route_mi=args.route_mi_weight,
             lambda_route_posterior=args.route_posterior_weight,
             lambda_route_distill=args.route_distill_weight,

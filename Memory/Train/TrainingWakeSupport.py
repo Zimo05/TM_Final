@@ -1552,6 +1552,8 @@ class TrainingWakeSupportMixin:
                 window=item.window,
                 write_quality=item.write_quality,
                 queue_weight=item.queue_weight,
+                semantic_theta=self.tree.semantic_theta(owner_id).detach(),
+                decays=self.hawkes.decays.detach(),
             )
             self.controller.split_queues[owner_id] += item.queue_weight
 
@@ -2008,6 +2010,8 @@ class TrainingWakeSupportMixin:
             window=item.window,
             write_quality=item.write_quality,
             queue_weight=item.queue_weight,
+            semantic_theta=self.tree.semantic_theta(owner_id).detach(),
+            decays=self.hawkes.decays.detach(),
         )
         self.controller.split_queues[
             owner_id
@@ -2046,6 +2050,8 @@ class TrainingWakeSupportMixin:
                 window=item.window,
                 write_quality=item.write_quality,
                 queue_weight=item.queue_weight,
+                semantic_theta=self.tree.semantic_theta(owner_id).detach(),
+                decays=self.hawkes.decays.detach(),
             )
             self.controller.split_queues[owner_id] += item.queue_weight
 

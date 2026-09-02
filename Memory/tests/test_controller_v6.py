@@ -317,6 +317,10 @@ class ControllerV6Tests(unittest.TestCase):
             memories_after = sum(
                 len(bank) for bank in inference.tree.episodic_memory.banks.values()
             )
+            support_after = sum(
+                float(bank.support.sum())
+                for bank in inference.tree.episodic_memory.banks.values()
+            )
             split_queues_after_local = dict(inference.controller.split_queues)
             probation_metadata = {
                 candidate.token: (
@@ -330,6 +334,10 @@ class ControllerV6Tests(unittest.TestCase):
                 node_id: len(bank)
                 for node_id, bank in inference.tree.episodic_memory.banks.items()
             }
+            bank_split_mass_after_local = {
+                node_id: float(bank.split_mass.sum())
+                for node_id, bank in inference.tree.episodic_memory.banks.items()
+            }
             inference.config.probation_min_effective_samples = 1.0
             inference.config.probation_lcb_kappa = 0.0
             inference.config.probation_persist_threshold = -1e9
@@ -339,11 +347,19 @@ class ControllerV6Tests(unittest.TestCase):
             memories_promoted = sum(
                 len(bank) for bank in inference.tree.episodic_memory.banks.values()
             )
+            support_promoted = sum(
+                float(bank.support.sum())
+                for bank in inference.tree.episodic_memory.banks.values()
+            )
             split_queues_after_promotion = dict(
                 inference.controller.split_queues
             )
             promoted_bank_weights = {
                 node_id: bank.queue_weight.detach().cpu().tolist()
+                for node_id, bank in inference.tree.episodic_memory.banks.items()
+            }
+            promoted_bank_split_mass = {
+                node_id: float(bank.split_mass.sum())
                 for node_id, bank in inference.tree.episodic_memory.banks.items()
             }
         self.assertEqual(memories_after, memories_before)
@@ -356,8 +372,12 @@ class ControllerV6Tests(unittest.TestCase):
         )
         self.assertGreater(promoted_result["probation_validation_count"], 0)
         self.assertGreater(promoted_result["promoted_write_count"], 0)
-        self.assertEqual(
+        self.assertLessEqual(
             memories_promoted - memories_after,
+            promoted_result["promoted_write_count"],
+        )
+        self.assertAlmostEqual(
+            support_promoted - support_after,
             promoted_result["promoted_write_count"],
         )
         for _, structural_weight, split_probability in probation_metadata.values():
@@ -380,13 +400,11 @@ class ControllerV6Tests(unittest.TestCase):
                 - split_queues_after_local.get(owner_id, 0.0),
                 sum(expected_weights),
             )
-            start = bank_lengths_after_local.get(owner_id, 0)
-            actual_weights = promoted_bank_weights[owner_id][
-                start:start + len(expected_weights)
-            ]
-            self.assertEqual(len(actual_weights), len(expected_weights))
-            for actual, expected in zip(actual_weights, expected_weights):
-                self.assertAlmostEqual(actual, expected)
+            self.assertAlmostEqual(
+                promoted_bank_split_mass[owner_id]
+                - bank_split_mass_after_local.get(owner_id, 0.0),
+                sum(expected_weights),
+            )
         accepted = [
             event for event in result["events"]
             if event.get("write_local_accepted")
