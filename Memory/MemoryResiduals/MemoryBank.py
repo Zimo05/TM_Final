@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass, replace
 from numbers import Real
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -43,17 +43,27 @@ class MemoryItem:
 
 def _signed_hash_projection(feature: Tensor, output_dim: int) -> Tensor:
     """Deterministically project a physical-law feature without parameters."""
-    flat = feature.reshape(-1)
-    positions = torch.arange(flat.numel(), device=flat.device, dtype=torch.long)
+    if feature.ndim == 0:
+        raise ValueError("feature must have at least one dimension")
+    feature_dim = feature.size(-1)
+    if feature_dim <= 0:
+        return feature.new_empty(*feature.shape[:-1], output_dim)
+    flat = feature.reshape(-1, feature_dim)
+    positions = torch.arange(feature_dim, device=feature.device, dtype=torch.long)
     buckets = torch.remainder(positions * 2654435761, output_dim)
     signs = torch.where(
         torch.remainder(positions * 2246822519 + 3266489917, 2) == 0,
         flat.new_ones(()),
         -flat.new_ones(()),
     )
-    projected = flat.new_zeros(output_dim)
-    projected.index_add_(0, buckets, signs * flat)
-    return F.normalize(projected.reshape(1, -1), dim=-1).reshape(-1)
+    projected = flat.new_zeros(flat.size(0), output_dim)
+    projected.scatter_add_(
+        1,
+        buckets.reshape(1, -1).expand(flat.size(0), -1),
+        signs.reshape(1, -1) * flat,
+    )
+    projected = F.normalize(projected, dim=-1)
+    return projected.reshape(*feature.shape[:-1], output_dim)
 
 
 def effective_hawkes_law_key(
@@ -72,21 +82,38 @@ def effective_hawkes_law_key(
     a Light-Sleep semantic rebase that preserves the effective law also
     preserves this identity.
     """
-    effective = semantic_theta.detach().reshape(-1) + delta_theta.detach().reshape(-1)
     expected = num_event_types + num_event_types * num_event_types * num_basis
-    if effective.numel() != expected:
+    semantic = semantic_theta.detach()
+    delta = delta_theta.detach()
+    if semantic.ndim == 0 or delta.ndim == 0:
+        raise ValueError("semantic_theta and delta_theta need a final parameter dimension")
+    if semantic.shape[-1] != expected or delta.shape[-1] != expected:
         raise ValueError(f"effective Hawkes theta must contain {expected} values")
+    try:
+        batch_shape = torch.broadcast_shapes(
+            semantic.shape[:-1], delta.shape[:-1]
+        )
+    except RuntimeError as error:
+        raise ValueError(
+            "semantic_theta and delta_theta batch dimensions are incompatible"
+        ) from error
+    semantic = semantic.expand(*batch_shape, expected)
+    delta = delta.expand(*batch_shape, expected)
+    effective = semantic + delta
     decay = decays.detach().reshape(-1).to(effective)
     if decay.numel() != num_basis or bool((decay <= 0).any()):
         raise ValueError("decays must contain one positive value per basis")
-    raw_mu = effective[:num_event_types]
-    raw_w = effective[num_event_types:].reshape(
-        num_event_types, num_event_types, num_basis
+    raw_mu = effective[..., :num_event_types]
+    raw_w = effective[..., num_event_types:].reshape(
+        *batch_shape, num_event_types, num_event_types, num_basis
     )
     mu = F.softplus(raw_mu)
-    integrated_excitation = (F.softplus(raw_w) / decay.reshape(1, 1, -1)).sum(-1)
+    integrated_excitation = (
+        F.softplus(raw_w) / decay.reshape(*((1,) * len(batch_shape)), 1, 1, -1)
+    ).sum(-1)
     return _signed_hash_projection(
-        torch.cat([mu, integrated_excitation.reshape(-1)]), key_dim
+        torch.cat([mu, integrated_excitation.reshape(*batch_shape, -1)], dim=-1),
+        key_dim,
     )
 
 
@@ -922,8 +949,202 @@ class MemoryBank:
         # sleep-time operation.
         self._age_reference_clock = 0
 
+        # The public tensors below remain compact views so old checkpoints and
+        # retrieval code keep their existing shape.  Once the first write is
+        # admitted, the views are backed by these fixed-capacity tensors.  A
+        # write therefore fills one free row instead of allocating and copying
+        # every previous row with ``torch.cat``.  ``_storage_capacity`` may be
+        # temporarily larger than ``capacity`` for topology merge operations
+        # that intentionally defer pruning.
+        self._storage_capacity = 0
+        for field in self._tensor_state_fields():
+            setattr(self, f"_storage_{field}", None)
+
     def __len__(self) -> int:
         return self.keys.shape[0]
+
+    @staticmethod
+    def _tensor_state_fields() -> Tuple[str, ...]:
+        return (
+            "keys",
+            "deltas",
+            "write_quality",
+            "queue_weight",
+            "law_keys",
+            "support",
+            "quality_mass",
+            "split_mass",
+            "mode_ids",
+            "mode_compressed",
+            "usage",
+            "cycle_usage",
+            "stale_cycles",
+            "age",
+        )
+
+    def _ensure_storage_metadata(self) -> None:
+        """Initialize append-cache fields for pre-batch checkpoints."""
+        if not hasattr(self, "_storage_capacity"):
+            self._storage_capacity = 0
+        for field in self._tensor_state_fields():
+            name = f"_storage_{field}"
+            if not hasattr(self, name):
+                setattr(self, name, None)
+
+    def __getstate__(self):
+        # Fixed storage is a rebuildable append cache. Excluding it keeps
+        # checkpoints compatible with the compact representation and avoids
+        # serializing a second copy of every bank row.
+        state = self.__dict__.copy()
+        for field in self._tensor_state_fields():
+            value = state.get(field)
+            if torch.is_tensor(value):
+                state[field] = value.clone()
+        state.pop("_storage_capacity", None)
+        for field in self._tensor_state_fields():
+            state.pop(f"_storage_{field}", None)
+        return state
+
+    def __setstate__(self, state) -> None:
+        self.__dict__.update(state)
+        self._ensure_storage_metadata()
+
+    def _invalidate_fixed_storage(self) -> None:
+        """Drop the append backing store after an external tensor replacement."""
+        self._ensure_storage_metadata()
+        self._storage_capacity = 0
+        for field in self._tensor_state_fields():
+            setattr(self, f"_storage_{field}", None)
+
+    def _storage_is_bound(self, count: int) -> bool:
+        self._ensure_storage_metadata()
+        if self._storage_capacity < max(self.capacity, count):
+            return False
+        for field in self._tensor_state_fields():
+            value = getattr(self, field)
+            storage = getattr(self, f"_storage_{field}")
+            if storage is None:
+                return False
+            if value.device != storage.device or value.dtype != storage.dtype:
+                return False
+            if value.shape[1:] != storage.shape[1:]:
+                return False
+            if count and value.data_ptr() != storage.data_ptr():
+                return False
+        return True
+
+    def _bind_fixed_storage_views(self, count: Optional[int] = None) -> None:
+        if self._storage_capacity <= 0:
+            return
+        count = len(self) if count is None else int(count)
+        for field in self._tensor_state_fields():
+            storage = getattr(self, f"_storage_{field}")
+            setattr(self, field, storage[:count])
+
+    @torch.no_grad()
+    def _ensure_fixed_storage(self) -> None:
+        """Make compact public rows addressable from a fixed-capacity store."""
+        self._ensure_storage_metadata()
+        count = len(self)
+        required_capacity = max(self.capacity, count)
+        if self._storage_is_bound(count):
+            return
+
+        old_values = {
+            field: getattr(self, field)
+            for field in self._tensor_state_fields()
+        }
+        for field, value in old_values.items():
+            storage_shape = (required_capacity, *value.shape[1:])
+            storage = torch.empty(
+                storage_shape,
+                device=value.device,
+                dtype=value.dtype,
+            )
+            if count:
+                storage[:count].copy_(value)
+            setattr(self, f"_storage_{field}", storage)
+        self._storage_capacity = required_capacity
+        self._bind_fixed_storage_views(count)
+
+    @torch.no_grad()
+    def _sync_fixed_storage(self) -> None:
+        """Copy compact results of keep/merge operations back into the store."""
+        self._ensure_storage_metadata()
+        if self._storage_capacity <= 0:
+            return
+        count = len(self)
+        if self._storage_capacity < max(self.capacity, count):
+            self._invalidate_fixed_storage()
+            self._ensure_fixed_storage()
+            return
+        for field in self._tensor_state_fields():
+            storage = getattr(self, f"_storage_{field}")
+            storage[:count].copy_(getattr(self, field))
+        self._bind_fixed_storage_views(count)
+
+    @torch.no_grad()
+    def _append_batch_rows(
+        self,
+        keys: Tensor,
+        deltas: Tensor,
+        law_keys: Tensor,
+        quality: Tensor,
+        queue: Tensor,
+        mode_ids: Tensor,
+        windows: Sequence[Optional[EventWindow]],
+    ) -> Tensor:
+        """Append already-classified rows into free fixed-capacity slots."""
+        row_count = int(keys.size(0))
+        if row_count == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        if any(len(value) != row_count for value in (
+            deltas, law_keys, quality, queue, mode_ids
+        )):
+            raise ValueError("batched append fields must have the same row count")
+        if len(windows) != row_count:
+            raise ValueError("windows must contain one entry per batched row")
+
+        self._ensure_fixed_storage()
+        start = len(self)
+        end = start + row_count
+        if end > self._storage_capacity:
+            # This path is only used by deferred topology merges. Ordinary
+            # writes call _make_space before reaching the hard bank capacity.
+            old_values = {
+                field: getattr(self, field)
+                for field in self._tensor_state_fields()
+            }
+            new_capacity = max(self.capacity, end, self._storage_capacity * 2)
+            for field, value in old_values.items():
+                storage = torch.empty(
+                    (new_capacity, *value.shape[1:]),
+                    device=value.device,
+                    dtype=value.dtype,
+                )
+                if start:
+                    storage[:start].copy_(value)
+                setattr(self, f"_storage_{field}", storage)
+            self._storage_capacity = new_capacity
+            self._bind_fixed_storage_views(start)
+
+        self._storage_keys[start:end].copy_(keys.to(self._storage_keys))
+        self._storage_deltas[start:end].copy_(deltas.to(self._storage_deltas))
+        self._storage_law_keys[start:end].copy_(law_keys.to(self._storage_law_keys))
+        self._storage_write_quality[start:end].copy_(quality.to(self._storage_write_quality))
+        self._storage_queue_weight[start:end].copy_(queue.to(self._storage_queue_weight))
+        self._storage_support[start:end].fill_(1.0)
+        self._storage_quality_mass[start:end].copy_(quality.to(self._storage_quality_mass))
+        self._storage_split_mass[start:end].copy_(queue.to(self._storage_split_mass))
+        self._storage_mode_ids[start:end].copy_(mode_ids.to(self._storage_mode_ids))
+        self._storage_mode_compressed[start:end].zero_()
+        self._storage_usage[start:end].zero_()
+        self._storage_cycle_usage[start:end].zero_()
+        self._storage_stale_cycles[start:end].zero_()
+        self._storage_age[start:end].zero_()
+        self.windows.extend(windows)
+        self._bind_fixed_storage_views(end)
+        return torch.arange(start, end, device=self.device, dtype=torch.long)
 
     def configure_prototype_policy(
         self,
@@ -1042,6 +1263,60 @@ class MemoryBank:
             - self.retention_age_weight * torch.log1p(age)
         )
 
+    def _mode_retention_batch(self) -> Tuple[Tensor, Tensor, Tensor]:
+        """Compute retention for every mode with one grouped reduction."""
+        mode_ids, inverse, counts = torch.unique(
+            self.mode_ids[: len(self)],
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        mode_count = mode_ids.numel()
+        if mode_count == 0:
+            empty = self.support.new_empty(0)
+            return mode_ids, empty, counts
+
+        mode_support = self.support.new_zeros(mode_count)
+        mode_support.index_add_(0, inverse, self.support[: len(self)])
+        mode_usage = self.usage.new_zeros(mode_count)
+        mode_usage.index_add_(
+            0,
+            inverse,
+            self.usage[: len(self)] + self.cycle_usage[: len(self)],
+        )
+        mode_age_mass = self.age.new_zeros(mode_count)
+        mode_age_mass.index_add_(
+            0,
+            inverse,
+            self.age[: len(self)] * self.support[: len(self)],
+        )
+        mode_stale = self.stale_cycles.new_full(
+            (mode_count,), -torch.inf
+        )
+        if hasattr(mode_stale, "scatter_reduce_"):
+            mode_stale.scatter_reduce_(
+                0,
+                inverse,
+                self.stale_cycles[: len(self)],
+                reduce="amax",
+                include_self=True,
+            )
+        else:
+            # Kept for older PyTorch installations; modern CUDA builds use the
+            # single scatter-reduce above.
+            mode_stale = torch.stack([
+                self.stale_cycles[: len(self)][inverse == index].max()
+                for index in range(mode_count)
+            ])
+        mode_age = mode_age_mass / mode_support.clamp_min(1.0)
+        retention = (
+            self.retention_support_weight * torch.log1p(mode_support)
+            + self.retention_usage_weight * torch.log1p(mode_usage)
+            - self.retention_stale_weight * mode_stale
+            - self.retention_age_weight * torch.log1p(mode_age)
+        )
+        return mode_ids, retention, counts
+
     @torch.no_grad()
     def _compress_mode(
         self,
@@ -1097,31 +1372,460 @@ class MemoryBank:
         protected_mode: Optional[int] = None,
     ) -> bool:
         while len(self) >= self.capacity:
-            modes = torch.unique(self.mode_ids).detach().cpu().tolist()
-            compressible = [
-                int(mode) for mode in modes
-                if int((self.mode_ids == int(mode)).sum().item()) > 1
-            ]
-            if compressible:
-                victim = min(compressible, key=lambda mode: float(self._mode_retention(mode)))
+            modes, retention, counts = self._mode_retention_batch()
+            compressible = counts > 1
+            if bool(compressible.any()):
+                inf = torch.full_like(retention, torch.inf)
+                victim_position = torch.where(
+                    compressible, retention, inf
+                ).argmin()
+                victim = int(modes[victim_position].item())
                 self._compress_mode(victim, law_key_builder)
                 continue
             # Every mode is already represented by one archive/singleton.
             # Only now is true eviction unavoidable under the hard bank cap.
-            eviction_candidates = [
-                int(mode) for mode in modes if int(mode) != protected_mode
-            ]
-            if not eviction_candidates:
-                return False
-            victim = min(
-                eviction_candidates,
-                key=lambda mode: float(self._mode_retention(int(mode))),
+            candidates = (
+                torch.ones_like(modes, dtype=torch.bool)
+                if protected_mode is None
+                else modes != int(protected_mode)
             )
-            keep = self.mode_ids != int(victim)
+            if not bool(candidates.any()):
+                return False
+            inf = torch.full_like(retention, torch.inf)
+            victim_position = torch.where(candidates, retention, inf).argmin()
+            victim = int(modes[victim_position].item())
+            keep = self.mode_ids != victim
             self.keep(torch.nonzero(keep, as_tuple=False).flatten())
             break
         return True
-    
+
+    def _batch_statistic(
+        self,
+        value: float | Tensor,
+        *,
+        name: str,
+        batch_size: int,
+    ) -> Tensor:
+        if isinstance(value, Real):
+            scalar_value = float(value)
+            if not math.isfinite(scalar_value):
+                raise FloatingPointError(f"{name} must be finite")
+            if not 0.0 <= scalar_value <= 1.0:
+                raise ValueError(f"{name} must lie in [0, 1]")
+            result = torch.full(
+                (batch_size,),
+                scalar_value,
+                device=self.device,
+                dtype=self.keys.dtype,
+            )
+        else:
+            result = torch.as_tensor(
+                value,
+                device=self.device,
+                dtype=self.keys.dtype,
+            ).reshape(-1)
+            if result.numel() == 1:
+                result = result.expand(batch_size)
+            elif result.numel() != batch_size:
+                raise ValueError(
+                    f"{name} must be scalar or contain one value per batched write"
+                )
+        if not bool(
+            torch.isfinite(result).all()
+            & (result >= 0.0).all()
+            & (result <= 1.0).all()
+        ):
+            raise ValueError(f"{name} must be finite values in [0, 1]")
+        return result
+
+    @torch.no_grad()
+    def _add_batch_scalar_fallback(
+        self,
+        keys: Tensor,
+        deltas: Tensor,
+        law_keys: Tensor,
+        quality: Tensor,
+        queue: Tensor,
+        windows: Sequence[Optional[EventWindow]],
+        law_key_builder: Optional[Callable[[Tensor], Tensor]],
+    ) -> List[Dict[str, int | float | str]]:
+        """Preserve exact causal admission for capacity/mode edge cases."""
+        return [
+            self.add(
+                key=keys[index],
+                delta_theta=deltas[index],
+                window=windows[index],
+                write_quality=quality[index],
+                queue_weight=queue[index],
+                law_key=law_keys[index],
+                law_key_builder=law_key_builder,
+            )
+            for index in range(keys.size(0))
+        ]
+
+    @torch.no_grad()
+    def add_batch(
+        self,
+        keys: Tensor,
+        delta_theta: Tensor,
+        windows: Optional[Sequence[Optional[EventWindow]]] = None,
+        write_quality: float | Tensor = 1.0,
+        queue_weight: float | Tensor = 0.0,
+        law_keys: Optional[Tensor] = None,
+        law_key_builder: Optional[Callable[[Tensor], Tensor]] = None,
+    ) -> List[Dict[str, int | float | str]]:
+        """Admit node-wise writes with one GPU matching/reduction pass.
+
+        Matching is performed against the bank state at the start of the
+        transaction. Duplicate rows targeting the same prototype are reduced
+        with ``index_add_`` and one support-aware EMA update. Batches that
+        would require an order-sensitive mode-capacity or eviction decision
+        fall back to the scalar path, preserving the original admission
+        semantics for those uncommon boundary cases.
+        """
+        if keys.ndim != 2 or keys.size(-1) != self.key_dim:
+            raise ValueError(
+                f"keys must have shape [B, {self.key_dim}], got {tuple(keys.shape)}"
+            )
+        if delta_theta.ndim != 2 or delta_theta.size(-1) != self.param_dim:
+            raise ValueError(
+                "delta_theta must have shape "
+                f"[B, {self.param_dim}], got {tuple(delta_theta.shape)}"
+            )
+        if delta_theta.size(0) != keys.size(0):
+            raise ValueError("keys and delta_theta must have the same batch size")
+        batch_size = int(keys.size(0))
+        if batch_size == 0:
+            return []
+        if windows is None:
+            windows = [None] * batch_size
+        elif len(windows) != batch_size:
+            raise ValueError("windows must contain one entry per batched write")
+
+        # Keep the same detached persistent-state boundary as add(), while
+        # normalizing a complete batch in one kernel.
+        keys = F.normalize(
+            keys.detach().to(device=self.device, dtype=self.keys.dtype),
+            dim=-1,
+        )
+        deltas = delta_theta.detach().to(
+            device=self.device,
+            dtype=self.deltas.dtype,
+        )
+        quality = self._batch_statistic(
+            write_quality, name="write_quality", batch_size=batch_size
+        )
+        queue = self._batch_statistic(
+            queue_weight, name="queue_weight", batch_size=batch_size
+        )
+
+        if law_keys is None:
+            if law_key_builder is None:
+                law_keys = keys
+            else:
+                law_keys = law_key_builder(deltas)
+        else:
+            law_keys = law_keys.detach().to(
+                device=self.device,
+                dtype=self.keys.dtype,
+            )
+        if law_keys.ndim == 1:
+            if batch_size != 1 or law_keys.numel() != self.key_dim:
+                raise ValueError(
+                    f"law_keys must have shape [B, {self.key_dim}]"
+                )
+            law_keys = law_keys.reshape(1, -1)
+        if law_keys.shape != (batch_size, self.key_dim):
+            raise ValueError(
+                f"law_keys must have shape {(batch_size, self.key_dim)}, "
+                f"got {tuple(law_keys.shape)}"
+            )
+        law_keys = F.normalize(law_keys, dim=-1)
+        if not bool(
+            torch.isfinite(keys).all()
+            & torch.isfinite(deltas).all()
+            & torch.isfinite(law_keys).all()
+        ):
+            raise FloatingPointError(
+                "episodic-memory batched key or residual contains NaN or Inf"
+            )
+
+        self._ensure_prototype_state()
+        self._ensure_fixed_storage()
+        bank_size = len(self)
+        if bank_size == 0:
+            if batch_size > self.capacity:
+                return self._add_batch_scalar_fallback(
+                    keys, deltas, law_keys, quality, queue, windows,
+                    law_key_builder,
+                )
+            mode_ids = torch.arange(
+                self._next_mode_id,
+                self._next_mode_id + batch_size,
+                device=self.device,
+                dtype=torch.long,
+            )
+            self._next_mode_id += batch_size
+            indices = self._append_batch_rows(
+                keys, deltas, law_keys, quality, queue, mode_ids, windows
+            )
+            indices_cpu = indices.detach().cpu().tolist()
+            mode_ids_cpu = mode_ids.detach().cpu().tolist()
+            return [
+                {
+                    "action": "append",
+                    "index": int(index),
+                    "mode_id": int(mode),
+                    "support": 1.0,
+                }
+                for index, mode in zip(
+                    indices_cpu,
+                    mode_ids_cpu,
+                )
+            ]
+
+        similarities = law_keys @ self.law_keys[:bank_size].transpose(0, 1)
+        best_similarity, best_index = similarities.max(dim=-1)
+        best_mode = self.mode_ids[best_index]
+        duplicate_mask = best_similarity >= self.duplicate_threshold
+        same_mode_mask = (
+            (best_similarity >= self.mode_threshold) & ~duplicate_mask
+        )
+        append_mask = ~duplicate_mask
+        append_positions = torch.nonzero(
+            append_mask, as_tuple=False
+        ).flatten()
+
+        # If incoming rows can match one another, the scalar implementation's
+        # order becomes observable (the later row may refresh the earlier
+        # append). Keep that boundary exact rather than silently changing the
+        # prototype policy for a rare correlated batch.
+        if append_positions.numel() > 1:
+            append_law_keys = law_keys.index_select(0, append_positions)
+            pairwise = append_law_keys @ append_law_keys.transpose(0, 1)
+            if bool(
+                torch.triu(pairwise, diagonal=1).ge(self.mode_threshold).any()
+            ):
+                return self._add_batch_scalar_fallback(
+                    keys, deltas, law_keys, quality, queue, windows,
+                    law_key_builder,
+                )
+
+        same_positions = torch.nonzero(
+            same_mode_mask, as_tuple=False
+        ).flatten()
+        if same_positions.numel():
+            existing_modes, existing_counts = torch.unique(
+                self.mode_ids[:bank_size],
+                sorted=True,
+                return_counts=True,
+            )
+            incoming_modes, incoming_counts = torch.unique(
+                best_mode.index_select(0, same_positions),
+                sorted=True,
+                return_counts=True,
+            )
+            mode_locations = torch.searchsorted(existing_modes, incoming_modes)
+            overflow = (
+                existing_counts.index_select(0, mode_locations)
+                + incoming_counts
+                > self.mode_capacity
+            )
+            if bool(overflow.any()):
+                return self._add_batch_scalar_fallback(
+                    keys, deltas, law_keys, quality, queue, windows,
+                    law_key_builder,
+                )
+
+        if bank_size + append_positions.numel() > self.capacity:
+            return self._add_batch_scalar_fallback(
+                keys, deltas, law_keys, quality, queue, windows,
+                law_key_builder,
+            )
+
+        results: List[Optional[Dict[str, int | float | str]]] = [
+            None
+        ] * batch_size
+
+        # Duplicate refresh: group all writes by their best prototype and do
+        # one support-aware EMA/scatter reduction per target row.
+        duplicate_positions = torch.nonzero(
+            duplicate_mask, as_tuple=False
+        ).flatten()
+        if duplicate_positions.numel():
+            targets, target_inverse = torch.unique(
+                best_index.index_select(0, duplicate_positions),
+                sorted=True,
+                return_inverse=True,
+            )
+            target_count = targets.numel()
+            target_counts = self.support.new_zeros(target_count)
+            target_counts.index_add_(
+                0,
+                target_inverse,
+                self.support.new_ones(duplicate_positions.numel()),
+            )
+            delta_sums = self.deltas.new_zeros(target_count, self.param_dim)
+            delta_sums.index_add_(
+                0,
+                target_inverse,
+                deltas.index_select(0, duplicate_positions),
+            )
+            key_sums = self.keys.new_zeros(target_count, self.key_dim)
+            key_sums.index_add_(
+                0,
+                target_inverse,
+                keys.index_select(0, duplicate_positions),
+            )
+            law_sums = self.law_keys.new_zeros(target_count, self.key_dim)
+            law_sums.index_add_(
+                0,
+                target_inverse,
+                law_keys.index_select(0, duplicate_positions),
+            )
+            mean_delta = delta_sums / target_counts[:, None]
+            mean_key = F.normalize(key_sums, dim=-1)
+            mean_law = F.normalize(law_sums, dim=-1)
+            old_support = self.support.index_select(0, targets).clamp_min(1.0)
+            beta = torch.clamp(
+                1.0 / (old_support + 1.0),
+                min=self.ema_beta_min,
+                max=self.ema_beta_max,
+            )
+            old_delta = self.deltas.index_select(0, targets)
+            old_key = self.keys.index_select(0, targets)
+            refreshed_delta = (
+                (1.0 - beta[:, None]) * old_delta
+                + beta[:, None] * mean_delta
+            )
+            refreshed_key = F.normalize(
+                (1.0 - beta[:, None]) * old_key
+                + beta[:, None] * mean_key,
+                dim=-1,
+            )
+            if law_key_builder is not None:
+                refreshed_law = law_key_builder(refreshed_delta)
+                if refreshed_law.ndim == 1:
+                    refreshed_law = refreshed_law.unsqueeze(0)
+            else:
+                old_law = self.law_keys.index_select(0, targets)
+                refreshed_law = (
+                    (1.0 - beta[:, None]) * old_law
+                    + beta[:, None] * mean_law
+                )
+            refreshed_law = F.normalize(
+                refreshed_law.detach().to(self.law_keys), dim=-1
+            )
+            self.deltas.index_copy_(0, targets, refreshed_delta)
+            self.keys.index_copy_(0, targets, refreshed_key)
+            self.law_keys.index_copy_(0, targets, refreshed_law)
+            quality_sums = self.quality_mass.new_zeros(target_count)
+            quality_sums.index_add_(
+                0,
+                target_inverse,
+                quality.index_select(0, duplicate_positions),
+            )
+            queue_sums = self.split_mass.new_zeros(target_count)
+            queue_sums.index_add_(
+                0,
+                target_inverse,
+                queue.index_select(0, duplicate_positions),
+            )
+            new_support = old_support + target_counts
+            new_quality_mass = (
+                self.quality_mass.index_select(0, targets) + quality_sums
+            )
+            new_split_mass = (
+                self.split_mass.index_select(0, targets) + queue_sums
+            )
+            self.support.index_copy_(0, targets, new_support)
+            self.quality_mass.index_copy_(0, targets, new_quality_mass)
+            self.split_mass.index_copy_(0, targets, new_split_mass)
+            self.write_quality.index_copy_(
+                0, targets, new_quality_mass / new_support
+            )
+            self.queue_weight.index_copy_(
+                0, targets, new_split_mass / new_support
+            )
+            self.age.index_fill_(0, targets, 0.0)
+            self.stale_cycles.index_fill_(0, targets, 0.0)
+            self.mode_compressed.index_fill_(0, targets, False)
+
+            duplicate_positions_cpu = duplicate_positions.detach().cpu().tolist()
+            targets_cpu = best_index.index_select(
+                0, duplicate_positions
+            ).detach().cpu().tolist()
+            support_cpu = self.support.detach().cpu().tolist()
+            mode_ids_cpu = self.mode_ids.detach().cpu().tolist()
+            for position, target in zip(duplicate_positions_cpu, targets_cpu):
+                if windows[position] is not None:
+                    self.windows[target] = windows[position]
+                results[position] = {
+                    "action": "refresh",
+                    "index": int(target),
+                    "mode_id": int(mode_ids_cpu[target]),
+                    "support": float(support_cpu[target]),
+                }
+
+        # A same-mode row clears a compressed archive for the whole mode, just
+        # like scalar add(). The affected-mode loop is over unique modes, not
+        # over writes, and never performs GPU-to-CPU conversion.
+        if same_positions.numel():
+            affected_modes = torch.unique(
+                best_mode.index_select(0, same_positions)
+            )
+            affected_rows = (
+                self.mode_ids[: len(self), None] == affected_modes[None, :]
+            ).any(dim=1)
+            self.mode_compressed[: len(self)][affected_rows] = False
+            self.stale_cycles[: len(self)][affected_rows] = 0.0
+
+        # Non-duplicate rows occupy consecutive fixed-capacity slots. New
+        # modes receive IDs in input order; existing same-mode rows retain the
+        # best-match mode selected above.
+        if append_positions.numel():
+            append_modes = best_mode.index_select(0, append_positions).clone()
+            append_new_mask = ~same_mode_mask.index_select(0, append_positions)
+            new_count = int(append_new_mask.sum().item())
+            if new_count:
+                new_mode_ids = torch.arange(
+                    self._next_mode_id,
+                    self._next_mode_id + new_count,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                append_modes[append_new_mask] = new_mode_ids
+                self._next_mode_id += new_count
+            append_windows = [
+                windows[index]
+                for index in append_positions.detach().cpu().tolist()
+            ]
+            appended_indices = self._append_batch_rows(
+                keys.index_select(0, append_positions),
+                deltas.index_select(0, append_positions),
+                law_keys.index_select(0, append_positions),
+                quality.index_select(0, append_positions),
+                queue.index_select(0, append_positions),
+                append_modes,
+                append_windows,
+            )
+            append_positions_cpu = append_positions.detach().cpu().tolist()
+            appended_indices_cpu = appended_indices.detach().cpu().tolist()
+            append_modes_cpu = append_modes.detach().cpu().tolist()
+            for position, index, mode in zip(
+                append_positions_cpu, appended_indices_cpu, append_modes_cpu
+            ):
+                results[position] = {
+                    "action": "append",
+                    "index": int(index),
+                    "mode_id": int(mode),
+                    "support": 1.0,
+                }
+
+        if any(result is None for result in results):
+            raise RuntimeError("batched memory admission did not classify every row")
+        return [result for result in results if result is not None]
+
     @torch.no_grad()
     def add(
         self,
@@ -1205,6 +1909,7 @@ class MemoryBank:
             )
 
         self._ensure_prototype_state()
+        self._ensure_fixed_storage()
         if len(self) > 0:
             similarities = self.law_keys @ law_key.reshape(-1)
             best_index = int(torch.argmax(similarities).item())
@@ -1264,45 +1969,21 @@ class MemoryBank:
             mode_id = self._next_mode_id
             self._next_mode_id += 1
 
-        self.keys = torch.cat([self.keys, key.to(self.device)], dim=0)
-        self.deltas = torch.cat([self.deltas, delta_theta.to(self.device)], dim=0)
-        self.law_keys = torch.cat([self.law_keys, law_key], dim=0)
-        self.support = torch.cat([self.support, torch.ones_like(quality)], dim=0)
-        self.quality_mass = torch.cat([self.quality_mass, quality], dim=0)
-        self.split_mass = torch.cat([self.split_mass, queue], dim=0)
-        self.mode_ids = torch.cat([
-            self.mode_ids,
+        index = self._append_batch_rows(
+            key.to(device=self.device, dtype=self.keys.dtype),
+            delta_theta.to(device=self.device, dtype=self.deltas.dtype),
+            law_key.to(device=self.device, dtype=self.law_keys.dtype),
+            quality,
+            queue,
             torch.tensor([mode_id], device=self.device, dtype=torch.long),
-        ])
-        self.mode_compressed = torch.cat([
-            self.mode_compressed,
-            torch.zeros(1, device=self.device, dtype=torch.bool),
-        ])
-        self.write_quality = torch.cat(
-            [self.write_quality, quality],
-            dim=0,
-        )
-        self.queue_weight = torch.cat(
-            [self.queue_weight, queue],
-            dim=0,
-        )
-
-        self.windows.append(window)
-
-        self.usage = torch.cat([self.usage, torch.zeros(1, device=self.device)])
-        self.cycle_usage = torch.cat(
-            [self.cycle_usage, torch.zeros(1, device=self.device)]
-        )
-        self.stale_cycles = torch.cat(
-            [self.stale_cycles, torch.zeros(1, device=self.device)]
-        )
-        self.age = torch.cat([self.age, torch.zeros(1, device=self.device)])
+            [window],
+        )[0]
 
         if len(self) > self.capacity:
             raise RuntimeError("prototype admission exceeded the hard bank capacity")
         return {
             "action": "append",
-            "index": len(self) - 1,
+            "index": int(index),
             "mode_id": int(mode_id),
             "support": 1.0,
         }
@@ -1417,6 +2098,7 @@ class MemoryBank:
         self.stale_cycles = self.stale_cycles[keep_idx]
         self.age = self.age[keep_idx]
         self.windows = [self.windows[i] for i in keep_idx.detach().cpu().tolist()]
+        self._sync_fixed_storage()
 
     @torch.no_grad()
     def append_from(
@@ -1495,6 +2177,7 @@ class MemoryBank:
             if window is not None and node_id is not None:
                 window = replace(window, node_id=node_id)
             self.windows.append(window)
+        self._sync_fixed_storage()
 
     @torch.no_grad()
     def clear(self) -> None:
@@ -1514,6 +2197,7 @@ class MemoryBank:
         self.stale_cycles = self.stale_cycles[:0]
         self.age = self.age[:0]
         self.windows = []
+        self._bind_fixed_storage_views(0)
     
     @torch.no_grad()
     def prune(self) -> None:

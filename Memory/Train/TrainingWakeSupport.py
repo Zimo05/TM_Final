@@ -346,13 +346,42 @@ class TrainingWakeSupportMixin:
         raw_action_probabilities: Optional[Tensor] = None,
         exploration: Optional[Any] = None,
         controller_version: Optional[int] = None,
+        provisional_owner_index: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Snapshot a causal write request without inspecting future events."""
-        frontier_ids = (
-            tuple(memory_output["frontier_node_ids"][batch_index])
-            if frontier_node_ids is None
-            else tuple(frontier_node_ids)
-        )
+        if frontier_node_ids is not None:
+            frontier_ids = tuple(frontier_node_ids)
+        else:
+            # ``materialize_diagnostics=False`` intentionally leaves the
+            # tree output's string-id tuple empty in the batched path.  Use
+            # it when available, otherwise reconstruct the same IDs from the
+            # already-produced index/mask tensors.  The normal optimized
+            # caller supplies ``frontier_node_ids`` from ``frontier_rows``;
+            # this fallback is for compatibility with older batch callers.
+            materialized_frontiers = memory_output.get("frontier_node_ids")
+            if materialized_frontiers and batch_index < len(
+                materialized_frontiers
+            ):
+                frontier_ids = tuple(materialized_frontiers[batch_index])
+            else:
+                frontier_indices = memory_output.get("frontier_node_indices")
+                if frontier_indices is None:
+                    raise KeyError(
+                        "memory_output must contain frontier_node_ids or "
+                        "frontier_node_indices"
+                    )
+                row_indices = frontier_indices[batch_index]
+                frontier_mask = memory_output.get("frontier_mask")
+                if frontier_mask is not None:
+                    row_indices = row_indices[
+                        frontier_mask[batch_index].to(torch.bool)
+                    ]
+                else:
+                    row_indices = row_indices[row_indices.ge(0)]
+                frontier_ids = tuple(
+                    self.tree.all_node_ids[int(index)]
+                    for index in row_indices.detach().cpu().tolist()
+                )
         count = len(frontier_ids)
         confidence = posterior[:count].max()
         version = (
@@ -387,7 +416,7 @@ class TrainingWakeSupportMixin:
         structural_weight = self.controller.queue_weight(
             request_probabilities
         ).detach()
-        return {
+        request = {
             "event_index": event_index,
             "ready_index": (
                 event_index + 2 * self.wake_config.write_horizon - 1
@@ -434,6 +463,17 @@ class TrainingWakeSupportMixin:
             ),
             "future_contexts": future_contexts,
         }
+        # Some batched wake callers keep the GPU owner index alongside the
+        # already-resolved owner id.  Accept it as optional metadata so those
+        # callers remain compatible with the scalar request builder without
+        # forcing an extra device-to-host synchronization here.
+        if provisional_owner_index is not None:
+            request["provisional_owner_index"] = (
+                provisional_owner_index.detach().clone()
+                if torch.is_tensor(provisional_owner_index)
+                else provisional_owner_index
+            )
+        return request
 
     def _write_probe_context(
         self,
@@ -1535,27 +1575,49 @@ class TrainingWakeSupportMixin:
                 )
             )
         # ``selected`` is already sequence-major because requests were packed
-        # in sequence/event order. Commit in that same deterministic order.
-        for position, (probe_index, item, owner_id) in enumerate(
-            zip(selected_cpu, selected_items, owner_ids)
-        ):
+        # in sequence/event order. Preserve that order within each node while
+        # grouping the actual persistent writes into node-wise GPU batches.
+        for probe_index, item in zip(selected_cpu, selected_items):
             item.write_quality = float(
                 evidence["bounded_gain"][probe_index].detach().cpu()
             )
             item.queue_weight = float(
                 packed["queue_weight"][probe_index].detach().cpu()
             )
-            self.tree.episodic_memory.add_memory(
+
+        grouped_items = {}
+        for item, owner_id in zip(selected_items, owner_ids):
+            grouped_items.setdefault(owner_id, []).append(item)
+        for owner_id, owner_items in grouped_items.items():
+            reference = owner_items[0].key
+            self.tree.episodic_memory.add_memory_batch(
                 node_id=owner_id,
-                key=item.key,
-                delta_theta=item.delta_theta,
-                window=item.window,
-                write_quality=item.write_quality,
-                queue_weight=item.queue_weight,
+                keys=torch.stack([
+                    item.key.reshape(-1).to(
+                        device=reference.device, dtype=reference.dtype
+                    )
+                    for item in owner_items
+                ]),
+                delta_theta=torch.stack([
+                    item.delta_theta.reshape(-1).to(device=reference.device)
+                    for item in owner_items
+                ]),
+                windows=[item.window for item in owner_items],
+                write_quality=torch.as_tensor(
+                    [item.write_quality for item in owner_items],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
+                queue_weight=torch.as_tensor(
+                    [item.queue_weight for item in owner_items],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
                 semantic_theta=self.tree.semantic_theta(owner_id).detach(),
                 decays=self.hawkes.decays.detach(),
             )
-            self.controller.split_queues[owner_id] += item.queue_weight
+            for item in owner_items:
+                self.controller.split_queues[owner_id] += item.queue_weight
 
         def request_token(probe_index: int) -> tuple[int, int]:
             sequence_row = int(sequence_rows[probe_index].detach().cpu())
@@ -2042,18 +2104,48 @@ class TrainingWakeSupportMixin:
             item.write_quality = float(evidence["bounded_gain"].detach().cpu())
             item.queue_weight = float(request["queue_weight"].detach().cpu())
             items.append(item)
+        # Group the physical writes by owner node.  The candidate/evidence
+        # work above is already batched; keeping each node's keys, residuals,
+        # and law identities together lets MemoryBank perform one GEMM and one
+        # scatter-reduction transaction per node instead of one CUDA-synchronizing
+        # add() call per event.
+        grouped_items = {}
         for owner_id, item in zip(owner_ids, items):
-            self.tree.episodic_memory.add_memory(
+            grouped_items.setdefault(owner_id, []).append(item)
+        for owner_id, owner_items in grouped_items.items():
+            reference = owner_items[0].key
+            owner_keys = torch.stack([
+                item.key.reshape(-1).to(
+                    device=reference.device, dtype=reference.dtype
+                )
+                for item in owner_items
+            ])
+            owner_deltas = torch.stack([
+                item.delta_theta.reshape(-1).to(device=reference.device)
+                for item in owner_items
+            ])
+            owner_quality = torch.as_tensor(
+                [item.write_quality for item in owner_items],
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            owner_queue = torch.as_tensor(
+                [item.queue_weight for item in owner_items],
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            self.tree.episodic_memory.add_memory_batch(
                 node_id=owner_id,
-                key=item.key,
-                delta_theta=item.delta_theta,
-                window=item.window,
-                write_quality=item.write_quality,
-                queue_weight=item.queue_weight,
+                keys=owner_keys,
+                delta_theta=owner_deltas,
+                windows=[item.window for item in owner_items],
+                write_quality=owner_quality,
+                queue_weight=owner_queue,
                 semantic_theta=self.tree.semantic_theta(owner_id).detach(),
                 decays=self.hawkes.decays.detach(),
             )
-            self.controller.split_queues[owner_id] += item.queue_weight
+            for item in owner_items:
+                self.controller.split_queues[owner_id] += item.queue_weight
 
     def _encode_memory_event(
         self,

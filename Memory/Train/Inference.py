@@ -793,28 +793,62 @@ class MemoryTreeInference:
         sequence: Mapping[str, Tensor],
         request: Mapping[str, Any],
     ) -> None:
-        evidence = request.get("window_evidence")
-        if evidence is None:
-            evidence = self._delayed_write_evidence(sequence, request)
-        owner_id = evidence["owner_id"]
-        item = evidence.get("candidate_item")
-        if item is None:
-            raise RuntimeError("write evidence is missing its residual candidate")
-        item.write_quality = float(evidence["bounded_gain"].detach().cpu())
-        item.queue_weight = float(request["queue_weight"])
-        self.tree.episodic_memory.add_memory(
-            owner_id,
-            item.key,
-            item.delta_theta,
-            item.window,
-            write_quality=item.write_quality,
-            queue_weight=item.queue_weight,
-            semantic_theta=self.tree.semantic_theta(owner_id).detach(),
-            decays=self.hawkes.decays.detach(),
-        )
-        self.controller.split_queues[
-            owner_id
-        ] += item.queue_weight
+        self._commit_delayed_writes_batch(sequence, [request])
+
+    def _commit_delayed_writes_batch(
+        self,
+        sequence: Mapping[str, Tensor],
+        requests: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Commit ready delayed writes grouped by their owner node."""
+        if not requests:
+            return
+        records = []
+        for request in requests:
+            evidence = request.get("window_evidence")
+            if evidence is None:
+                evidence = self._delayed_write_evidence(sequence, request)
+            owner_id = evidence["owner_id"]
+            item = evidence.get("candidate_item")
+            if item is None:
+                raise RuntimeError("write evidence is missing its residual candidate")
+            item.write_quality = float(evidence["bounded_gain"].detach().cpu())
+            item.queue_weight = float(request["queue_weight"])
+            records.append((owner_id, item))
+
+        grouped_items = {}
+        for owner_id, item in records:
+            grouped_items.setdefault(owner_id, []).append(item)
+        for owner_id, owner_items in grouped_items.items():
+            reference = owner_items[0].key
+            self.tree.episodic_memory.add_memory_batch(
+                owner_id,
+                torch.stack([
+                    item.key.reshape(-1).to(
+                        device=reference.device, dtype=reference.dtype
+                    )
+                    for item in owner_items
+                ]),
+                torch.stack([
+                    item.delta_theta.reshape(-1).to(device=reference.device)
+                    for item in owner_items
+                ]),
+                windows=[item.window for item in owner_items],
+                write_quality=torch.as_tensor(
+                    [item.write_quality for item in owner_items],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
+                queue_weight=torch.as_tensor(
+                    [item.queue_weight for item in owner_items],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
+                semantic_theta=self.tree.semantic_theta(owner_id).detach(),
+                decays=self.hawkes.decays.detach(),
+            )
+        for owner_id, item in records:
+            self.controller.split_queues[owner_id] += item.queue_weight
 
     def _enqueue_probation_candidate(
         self,
@@ -1012,6 +1046,7 @@ class MemoryTreeInference:
             })
 
         promotions: list[Dict[str, Any]] = []
+        promotable: list[tuple[ProbationCandidate, float]] = []
         for candidate in list(self.write_probation):
             if not candidate.promotion_ready(
                 minimum_effective_samples=(
@@ -1024,16 +1059,50 @@ class MemoryTreeInference:
             quality = candidate.promoted_quality(
                 self.wake_config.controller_gain_reference
             )
-            self.tree.episodic_memory.add_memory(
-                candidate.owner_id,
-                candidate.key,
-                candidate.delta_theta,
-                candidate.window,
-                write_quality=quality,
-                queue_weight=candidate.queue_weight,
-                semantic_theta=self.tree.semantic_theta(candidate.owner_id).detach(),
+            promotable.append((candidate, quality))
+
+        # Promotion is the other persistent-write path outside the Wake
+        # batch. Candidates remain in insertion order inside each owner group;
+        # grouping only removes repeated law-key construction and admission
+        # synchronizations, while the metadata report below retains the
+        # original global order.
+        grouped_promotions = {}
+        for candidate, quality in promotable:
+            grouped_promotions.setdefault(candidate.owner_id, []).append(
+                (candidate, quality)
+            )
+        for owner_id, owner_candidates in grouped_promotions.items():
+            reference = owner_candidates[0][0].key
+            self.tree.episodic_memory.add_memory_batch(
+                owner_id,
+                torch.stack([
+                    candidate.key.reshape(-1).to(
+                        device=reference.device, dtype=reference.dtype
+                    )
+                    for candidate, _ in owner_candidates
+                ]),
+                torch.stack([
+                    candidate.delta_theta.reshape(-1).to(
+                        device=reference.device
+                    )
+                    for candidate, _ in owner_candidates
+                ]),
+                windows=[candidate.window for candidate, _ in owner_candidates],
+                write_quality=torch.as_tensor(
+                    [quality for _, quality in owner_candidates],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
+                queue_weight=torch.as_tensor(
+                    [candidate.queue_weight for candidate, _ in owner_candidates],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
+                semantic_theta=self.tree.semantic_theta(owner_id).detach(),
                 decays=self.hawkes.decays.detach(),
             )
+
+        for candidate, quality in promotable:
             # This is the sole probation-to-Split bridge. Before promotion the
             # candidate is absent from both the bank and the trigger queue.
             self.controller.split_queues[
@@ -1640,10 +1709,12 @@ class MemoryTreeInference:
                 ).indices.cpu().tolist()
             else:
                 selected = []
-            for index in selected:
-                request = eligible[index]
-                if self.config.allow_memory_writes:
-                    self._commit_delayed_write(sequence, request)
+            selected_requests = [eligible[index] for index in selected]
+            if self.config.allow_memory_writes:
+                self._commit_delayed_writes_batch(
+                    sequence, selected_requests
+                )
+                for request in selected_requests:
                     request["committed"] = True
                     accepted_write_requests.append(request)
                     outputs[request["event_index"]]["write_accepted"] = True

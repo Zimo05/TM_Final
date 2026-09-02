@@ -66,6 +66,72 @@ class UnifiedTopologyCandidate:
         }
 
 
+def format_split_candidate_log(
+    candidate: UnifiedTopologyCandidate,
+) -> Optional[str]:
+    """Format the compact Split evidence line used during Deep evaluation."""
+    if candidate.kind is not TopologyActionKind.SPLIT:
+        return None
+
+    diagnostics = candidate.diagnostics
+    child_effective_mass = diagnostics.get(
+        "child_effective_mass", (float("nan"), float("nan"))
+    )
+    if not isinstance(child_effective_mass, Sequence):
+        child_effective_mass = (float("nan"), float("nan"))
+    child_left = (
+        child_effective_mass[0]
+        if len(child_effective_mass) > 0
+        else float("nan")
+    )
+    child_right = (
+        child_effective_mass[1]
+        if len(child_effective_mass) > 1
+        else float("nan")
+    )
+
+    def scalar(value: Any, default: float = float("nan")) -> float:
+        try:
+            return float(torch.as_tensor(value).detach().cpu())
+        except (TypeError, ValueError, RuntimeError):
+            return float(default)
+
+    def integer(value: Any, default: int = 0) -> int:
+        try:
+            return int(torch.as_tensor(value).detach().cpu())
+        except (TypeError, ValueError, RuntimeError):
+            return int(default)
+
+    reason = str(diagnostics.get("reason", "unknown"))
+    return (
+        f"[UnifiedTopology] split:{candidate.target} "
+        f"N_bank={integer(diagnostics.get('N_bank', candidate.replay_size))} "
+        f"N_shadow={integer(diagnostics.get('N_shadow', 0))} "
+        f"N_replay={integer(diagnostics.get('N_replay', candidate.replay_size))} "
+        f"N_eff={scalar(candidate.effective_sample_size):.6g} "
+        f"N_L_eff={scalar(child_left):.6g} "
+        f"N_R_eff={scalar(child_right):.6g} "
+        f"S_structural={scalar(diagnostics.get('structural_strength')):.6g} "
+        f"G_pred={scalar(diagnostics.get('prediction_gain')):+.6g} "
+        f"G_sigma={scalar(candidate.uncertainty):.6g} "
+        f"G_raw={scalar(candidate.raw_gain):+.6g} "
+        f"G_conservative={scalar(candidate.conservative_gain):+.6g} "
+        f"eligible={bool(candidate.eligible)} "
+        f"ready={bool(candidate.ready)} "
+        f"reason={reason}"
+    )
+
+
+def print_split_candidate_logs(
+    candidates: Sequence[UnifiedTopologyCandidate],
+) -> None:
+    """Print one diagnostic line for every Split candidate in an evaluation."""
+    for candidate in candidates:
+        line = format_split_candidate_log(candidate)
+        if line is not None:
+            print(line, flush=True)
+
+
 @dataclass(frozen=True)
 class UnifiedTopologySelection:
     """Calibrated training policy plus gain-gated physical commit decode."""
@@ -291,6 +357,9 @@ def build_split_candidate(
         child_ess_right,
     ) = summary
     eligible = bool(eligible_value)
+    n_bank = output.get("N_bank", parent.numel())
+    n_shadow = output.get("N_shadow", 0)
+    n_replay = output.get("N_replay", parent.numel())
     return UnifiedTopologyCandidate(
         action_id=action_id,
         kind=TopologyActionKind.SPLIT,
@@ -306,6 +375,9 @@ def build_split_candidate(
         replay_size=int(parent.numel()),
         diagnostics={
             "reason": "ready" if eligible else "insufficient_split_support",
+            "N_bank": int(n_bank),
+            "N_shadow": int(n_shadow),
+            "N_replay": int(n_replay),
             "prediction_gain": float(mean_gain_value),
             "complexity_delta": 1.0,
             "lambda_T": float(lambda_T),

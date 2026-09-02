@@ -121,6 +121,10 @@ class TreeEpisodicMemory(nn.Module):
             bank.cycle_usage = fn(bank.cycle_usage)
             bank.stale_cycles = fn(bank.stale_cycles)
             bank.age = fn(bank.age)
+            # The fixed-capacity append store is an optimization cache, not
+            # serialized state. Rebuild it lazily after a device/dtype move so
+            # no stale pre-move storage can be written into later.
+            bank._invalidate_fixed_storage()
             bank.device = bank.keys.device
             for window in bank.windows:
                 if window is not None:
@@ -298,17 +302,15 @@ class TreeEpisodicMemory(nn.Module):
                 # bank in a checkpoint; it is never read and will be removed
                 # by the normal node synchronization transaction.
                 continue
-            bank.law_keys = torch.stack([
-                effective_hawkes_law_key(
-                    semantic_theta=semantic_theta,
-                    delta_theta=delta,
-                    decays=decays,
-                    num_event_types=self.parameter_update.D,
-                    num_basis=self.parameter_update.M,
-                    key_dim=self.key_dim,
-                ).to(bank.keys)
-                for delta in bank.deltas
-            ])
+            bank.law_keys = effective_hawkes_law_key(
+                semantic_theta=semantic_theta,
+                delta_theta=bank.deltas[: len(bank)],
+                decays=decays,
+                num_event_types=self.parameter_update.D,
+                num_basis=self.parameter_update.M,
+                key_dim=self.key_dim,
+            ).to(bank.keys)
+            bank._invalidate_fixed_storage()
 
     def sync_nodes(self, node_ids: Iterable[str], remove_stale: bool = False) -> None:
         active_ids = set(node_ids)
@@ -357,6 +359,48 @@ class TreeEpisodicMemory(nn.Module):
             write_quality=write_quality,
             queue_weight=queue_weight,
             law_key=law_key,
+            law_key_builder=law_key_builder,
+        )
+
+    def add_memory_batch(
+        self,
+        node_id: str,
+        keys: Tensor,
+        delta_theta: Tensor,
+        windows: Optional[Sequence[Optional[EventWindow]]] = None,
+        write_quality: float | Tensor = 1.0,
+        queue_weight: float | Tensor = 0.0,
+        semantic_theta: Optional[Tensor] = None,
+        decays: Optional[Tensor] = None,
+        law_keys: Optional[Tensor] = None,
+    ) -> list[Dict[str, int | float | str]]:
+        """Batch node-local memory writes before touching the persistent bank."""
+        bank = self.get_bank(node_id)
+        bank.materialize_age(self._age_clock)
+        law_key_builder = None
+        if semantic_theta is not None or decays is not None:
+            if semantic_theta is None or decays is None:
+                raise ValueError("semantic_theta and decays must be provided together")
+
+            def law_key_builder(candidate_delta: Tensor) -> Tensor:
+                return effective_hawkes_law_key(
+                    semantic_theta=semantic_theta,
+                    delta_theta=candidate_delta,
+                    decays=decays,
+                    num_event_types=self.parameter_update.D,
+                    num_basis=self.parameter_update.M,
+                    key_dim=self.key_dim,
+                )
+
+            if law_keys is None:
+                law_keys = law_key_builder(delta_theta)
+        return bank.add_batch(
+            keys=keys,
+            delta_theta=delta_theta,
+            windows=windows,
+            write_quality=write_quality,
+            queue_weight=queue_weight,
+            law_keys=law_keys,
             law_key_builder=law_key_builder,
         )
 

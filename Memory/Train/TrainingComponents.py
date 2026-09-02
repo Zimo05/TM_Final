@@ -64,6 +64,7 @@ from Sleep.UnifiedTopology import (
     build_merge_candidate,
     build_split_candidate,
     build_topology_prune_candidate,
+    print_split_candidate_logs,
     smooth_candidate_gains,
 )
 from Train.ConstructTree import ConstructMemoryTree

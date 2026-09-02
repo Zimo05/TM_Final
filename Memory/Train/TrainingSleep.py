@@ -52,8 +52,9 @@ class TrainingSleepMixin:
                     progress.update(1)
                 continue
             module = self.split_modules[leaf_id]
+            bank = self.tree.episodic_memory.get_bank(leaf_id)
             episodic_batch = module.build_split_batch_from_memory_bank(
-                self.tree.episodic_memory.get_bank(leaf_id),
+                bank,
                 max_items=max_evidence,
             )
             batch = episodic_batch
@@ -79,6 +80,12 @@ class TrainingSleepMixin:
                 delta_complexity=1.0,
             )
             output["replay_weights"] = batch.weights.detach()
+            # Preserve evidence-size provenance for the diagnostic logger.
+            # The current production path has no shadow buffer, so make that
+            # explicit instead of conflating it with bounded replay rows.
+            output["N_bank"] = int(len(bank))
+            output["N_shadow"] = 0
+            output["N_replay"] = int(batch.residuals.shape[0])
             proposals[leaf_id] = (module, output)
             if progress is not None:
                 progress.update(1)
@@ -444,6 +451,10 @@ class TrainingSleepMixin:
             strength=self.sleep_config.topology_inertia_strength,
             tau=self.sleep_config.topology_inertia_tau,
         )
+        # This method is called only when evaluation_needed=True.  Log the
+        # final Split evidence after smoothing/inertia so it matches the
+        # candidate passed to the unified selector.
+        print_split_candidate_logs(candidates)
         # TopologyPrune already applies its replay uncertainty. The common
         # selector owns action-type/target arbitration and the Null boundary.
         selection = self.topology_selector(
