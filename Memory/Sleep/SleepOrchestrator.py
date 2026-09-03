@@ -45,10 +45,17 @@ class SleepOrchestrator:
                 result["deep_gate"]["hard_gate"],
             )
         )
-        control_flow = ["light", "deep_gate"]
+        # Light owns the frozen snapshot and the Bank-mode probe.  Keep the
+        # diagnostic order aligned with the actual lifecycle rather than
+        # reporting the gate before the work it gates.
+        control_flow = [
+            "freeze_snapshot",
+            "bank_mode_probe",
+            "light_or_preserve",
+            "deep_gate",
+        ]
         if evaluated:
             control_flow.extend((
-                "freeze_snapshot",
                 "build_candidates",
                 "temporal_smoothing",
                 "unified_selector",

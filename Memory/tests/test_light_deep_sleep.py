@@ -9,7 +9,11 @@ from LatentHawkesTree import HawkesTree
 from MemoryResiduals.MemoryBank import EventWindow
 from MemoryResiduals.Replay import replay_log_likelihood
 from Sleep.DeepGate import DeepSleepGate
-from Sleep.Light import LightSleepSettings, run_light_sleep
+from Sleep.Light import (
+    LightSleepSettings,
+    propose_light_absorption,
+    run_light_sleep,
+)
 from Sleep.Split import SplitModule
 from Train.Train import (
     CausalPrefixEncoder,
@@ -410,17 +414,34 @@ class LightDeepSleepTests(unittest.TestCase):
         theta_before = tree.semantic_theta("root").detach().clone()
         delta_before = bank.deltas.detach().clone()
 
+        seen = {}
+
+        def structural_probe(leaf_id, current_bank, proposal):
+            seen[leaf_id] = {
+                "theta": tree.semantic_theta(leaf_id).detach().clone(),
+                "deltas": current_bank.deltas.detach().clone(),
+                "theta_old": proposal.theta_old.detach().clone(),
+            }
+            return {"protect": True, "advantage": 1.0}
+
         result = run_light_sleep(
             tree,
             hawkes,
             settings=LightSleepSettings(replay_budget=2),
-            protected_leaf_ids={"root"},
+            structural_probe=structural_probe,
         )
 
+        self.assertIn("root", seen)
+        torch.testing.assert_close(seen["root"]["theta"], theta_before)
+        torch.testing.assert_close(seen["root"]["deltas"], delta_before)
+        torch.testing.assert_close(
+            seen["root"]["theta_old"], theta_before
+        )
         torch.testing.assert_close(tree.semantic_theta("root"), theta_before)
         torch.testing.assert_close(bank.deltas, delta_before)
         self.assertEqual(result["protected_leaves"], 1)
         self.assertEqual(result["absorbed_leaves"], 0)
+        self.assertIn("root", result["bank_mode_probes"])
 
     def test_bank_mode_counterfactual_probe_is_non_mutating(self):
         torch.manual_seed(423)
@@ -452,9 +473,10 @@ class LightDeepSleepTests(unittest.TestCase):
         law_b = torch.zeros(law_dim)
         law_a[0] = 1.0
         law_b[min(1, law_dim - 1)] = 1.0
+        delta = self._improving_residual(tree, hawkes, windows[0])
         bank.add(
             torch.tensor([1.0, 0.0, 0.0]),
-            torch.full((tree.param_dim,), 0.02),
+            delta,
             windows[0],
             law_key=law_a,
             prediction_gain=1.0,
@@ -462,26 +484,57 @@ class LightDeepSleepTests(unittest.TestCase):
         )
         bank.add(
             torch.tensor([0.0, 1.0, 0.0]),
-            torch.full((tree.param_dim,), -0.02),
-            windows[1],
+            delta,
+            windows[0],
             law_key=law_b,
             prediction_gain=1.0,
             force_new_mode_confirmation=True,
         )
         module = SplitModule(tree.param_dim, 3, nll_fn=hawkes)
-        batch = module.build_split_batch_from_memory_bank(bank)
         theta_before = tree.semantic_theta("root").detach().clone()
         delta_before = bank.deltas.detach().clone()
         modes_before = bank.mode_ids.detach().clone()
+        settings = LightSleepSettings(
+            replay_budget=2,
+            min_per_leaf=1,
+            min_direction_support=1,
+            coherence_threshold=0.0,
+            gain_reference=1e-6,
+        )
+        proposal = propose_light_absorption(
+            bank,
+            theta_before,
+            hawkes,
+            settings,
+            [0, 1],
+            replay_budget=2,
+        )
+        self.assertIsNotNone(proposal.selected_direction)
+        batch = module.build_split_batch_from_memory_bank(
+            bank,
+            indices=proposal.replay_indices,
+        )
+        self.assertIsNotNone(batch)
 
         probe = module.bank_mode_counterfactual_probe(
             theta_sem=theta_before,
             batch=batch,
             hawkes_ll=hawkes,
+            light_proposal=proposal,
         )
 
         self.assertIsNotNone(probe)
         self.assertTrue(torch.isfinite(torch.tensor(probe["advantage"])))
+        torch.testing.assert_close(
+            probe["theta_h0"], proposal.theta_candidate
+        )
+        torch.testing.assert_close(
+            probe["shared_delta"], proposal.shared_delta
+        )
+        self.assertEqual(probe["alpha_light"], proposal.alpha)
+        torch.testing.assert_close(
+            probe["light_replay_indices"], proposal.replay_indices
+        )
         torch.testing.assert_close(tree.semantic_theta("root"), theta_before)
         torch.testing.assert_close(bank.deltas, delta_before)
         torch.testing.assert_close(bank.mode_ids, modes_before)
@@ -725,9 +778,10 @@ class LightDeepSleepTests(unittest.TestCase):
         self.assertEqual(float(trainer.deep_sleep_gate.accumulator), 0.0)
         self.assertTrue(result["deep_gate"]["reset_after_evaluation"])
         self.assertEqual(result["control_flow"], [
-            "light",
-            "deep_gate",
             "freeze_snapshot",
+            "bank_mode_probe",
+            "light_or_preserve",
+            "deep_gate",
             "build_candidates",
             "temporal_smoothing",
             "unified_selector",

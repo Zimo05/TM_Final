@@ -1287,10 +1287,15 @@ class SplitModule(nn.Module):
         residual_norm_ema: float = 1.0,
         max_items: Optional[int] = None,
         min_replay_per_group: int = 2,
+        indices: Optional[Sequence[int] | torch.Tensor] = None,
     ) -> Optional[SplitBatch]:
         """Build a bounded evidence batch from one leaf memory bank."""
         if max_items is not None and max_items <= 0:
             raise ValueError("max_items must be positive when provided")
+        if indices is not None and max_items is not None:
+            raise ValueError(
+                "max_items cannot be combined with exact replay indices"
+            )
         bank._ensure_prototype_state()
         count = len(bank)
         if count == 0:
@@ -1309,7 +1314,31 @@ class SplitModule(nn.Module):
         ]
         if not valid_indices:
             return None
-        indices = torch.tensor(valid_indices, device=bank.device, dtype=torch.long)
+        if indices is None:
+            selected_indices = valid_indices
+        elif torch.is_tensor(indices):
+            selected_indices = [
+                int(index)
+                for index in indices.detach().cpu().reshape(-1).tolist()
+            ]
+        else:
+            selected_indices = [int(index) for index in indices]
+        if not selected_indices:
+            return None
+        valid_set = set(valid_indices)
+        invalid = sorted(set(selected_indices).difference(valid_set))
+        if invalid:
+            raise ValueError(
+                "exact replay indices must refer to retained physical windows: "
+                f"{invalid}"
+            )
+        if len(set(selected_indices)) != len(selected_indices):
+            raise ValueError("exact replay indices must be unique")
+        indices = torch.tensor(
+            selected_indices,
+            device=bank.device,
+            dtype=torch.long,
+        )
         # Raw delta_theta determines the dynamics identity; quality is applied
         # only to base evidence weights below.
         residuals = bank.deltas[indices]
@@ -1401,22 +1430,22 @@ class SplitModule(nn.Module):
         theta_sem: torch.Tensor | HawkesParams | Any,
         batch: SplitBatch,
         hawkes_ll: Optional[HawkesFamily] = None,
-        alpha_max: float = 0.25,
-        trust_radius: float = 0.10,
-        gain_reference: float = 0.05,
+        light_proposal: Any,
     ) -> Optional[Dict[str, Any]]:
         """Compare shared Light absorption with Bank-mode specialization.
 
-        The method is deliberately non-mutating.  Both hypotheses are
-        evaluated on the same frozen semantic parameter and the same bounded
-        physical replay rows.  Bank mode assignment forms H1; residuals are
-        never re-clustered and write quality only affects reliability weights.
+        ``light_proposal`` must be produced by
+        :func:`Sleep.Light.propose_light_absorption`.  Split owns only H1 and
+        the comparison statistic; it never reconstructs H0 or a second Light
+        weighting rule.  Both hypotheses are evaluated on the same frozen
+        semantic parameter and the same physical replay rows.
         """
-        if alpha_max < 0.0 or trust_radius < 0.0 or gain_reference <= 0.0:
-            raise ValueError("invalid Light probe step-size settings")
         if batch.bank_group_weights is None or batch.mode_summary is None:
             return None
         if int(batch.mode_summary["mode_ids"].numel()) < 2:
+            return None
+        selected_direction = getattr(light_proposal, "selected_direction", None)
+        if selected_direction is None:
             return None
 
         hawkes_ll = self._resolve_hawkes_ll(hawkes_ll)
@@ -1428,6 +1457,37 @@ class SplitModule(nn.Module):
         if q is None:
             return None
         q = q / q.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+
+        light_replay_indices = getattr(light_proposal, "replay_indices", None)
+        if light_replay_indices is None:
+            return None
+        if int(light_replay_indices.numel()) != int(frozen.residuals.size(0)):
+            raise ValueError(
+                "probe batch must contain exactly Light proposal replay rows"
+            )
+
+        # H0 is the semantic candidate that real Light would commit.  It is
+        # intentionally not recomputed from the probe weights.
+        theta_h0 = torch.as_tensor(
+            light_proposal.theta_h0,
+            device=theta.device,
+            dtype=theta.dtype,
+        ).detach().clone()
+        shared_delta = torch.as_tensor(
+            light_proposal.shared_delta,
+            device=theta.device,
+            dtype=theta.dtype,
+        ).detach().clone()
+        alpha_light = float(light_proposal.alpha)
+        light_replay_weights = torch.as_tensor(
+            light_proposal.replay_weights,
+            device=theta.device,
+            dtype=theta.dtype,
+        ).reshape(-1)
+        if light_replay_weights.shape != frozen.weights.shape:
+            raise ValueError(
+                "Light proposal replay weights must align with probe rows"
+            )
 
         persistent_support = (
             torch.ones_like(frozen.weights)
@@ -1449,51 +1509,9 @@ class SplitModule(nn.Module):
         if not bool(torch.isfinite(total_weight)) or bool(total_weight <= self.eps):
             return None
 
-        weighted_sum = (reliability[:, None] * frozen.residuals).sum(0)
-        shared_delta = weighted_sum / total_weight
-        energy = (
-            reliability
-            * frozen.residuals.square().sum(dim=-1)
-        ).sum()
-        coherence = (
-            weighted_sum.square().sum()
-            / (total_weight * energy).clamp_min(self.eps)
-        ).clamp(0.0, 1.0)
-
         replay_cache = build_replay_batch_cache(
             frozen.windows, hawkes_ll, theta
         )
-        # The optimized replay kernel evaluates the parent plus exactly two
-        # alternatives. Duplicate the shared alternative for this H0
-        # step-size calibration pass.
-        shared_models = torch.stack(
-            (theta, theta + shared_delta, theta + shared_delta), dim=0
-        )
-        shared_nll = batched_replay_log_likelihood(
-            replay_cache,
-            shared_models,
-            hawkes_ll,
-            normalize_by_events=True,
-        )
-        full_step_gain = (
-            reliability * (shared_nll[:, 0] - shared_nll[:, 1])
-        ).sum() / total_weight
-        trust = min(
-            1.0,
-            float(trust_radius)
-            / (float(shared_delta.norm().item()) + self.eps),
-        )
-        gain_scale = min(
-            1.0,
-            max(0.0, float(full_step_gain.item())) / float(gain_reference),
-        )
-        alpha_light = (
-            float(alpha_max)
-            * float(coherence.item())
-            * trust
-            * gain_scale
-        )
-        theta_h0 = theta + alpha_light * shared_delta
 
         grouped_weight = reliability[:, None] * q
         group_mass = grouped_weight.sum(dim=0)
@@ -1530,8 +1548,12 @@ class SplitModule(nn.Module):
             "theta_h0": theta_h0.detach(),
             "theta_h1": theta_h1.detach(),
             "alpha_light": float(alpha_light),
-            "coherence": float(coherence.item()),
-            "full_step_gain": float(full_step_gain.item()),
+            "coherence": float(selected_direction.coherence.item()),
+            "direction_gain": float(selected_direction.gain.item()),
+            "full_step_gain": float(selected_direction.gain.item()),
+            "selected_direction_indices": selected_direction.indices.detach().clone(),
+            "light_replay_indices": light_replay_indices.detach().clone(),
+            "light_replay_weights": light_replay_weights.detach().clone(),
             "loss_h0": float(loss_h0.item()),
             "loss_h1": float(loss_h1.item()),
             "advantage": float(advantage.item()),
@@ -1729,7 +1751,7 @@ class SplitModule(nn.Module):
                 tau_age=tau_age,
                 residual_norm_ema=residual_norm_ema,
             )
-            if batch is None or batch.residuals.shape[0] < 2:
+            if batch is None:
                 continue
 
             if leaf_id not in leaf_to_split_module:

@@ -9,7 +9,7 @@ then rebased so its effective Hawkes parameters remain exactly unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Collection, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Collection, Dict, Mapping, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -82,6 +82,29 @@ class DirectionEvidence:
     coherence: Tensor
     gain: Tensor
     replay_indices: Tensor
+
+
+@dataclass
+class LightAbsorptionProposal:
+    """The complete non-mutating proposal made by Light for one leaf."""
+
+    theta_old: Tensor
+    theta_h0: Tensor
+    shared_delta: Tensor
+    alpha: float
+    selected_direction: Optional[DirectionEvidence]
+    replay_indices: Tensor
+    replay_weights: Tensor
+    candidate_indices: Tensor
+    clusters: list[Tensor]
+    evidence: list[DirectionEvidence]
+    updated_summary: Dict[str, Tensor]
+    replay_used: int
+
+    @property
+    def theta_candidate(self) -> Tensor:
+        """Compatibility name used by the Light application path."""
+        return self.theta_h0
 
 
 def _bounded_valid_window_indices(
@@ -367,6 +390,7 @@ def _reconcile_contracted_banks(
     hawkes_ll: HawkesFamily,
     settings: LightSleepSettings,
     protected_leaf_ids: Collection[str] = (),
+    replay_budget: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Consume pending post-contraction overflow in a bounded Light step.
 
@@ -379,7 +403,11 @@ def _reconcile_contracted_banks(
     """
     pending = tree.memory_reconciliation
     base_capacity = int(tree.episodic_memory.capacity_per_node)
-    remaining_replay = int(settings.replay_budget)
+    remaining_replay = (
+        int(settings.replay_budget)
+        if replay_budget is None
+        else max(0, int(replay_budget))
+    )
     replay_windows = 0
     replay_events = 0
     removed_rows = 0
@@ -588,6 +616,137 @@ def _direction_evidence(
     )
 
 
+@torch.no_grad()
+def propose_light_absorption(
+    bank: MemoryBank,
+    theta_leaf: Tensor,
+    hawkes_ll: HawkesFamily,
+    settings: LightSleepSettings,
+    candidate_indices: Sequence[int] | Tensor,
+    *,
+    direction_summary: Optional[Dict[str, Tensor]] = None,
+    replay_budget: Optional[int] = None,
+) -> LightAbsorptionProposal:
+    """Build exactly the proposal that ``run_light_sleep`` would apply.
+
+    This helper has no tree or Bank mutation.  It is the single source of
+    truth for direction clustering, eligibility, selected direction, replay
+    rows, trust-region alpha, and the candidate semantic parameter.  Probe H0
+    calls this helper's result, so H0 cannot silently drift from real Light.
+    """
+    settings.validate()
+    if torch.is_tensor(candidate_indices):
+        candidate_tensor = candidate_indices.to(
+            device=bank.device, dtype=torch.long
+        ).reshape(-1)
+        candidate_list = candidate_tensor.detach().cpu().tolist()
+    else:
+        candidate_list = [int(index) for index in candidate_indices]
+        candidate_tensor = torch.tensor(
+            candidate_list, device=bank.device, dtype=torch.long
+        )
+    budget = (
+        len(candidate_list)
+        if replay_budget is None
+        else max(0, int(replay_budget))
+    )
+    clusters, updated_summary = _cluster_residual_directions(
+        bank,
+        candidate_list,
+        settings,
+        direction_summary,
+    )
+    evidence: list[DirectionEvidence] = []
+    replay_used = 0
+    for cluster in clusters:
+        if replay_used >= budget:
+            break
+        local_settings = LightSleepSettings(
+            **{
+                **settings.__dict__,
+                "gain_evaluations_per_direction": min(
+                    settings.gain_evaluations_per_direction,
+                    budget - replay_used,
+                ),
+            }
+        )
+        item = _direction_evidence(
+            bank,
+            cluster,
+            theta_leaf,
+            hawkes_ll,
+            local_settings,
+        )
+        evidence.append(item)
+        replay_used += int(item.replay_indices.numel())
+
+    eligible = [
+        item
+        for item in evidence
+        if (
+            int(item.indices.numel()) >= settings.min_direction_support
+            and bool(item.gain > settings.min_gain)
+            and bool(item.coherence >= settings.coherence_threshold)
+        )
+    ]
+    selected_direction = None
+    alpha = 0.0
+    theta_candidate = theta_leaf.detach().clone()
+    if eligible:
+        selected_direction = max(
+            eligible,
+            key=lambda item: float(
+                (
+                    item.weight
+                    * item.coherence
+                    * item.gain.clamp_min(0.0)
+                ).item()
+            ),
+        )
+        trust = min(
+            1.0,
+            settings.trust_radius
+            / (float(selected_direction.mean.norm().item()) + settings.eps),
+        )
+        gain_scale = min(
+            1.0,
+            max(0.0, float(selected_direction.gain.item()))
+            / settings.gain_reference,
+        )
+        alpha = (
+            settings.alpha_max
+            * float(selected_direction.coherence.item())
+            * trust
+            * gain_scale
+        )
+        theta_candidate = theta_leaf + alpha * selected_direction.mean
+
+    if selected_direction is None:
+        shared_delta = theta_leaf.new_zeros(theta_leaf.shape)
+        replay_indices = candidate_tensor[:0]
+        replay_weights = theta_leaf.new_empty(0)
+    else:
+        shared_delta = selected_direction.mean.detach().clone()
+        replay_indices = selected_direction.replay_indices.detach().clone()
+        replay_weights = _cheap_memory_weight(
+            bank, replay_indices, settings
+        ).detach().clone()
+    return LightAbsorptionProposal(
+        theta_old=theta_leaf.detach().clone(),
+        theta_h0=theta_candidate.detach().clone(),
+        shared_delta=shared_delta,
+        alpha=float(alpha),
+        selected_direction=selected_direction,
+        replay_indices=replay_indices,
+        replay_weights=replay_weights,
+        candidate_indices=candidate_tensor.detach().clone(),
+        clusters=clusters,
+        evidence=evidence,
+        updated_summary=updated_summary,
+        replay_used=replay_used,
+    )
+
+
 def _clear_optimizer_state(
     optimizer: Optional[torch.optim.Optimizer],
     parameter: torch.nn.Parameter,
@@ -605,6 +764,12 @@ def run_light_sleep(
     settings: Optional[LightSleepSettings] = None,
     state: Optional[Dict[str, object]] = None,
     protected_leaf_ids: Collection[str] = (),
+    structural_probe: Optional[
+        Callable[
+            [str, MemoryBank, LightAbsorptionProposal],
+            Optional[Dict[str, Any]],
+        ]
+    ] = None,
 ) -> Dict[str, object]:
     """Run one fixed-topology, globally budgeted consolidation cycle."""
     settings = LightSleepSettings() if settings is None else settings
@@ -613,9 +778,32 @@ def run_light_sleep(
     scan_cursors = state.setdefault("scan_cursors", {})
     direction_summaries = state.setdefault("direction_summaries", {})
     protected = set(protected_leaf_ids)
-    reconciliation = _reconcile_contracted_banks(
-        tree, hawkes_ll, settings, protected
+    defer_reconciliation = (
+        structural_probe is not None and bool(tree.memory_reconciliation)
     )
+    if defer_reconciliation:
+        # A structural probe must see the exact post-consolidation Bank before
+        # any pending collapse overflow is deleted or compressed.  The
+        # reconciliation transaction is therefore postponed until after the
+        # probe/Light decision and is skipped for a protected node.
+        reconciliation = {
+            "reconciled_nodes": [],
+            "reconciled_banks": 0,
+            "removed_rows": 0,
+            "deferred_banks": 0,
+            "replay_windows": 0,
+            "replay_events": 0,
+            "merge_banks": 0,
+            "prune_banks": 0,
+            "utility_numerator": 0.0,
+            "utility_denominator": 0.0,
+            "raw_energy_numerator": 0.0,
+            "raw_energy_denominator": 0.0,
+        }
+    else:
+        reconciliation = _reconcile_contracted_banks(
+            tree, hawkes_ll, settings, protected
+        )
     for node_id in reconciliation["reconciled_nodes"]:
         scan_cursors.pop(node_id, None)
         direction_summaries.pop(node_id, None)
@@ -661,6 +849,9 @@ def run_light_sleep(
         reconciliation["raw_energy_denominator"]
     )
     absorbed = 0
+    probe_results: Dict[str, Dict[str, Any]] = {}
+    probe_protected: set[str] = set()
+    probed_leaves: set[str] = set()
 
     for leaf_id in sorted(protected.intersection(tree.leaf_ids)):
         bank = tree.episodic_memory.banks.get(leaf_id)
@@ -682,6 +873,7 @@ def run_light_sleep(
         )
         if leaf_budget <= 0:
             continue
+        probed_leaves.add(leaf_id)
         bank = tree.episodic_memory.banks[leaf_id]
         leaf_scan_budget = min(
             remaining_scan_budget,
@@ -700,38 +892,22 @@ def run_light_sleep(
         scan_cursors[leaf_id] = next_cursor
         remaining_scan_budget -= inspected
         total_scanned_memories += inspected
-        clusters, updated_summary = _cluster_residual_directions(
-            bank,
-            candidate_indices,
-            settings,
-            direction_summaries.get(leaf_id),
-        )
-        direction_summaries[leaf_id] = updated_summary
         theta_old = tree.semantic_theta(leaf_id).detach().clone()
-        evidence = []
-        replay_used = 0
-        for cluster in clusters:
-            if replay_used >= leaf_budget:
-                break
-            local_settings = LightSleepSettings(
-                **{
-                    **settings.__dict__,
-                    "gain_evaluations_per_direction": min(
-                        settings.gain_evaluations_per_direction,
-                        leaf_budget - replay_used,
-                    ),
-                }
-            )
-            item = _direction_evidence(
-                bank,
-                cluster,
-                theta_old,
-                hawkes_ll,
-                local_settings,
-            )
-            used_count = int(item.replay_indices.numel())
-            replay_used += used_count
-            total_replay_windows += used_count
+        proposal = propose_light_absorption(
+            bank,
+            theta_old,
+            hawkes_ll,
+            settings,
+            candidate_indices,
+            direction_summary=direction_summaries.get(leaf_id),
+            replay_budget=leaf_budget,
+        )
+        clusters = proposal.clusters
+        updated_summary = proposal.updated_summary
+        direction_summaries[leaf_id] = updated_summary
+        evidence = proposal.evidence
+        replay_used = proposal.replay_used
+        for item in evidence:
             for memory_index in item.replay_indices.detach().cpu().tolist():
                 window = bank.windows[memory_index]
                 if window is not None:
@@ -739,22 +915,9 @@ def run_light_sleep(
                         0,
                         int(window.end_idx) - int(window.start_idx),
                     )
-            evidence.append(item)
+        total_replay_windows += replay_used
         remaining_budget -= replay_used
 
-        eligible = [
-            item
-            for item in evidence
-            if (
-                int(item.indices.numel())
-                >= settings.min_direction_support
-                and bool(item.gain > settings.min_gain)
-                and bool(
-                    item.coherence
-                    >= settings.coherence_threshold
-                )
-            )
-        ]
         record: Dict[str, object] = {
             "bank_size": len(bank),
             "scanned_memories": inspected,
@@ -769,35 +932,20 @@ def run_light_sleep(
             "replay_windows": replay_used,
             "absorbed": False,
         }
-        if eligible:
-            chosen = max(
-                eligible,
-                key=lambda item: float(
-                    (
-                        item.weight
-                        * item.coherence
-                        * item.gain.clamp_min(0.0)
-                    ).item()
-                ),
-            )
-            trust = min(
-                1.0,
-                settings.trust_radius
-                / (float(chosen.mean.norm().item()) + settings.eps),
-            )
-            gain_scale = min(
-                1.0,
-                max(0.0, float(chosen.gain.item()))
-                / settings.gain_reference,
-            )
-            alpha = (
-                settings.alpha_max
-                * float(chosen.coherence.item())
-                * trust
-                * gain_scale
-            )
-            if alpha > 0.0:
-                theta_new = theta_old + alpha * chosen.mean
+        probe_result = None
+        if structural_probe is not None:
+            probe_result = structural_probe(leaf_id, bank, proposal)
+            if probe_result is not None:
+                probe_results[leaf_id] = probe_result
+        protected_by_probe = bool(
+            probe_result is not None and probe_result.get("protect", False)
+        )
+        if protected_by_probe:
+            probe_protected.add(leaf_id)
+        if proposal.selected_direction is not None and proposal.alpha > 0.0:
+            chosen = proposal.selected_direction
+            if not protected_by_probe:
+                theta_new = proposal.theta_h0
                 tree.set_semantic_theta(leaf_id, theta_new)
                 # Exact rebasing:
                 # theta_new + delta_new == theta_old + delta_old.
@@ -815,9 +963,16 @@ def run_light_sleep(
                     "support": int(chosen.indices.numel()),
                     "gain": float(chosen.gain.item()),
                     "coherence": float(chosen.coherence.item()),
-                    "alpha": float(alpha),
+                    "alpha": float(proposal.alpha),
                     "semantic_shift_norm": float(
                         (theta_new - theta_old).norm().item()
+                    ),
+                })
+            elif probe_result is not None:
+                record.update({
+                    "protected_by_bank_mode_probe": True,
+                    "probe_advantage": float(
+                        probe_result.get("advantage", 0.0)
                     ),
                 })
         if candidate_indices:
@@ -856,6 +1011,46 @@ def run_light_sleep(
         if remaining_budget <= 0 or remaining_scan_budget <= 0:
             break
 
+    if defer_reconciliation:
+        unprobed_pending = {
+            node_id
+            for node_id in set(tree.memory_reconciliation)
+            if (
+                node_id not in probed_leaves
+                and node_id in tree.leaf_ids
+                and node_id in tree.episodic_memory.banks
+            )
+        }
+        reconciliation = _reconcile_contracted_banks(
+            tree,
+            hawkes_ll,
+            settings,
+            protected
+            | probe_protected
+            | unprobed_pending,
+            replay_budget=max(
+                0,
+                settings.replay_budget - total_replay_windows,
+            ),
+        )
+        for node_id in reconciliation["reconciled_nodes"]:
+            scan_cursors.pop(node_id, None)
+            direction_summaries.pop(node_id, None)
+        total_replay_windows += int(reconciliation["replay_windows"])
+        total_replay_events += int(reconciliation["replay_events"])
+        sampled_utility_numerator += float(
+            reconciliation["utility_numerator"]
+        )
+        sampled_utility_denominator += float(
+            reconciliation["utility_denominator"]
+        )
+        sampled_raw_energy_numerator += float(
+            reconciliation["raw_energy_numerator"]
+        )
+        sampled_raw_energy_denominator += float(
+            reconciliation["raw_energy_denominator"]
+        )
+
     return {
         "ran": True,
         "budget": settings.replay_budget,
@@ -882,7 +1077,11 @@ def run_light_sleep(
         "active_leaves": len(active_leaves) + len(
             protected.intersection(tree.leaf_ids)
         ),
-        "protected_leaves": len(protected.intersection(tree.leaf_ids)),
+        "protected_leaves": len(
+            protected.intersection(tree.leaf_ids)
+            | probe_protected.intersection(tree.leaf_ids)
+        ),
+        "bank_mode_probes": probe_results,
         "absorbed_leaves": absorbed,
         "memory_reconciliation": reconciliation,
         "leaf_records": leaf_records,
@@ -890,6 +1089,8 @@ def run_light_sleep(
 
 __all__ = [
     "DirectionEvidence",
+    "LightAbsorptionProposal",
     "LightSleepSettings",
+    "propose_light_absorption",
     "run_light_sleep",
 ]

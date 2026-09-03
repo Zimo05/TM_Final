@@ -236,7 +236,7 @@ class WakeObjectiveConfig:
     count_saturation: float = 3.0
     # Appended to preserve positional construction of older configs.
     # Accepted-sample calibrated duplicate radius quantile.
-    prototype_duplicate_quantile: float = 0.80
+    prototype_duplicate_quantile: float = 0.85
 
 
 @dataclass

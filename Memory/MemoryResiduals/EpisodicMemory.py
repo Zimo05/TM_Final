@@ -53,14 +53,9 @@ class TreeEpisodicMemory(nn.Module):
             num_basis=num_basis,
         )
         self.param_dim = self.parameter_update.param_dim
-        # Hawkes-law identity uses the complete physical parameter feature;
-        # retrieval/context identities remain ``key_dim`` wide.  Keep this
-        # expression explicit so the law-key width follows the configured
-        # event/basis geometry (``D + D * D * M``), rather than any example
-        # configuration's resulting constant.
-        D = self.parameter_update.D
-        M = self.parameter_update.M
-        self.law_dim = int(D + D * D * M)
+        # Law identities use the compact signed-hash representation, while
+        # parameter storage remains the full physical Hawkes width.
+        self.law_dim = int(key_dim)
         self._prototype_policy = {
             "duplicate_threshold": 0.98,
             "mode_threshold": 0.90,
@@ -72,9 +67,9 @@ class TreeEpisodicMemory(nn.Module):
             "retention_stale_weight": 1.0,
             "retention_age_weight": 0.1,
             "adaptive_history_size": 64,
-            "adaptive_min_samples": 8,
-            "duplicate_quantile": 0.80,
-            "mode_quantile": 0.95,
+            "adaptive_min_samples": 16,
+            "duplicate_quantile": 0.85,
+            "mode_quantile": 0.975,
             "radius_margin": 1e-3,
             "gain_quantile": 0.95,
             "gain_ema_decay": 0.8,

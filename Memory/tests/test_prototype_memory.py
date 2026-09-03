@@ -83,6 +83,47 @@ class PrototypeMemoryTests(unittest.TestCase):
         after = effective_hawkes_law_key(semantic + shift, delta - shift, **kwargs)
         torch.testing.assert_close(before, after)
 
+    def test_effective_law_key_sums_basis_before_projection(self):
+        dtype = torch.float64
+
+        def inverse_softplus(value):
+            value = torch.tensor(value, dtype=dtype)
+            return torch.log(torch.expm1(value))
+
+        semantic_a = torch.tensor(
+            [0.2, float(inverse_softplus(0.8)), float(inverse_softplus(0.4))],
+            dtype=dtype,
+        )
+        semantic_b = torch.tensor(
+            [0.2, float(inverse_softplus(0.4)), float(inverse_softplus(1.2))],
+            dtype=dtype,
+        )
+        kwargs = dict(
+            decays=torch.tensor([1.0, 2.0], dtype=dtype),
+            num_event_types=1,
+            num_basis=2,
+            key_dim=7,
+        )
+        key_a = effective_hawkes_law_key(
+            semantic_a, torch.zeros_like(semantic_a), **kwargs
+        )
+        key_b = effective_hawkes_law_key(
+            semantic_b, torch.zeros_like(semantic_b), **kwargs
+        )
+
+        self.assertEqual(key_a.shape, (7,))
+        torch.testing.assert_close(key_a, key_b, atol=1e-12, rtol=1e-12)
+
+        memory = TreeEpisodicMemory(
+            key_dim=7,
+            num_event_types=1,
+            num_basis=2,
+            capacity_per_node=4,
+            device="cpu",
+        )
+        self.assertEqual(memory.law_dim, 7)
+        self.assertEqual(memory.get_bank("root").law_dim, 7)
+
     def test_duplicate_refresh_is_bounded_and_preserves_evidence_mass(self):
         memory = TreeEpisodicMemory(
             key_dim=8,
@@ -449,7 +490,7 @@ class PrototypeMemoryTests(unittest.TestCase):
         expected = MemoryBank._rolling_quantile(
             bank._mode_duplicate_distances[mode_id], bank.duplicate_quantile
         )
-        self.assertAlmostEqual(bank.duplicate_quantile, 0.80, places=7)
+        self.assertAlmostEqual(bank.duplicate_quantile, 0.85, places=7)
         self.assertAlmostEqual(duplicate_radius, expected, places=7)
         self.assertGreaterEqual(
             mode_radius, duplicate_radius + bank.radius_margin - 1e-12

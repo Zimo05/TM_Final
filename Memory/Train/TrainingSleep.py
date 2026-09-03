@@ -136,7 +136,7 @@ class TrainingSleepMixin:
                     ),
                 )
                 theta_snapshot = probe["theta_sem_snapshot"]
-            if batch is None or batch.residuals.shape[0] < 2:
+            if batch is None:
                 if progress is not None:
                     progress.update(1)
                 continue
@@ -176,52 +176,38 @@ class TrainingSleepMixin:
         return proposals
 
     @torch.no_grad()
-    def _build_bank_mode_probes(
+    def _probe_bank_modes_before_light(
         self,
-        *,
-        max_evidence: int,
-        released_once: Sequence[str] = (),
-    ) -> Dict[str, Dict[str, Any]]:
-        """Freeze and probe every eligible node before Light can mutate it."""
-        released = set(released_once)
-        probes: Dict[str, Dict[str, Any]] = {}
-        light_settings = self._light_sleep_settings()
-        candidate_leaves = []
-        for leaf_id in list(self.tree.leaf_ids):
-            bank = self.tree.episodic_memory.get_bank(leaf_id)
-            bank._ensure_prototype_state()
-            if (
-                leaf_id not in released
-                and len(bank) > 0
-                and int(torch.unique(bank.mode_ids).numel()) >= 2
-            ):
-                candidate_leaves.append(leaf_id)
-        if not candidate_leaves:
-            return probes
+        leaf_id: str,
+        bank: Any,
+        light_proposal: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Run the Bank-mode probe on the exact Light replay proposal.
+
+        ``run_light_sleep`` has already built the non-mutating Light proposal
+        for this leaf, but has not changed its semantic parameter or Bank.
+        Constructing the Split batch from ``light_proposal.replay_indices``
+        keeps H0 and H1 on the same frozen physical replay rows.
+        """
+        if getattr(light_proposal, "selected_direction", None) is None:
+            return None
+        replay_indices = getattr(light_proposal, "replay_indices", None)
+        if replay_indices is None or int(replay_indices.numel()) == 0:
+            return None
         self._sync_split_modules()
-        for leaf_id in candidate_leaves:
-            bank = self.tree.episodic_memory.get_bank(leaf_id)
-            module = self.split_modules[leaf_id]
-            batch = module.build_split_batch_from_memory_bank(
-                bank,
-                max_items=max_evidence,
-                min_replay_per_group=(
-                    self.sleep_config.split_min_replay_per_group
-                ),
-            )
-            if batch is None:
-                continue
-            probe = module.bank_mode_counterfactual_probe(
-                theta_sem=self.tree.semantic_theta(leaf_id).detach().clone(),
-                batch=batch,
-                hawkes_ll=self.hawkes,
-                alpha_max=light_settings.alpha_max,
-                trust_radius=light_settings.trust_radius,
-                gain_reference=light_settings.gain_reference,
-            )
-            if probe is not None:
-                probes[leaf_id] = probe
-        return probes
+        module = self.split_modules[leaf_id]
+        batch = module.build_split_batch_from_memory_bank(
+            bank,
+            indices=replay_indices,
+        )
+        if batch is None:
+            return None
+        return module.bank_mode_counterfactual_probe(
+            theta_sem=light_proposal.theta_old,
+            batch=batch,
+            hawkes_ll=self.hawkes,
+            light_proposal=light_proposal,
+        )
 
     def _light_sleep_settings(self) -> LightSleepSettings:
         return LightSleepSettings(
@@ -1002,22 +988,24 @@ class TrainingSleepMixin:
             low_mass = []
             sleep_progress.update(1)
 
-            # Probe the frozen post-consolidation snapshot before Light can
-            # alter semantics, rebase residuals, or reconcile Bank rows.
-            released_once = tuple(
+            # A rejected preservation probe gets one ordinary Light cycle.
+            # Every other node is probed inside Light immediately before the
+            # proposal can mutate its semantic parameter or Bank residuals.
+            released_once = set(
                 self.sleep_state.pop(
                     "bank_mode_probe_release_once", ()
                 )
             )
-            bank_mode_probes = self._build_bank_mode_probes(
-                max_evidence=self.sleep_config.deep_evidence_budget,
-                released_once=released_once,
-            )
-            protected_probes = {
-                leaf_id: probe
-                for leaf_id, probe in bank_mode_probes.items()
-                if bool(probe["protect"])
-            }
+            self._sync_split_modules()
+
+            def structural_probe(leaf_id, bank, light_proposal):
+                if leaf_id in released_once:
+                    return None
+                return self._probe_bank_modes_before_light(
+                    leaf_id,
+                    bank,
+                    light_proposal,
+                )
 
             light_result = run_light_sleep(
                 self.tree,
@@ -1025,8 +1013,16 @@ class TrainingSleepMixin:
                 optimizer=self.optimizer,
                 settings=self._light_sleep_settings(),
                 state=self.sleep_state.setdefault("light_index", {}),
-                protected_leaf_ids=protected_probes,
+                structural_probe=structural_probe,
             )
+            bank_mode_probes = dict(
+                light_result.get("bank_mode_probes", {})
+            )
+            protected_probes = {
+                leaf_id: probe
+                for leaf_id, probe in bank_mode_probes.items()
+                if bool(probe.get("protect", False))
+            }
             self.sleep_state["last_light_epoch"] = epoch_label
             sleep_progress.set_postfix(
                 phase="light",
@@ -1202,6 +1198,17 @@ class TrainingSleepMixin:
             else:
                 sleep_progress.update(leaf_count)
 
+            # A protected probe has three possible outcomes after the final
+            # unified-selector arbitration:
+            #
+            #   accepted  -> this node's Split is selected;
+            #   deferred  -> its final G_cons is positive, but another action
+            #                wins the one-action physical commit;
+            #   rejected  -> its final G_cons is non-positive.
+            #
+            # ``deferred`` is still protected on the next cycle.  In
+            # particular, selector arbitration must not be mistaken for a
+            # negative hypothesis test and release confirmed Bank evidence.
             selected_protected_split = set()
             if (
                 selection is not None
@@ -1211,12 +1218,49 @@ class TrainingSleepMixin:
                 and selection.selected.target in protected_probes
             ):
                 selected_protected_split.add(selection.selected.target)
-            rejected_probes = set(protected_probes).difference(
-                selected_protected_split
-            )
+
+            split_candidates_by_target = {
+                candidate.target: candidate
+                for candidate in unified_candidates
+                if (
+                    candidate.kind.value == "split"
+                    and candidate.target in protected_probes
+                )
+            }
+            accepted_probes = set(selected_protected_split)
+            deferred_probes = set()
+            rejected_probes = set()
+            unresolved_probes = set()
+            probe_states = {}
+            for leaf_id in protected_probes:
+                candidate = split_candidates_by_target.get(leaf_id)
+                if leaf_id in accepted_probes:
+                    probe_states[leaf_id] = "accepted"
+                    continue
+                if candidate is None:
+                    # No candidate means that this cycle did not produce a
+                    # selector-visible G_cons.  Preserve the node until a
+                    # later cycle supplies an explicit non-positive result.
+                    unresolved_probes.add(leaf_id)
+                    deferred_probes.add(leaf_id)
+                    probe_states[leaf_id] = "deferred"
+                    continue
+                conservative_gain = torch.as_tensor(
+                    candidate.conservative_gain
+                ).detach().reshape(())
+                if bool(conservative_gain.le(0.0).cpu()):
+                    rejected_probes.add(leaf_id)
+                    probe_states[leaf_id] = "rejected"
+                else:
+                    # Positive and non-finite gains are not release evidence;
+                    # keep the Bank evidence protected until arbitration or a
+                    # later explicit rejection resolves it.
+                    deferred_probes.add(leaf_id)
+                    probe_states[leaf_id] = "deferred"
             if rejected_probes:
-                # A rejected preservation probe gets exactly one unprotected
-                # Light cycle before Bank evidence may be probed again.
+                # Only an explicit G_cons <= 0 rejection gets exactly one
+                # unprotected Light cycle before Bank evidence is probed
+                # again.  Positive-but-unselected probes remain protected.
                 self.sleep_state["bank_mode_probe_release_once"] = sorted(
                     rejected_probes
                 )
@@ -1369,23 +1413,34 @@ class TrainingSleepMixin:
             "bank_mode_probe": {
                 "evaluated_nodes": len(bank_mode_probes),
                 "protected_nodes": sorted(protected_probes),
+                "accepted_nodes": sorted(accepted_probes),
+                "deferred_nodes": sorted(deferred_probes),
+                "rejected_nodes": sorted(rejected_probes),
+                "unresolved_nodes": sorted(unresolved_probes),
                 "released_once": sorted(rejected_probes),
                 "nodes": {
                     leaf_id: {
-                        key: value
-                        for key, value in probe.items()
-                        if key not in {
-                            "batch",
-                            "theta_sem_snapshot",
-                            "bank_group_weights",
-                            "shared_delta",
-                            "group_delta",
-                            "theta_h0",
-                            "theta_h1",
-                            "replay_weights",
-                            "mode_ids",
-                            "mode_group_ids",
-                        }
+                        **{
+                            key: value
+                            for key, value in probe.items()
+                            if key not in {
+                                "batch",
+                                "theta_sem_snapshot",
+                                "bank_group_weights",
+                                "shared_delta",
+                                "group_delta",
+                                "theta_h0",
+                                "theta_h1",
+                                "replay_weights",
+                                "mode_ids",
+                                "mode_group_ids",
+                                "selected_direction_indices",
+                                "light_replay_indices",
+                                "light_replay_weights",
+                            }
+                        },
+                        **({"state": probe_states[leaf_id]}
+                           if leaf_id in probe_states else {}),
                     }
                     for leaf_id, probe in bank_mode_probes.items()
                 },

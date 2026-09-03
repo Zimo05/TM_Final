@@ -81,7 +81,7 @@ def _parse_args():
         ),
     )
     parser.add_argument(
-        "--prototype-duplicate-quantile", type=float, default=0.80,
+        "--prototype-duplicate-quantile", type=float, default=0.85,
         help="Quantile for the accepted-sample calibrated duplicate radius.",
     )
     parser.add_argument(
@@ -461,19 +461,19 @@ def _parse_args():
     parser.add_argument(
         "--split-min-structural-strength",
         type=float,
-        default=0.05,
+        default=0.0,
         help=(
-            "Minimum base-weighted mean p(QUEUE_SPLIT) required before a "
-            "normalized Split proposal can commit."
+            "Deprecated compatibility value; Split decisions use predictive "
+            "objective competition and do not apply this threshold."
         ),
     )
     parser.add_argument(
         "--split-min-effective-sample-size",
         type=float,
-        default=2.0,
+        default=0.0,
         help=(
-            "Minimum effective number of structural-evidence memories "
-            "required before a Split proposal can commit."
+            "Deprecated compatibility value; Split decisions use predictive "
+            "objective competition and do not apply this threshold."
         ),
     )
     parser.add_argument(

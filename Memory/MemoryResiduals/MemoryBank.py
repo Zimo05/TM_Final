@@ -45,11 +45,7 @@ class MemoryItem:
 
 
 def _signed_hash_projection(feature: Tensor, output_dim: int) -> Tensor:
-    """Legacy projection helper retained for old imports/checkpoints.
-
-    New law identities never call this function; they preserve every basis
-    coordinate in ``effective_hawkes_law_key`` below.
-    """
+    """Deterministically project a physical-law feature without parameters."""
     if feature.ndim == 0:
         raise ValueError("feature must have at least one dimension")
     feature_dim = feature.size(-1)
@@ -80,21 +76,15 @@ def effective_hawkes_law_key(
     *,
     num_event_types: int,
     num_basis: int,
-    key_dim: Optional[int] = None,
+    key_dim: int,
 ) -> Tensor:
-    """Return a basis-preserving identity of the effective physical law.
+    """Return a compact identity of the effective physical Hawkes law.
 
     The key is derived from ``semantic_theta + delta_theta`` after mapping the
     unconstrained baseline and kernels to physical parameters.  Consequently
     a Light-Sleep semantic rebase that preserves the effective law also
-    preserves this identity.  Every basis slice remains in the feature, so
-    fast/slow excitation allocations cannot collapse to the same identity
-    merely because their integrated sums agree.
-
-    ``key_dim`` is retained as an ignored compatibility keyword for callers
-    written against the old signed-hash implementation.  Law identities now
-    always have the physical feature width
-    ``D + D * D * M``; retrieval/context keys keep their own ``key_dim``.
+    preserves this identity.  Basis components are integrated before the
+    physical-law feature is projected to ``key_dim``.
     """
     expected = num_event_types + num_event_types * num_event_types * num_basis
     semantic = semantic_theta.detach()
@@ -122,13 +112,14 @@ def effective_hawkes_law_key(
         *batch_shape, num_event_types, num_event_types, num_basis
     )
     mu = F.softplus(raw_mu)
-    excitation_by_basis = F.softplus(raw_w) / decay.reshape(
-        *((1,) * len(batch_shape)), 1, 1, -1
-    )
+    integrated_excitation = (
+        F.softplus(raw_w)
+        / decay.reshape(*((1,) * len(batch_shape)), 1, 1, -1)
+    ).sum(-1)
     law_feature = torch.cat(
-        [mu, excitation_by_basis.reshape(*batch_shape, -1)], dim=-1
+        [mu, integrated_excitation.reshape(*batch_shape, -1)], dim=-1
     )
-    return F.normalize(law_feature, dim=-1)
+    return _signed_hash_projection(law_feature, key_dim)
 
 
 @dataclass
@@ -977,12 +968,10 @@ class MemoryBank:
 
         self.key_dim = key_dim
         self.param_dim = param_dim
-        # Law identity is intentionally independent from retrieval/context
-        # identity.  Standalone legacy banks with a wider retrieval key keep
-        # that width by default, while the common Hawkes case (``param_dim``
-        # wider than ``key_dim``) naturally gets the full physical width.  The
-        # tree adapter supplies the physical Hawkes feature width explicitly.
-        self.law_dim = max(key_dim, param_dim) if law_dim is None else int(law_dim)
+        # Law identities use the compact signed-hash representation by
+        # default.  Keep an explicit ``law_dim`` override for legacy and
+        # generic callers that need a different storage width.
+        self.law_dim = key_dim if law_dim is None else int(law_dim)
         if self.law_dim <= 0:
             raise ValueError("law_dim must be positive")
         self.capacity = capacity
@@ -1032,12 +1021,12 @@ class MemoryBank:
         # enough accepted observations, its own rolling distance statistics
         # determine both radii.
         self.adaptive_history_size = 64
-        self.adaptive_min_samples = 8
+        self.adaptive_min_samples = 16
         # Accepted-sample calibrated duplicate radius.  The lower quantile
         # keeps the duplicate gate from inheriting the upper-tail bias caused
         # by its own admission censoring.
-        self.duplicate_quantile = 0.80
-        self.mode_quantile = 0.95
+        self.duplicate_quantile = 0.85
+        self.mode_quantile = 0.975
         self.radius_margin = 1e-3
         self.gain_quantile = 0.95
         self.gain_ema_decay = 0.8
@@ -1305,9 +1294,9 @@ class MemoryBank:
         retention_stale_weight: float = 1.0,
         retention_age_weight: float = 0.1,
         adaptive_history_size: int = 64,
-        adaptive_min_samples: int = 8,
-        duplicate_quantile: float = 0.80,
-        mode_quantile: float = 0.95,
+        adaptive_min_samples: int = 16,
+        duplicate_quantile: float = 0.85,
+        mode_quantile: float = 0.975,
         radius_margin: float = 1e-3,
         gain_quantile: float = 0.95,
         gain_ema_decay: float = 0.8,
@@ -1390,13 +1379,13 @@ class MemoryBank:
         batch_size: Optional[int] = None,
         name: str = "law_key",
     ) -> Tensor:
-        """Normalize law identities and migrate legacy retrieval-width vectors.
+        """Normalize compact law identities and migrate legacy widths.
 
-        New tree banks store the full physical-law feature in ``law_dim``.
-        Older callers/checkpoints may still provide a retrieval key (or an
-        old law key) with ``key_dim`` values.  Padding/truncating that legacy
-        representation is only a load/API compatibility path; all newly
-        computed Hawkes identities already have the exact physical width.
+        New tree banks store the signed-hash physical-law identity in
+        ``law_dim`` (normally ``key_dim``). Older callers/checkpoints may
+        still provide a retrieval key or an intermediate full-width law
+        feature; conversion is kept only for compatibility. Newly computed
+        Hawkes identities use the compact width.
         """
         if not torch.is_tensor(law_keys):
             raise ValueError(f"{name} must be a tensor")
@@ -1598,9 +1587,9 @@ class MemoryBank:
                 setattr(self, name, default)
         policy_defaults = {
             "adaptive_history_size": 64,
-            "adaptive_min_samples": 8,
-            "duplicate_quantile": 0.80,
-            "mode_quantile": 0.95,
+            "adaptive_min_samples": 16,
+            "duplicate_quantile": 0.85,
+            "mode_quantile": 0.975,
             "radius_margin": 1e-3,
             "gain_quantile": 0.95,
             "gain_ema_decay": 0.8,
