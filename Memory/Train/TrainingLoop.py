@@ -8,6 +8,68 @@ from collections import defaultdict
 from Train.TrainingComponents import *  # noqa: F403
 
 
+class _LazyFrontierRows:
+    """Compatibility view that decodes frontier IDs only when accessed.
+
+    The packed frontier is the source of truth for the Wake transaction.  A
+    few older callers still expect ``frontier_rows`` to behave like a list of
+    ``(node_ids, visited_count, branch_count)`` tuples, so keep that surface
+    without materializing any Python IDs while preparing a batch.
+    """
+
+    def __init__(self, frontier: Any, node_ids: Sequence[str]) -> None:
+        self._frontier = frontier
+        self._node_ids = tuple(node_ids)
+
+    def __len__(self) -> int:
+        return int(self._frontier.node_indices.size(0))
+
+    def _decode(self, positions: Sequence[int]) -> list[tuple[tuple[str, ...], int, int]]:
+        positions_tensor = torch.as_tensor(
+            list(positions),
+            device=self._frontier.node_indices.device,
+            dtype=torch.long,
+        )
+        node_indices = self._frontier.node_indices.index_select(
+            0, positions_tensor
+        )
+        counts = torch.stack(
+            [
+                self._frontier.mask.index_select(0, positions_tensor).sum(dim=-1),
+                self._frontier.visited_mask.index_select(
+                    0, positions_tensor
+                ).sum(dim=-1),
+                self._frontier.expanded_mask.index_select(
+                    0, positions_tensor
+                ).sum(dim=-1),
+            ],
+            dim=-1,
+        ).detach().cpu().tolist()
+        node_indices_cpu = node_indices.detach().cpu().tolist()
+        rows = []
+        for indices, (size, visited, branches) in zip(
+            node_indices_cpu,
+            counts,
+        ):
+            node_ids = tuple(
+                self._node_ids[int(node_index)]
+                for node_index in indices[: int(size)]
+            )
+            rows.append((node_ids, int(visited), int(branches)))
+        return rows
+
+    def __getitem__(self, index: int | slice):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return self._decode(range(start, stop, step))
+        if not isinstance(index, int):
+            raise TypeError("frontier row index must be an int or slice")
+        position = index if index >= 0 else len(self) + index
+        if position < 0 or position >= len(self):
+            raise IndexError("frontier row index out of range")
+        return self._decode((position,))[0]
+
+
 class TrainingLoopMixin:
     @staticmethod
     def _rank_correlation(x: Sequence[float], y: Sequence[float]) -> float:
@@ -27,6 +89,36 @@ class TrainingLoopMixin:
             * sum((b - my) ** 2 for b in ry)
         )
         return numerator / denominator if denominator > 0 else 0.0
+
+    def _unified_topology_log_path(self) -> Path:
+        """Resolve the standalone human-readable topology diagnostics file."""
+        configured = getattr(
+            self.training_config,
+            "unified_topology_log_path",
+            None,
+        )
+        if configured:
+            return Path(configured)
+        checkpoint = Path(self.training_config.checkpoint_path)
+        return checkpoint.with_name(
+            f"{checkpoint.stem}_unified_topology.log"
+        )
+
+    def _write_unified_topology_log(
+        self,
+        epoch: int,
+        lines: Sequence[str],
+    ) -> None:
+        """Append one epoch section without contaminating the main log."""
+        if not lines:
+            return
+        path = self._unified_topology_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"Epoch: {int(epoch)}\n")
+            for line in lines:
+                stream.write(f"{line}\n")
+            stream.write("\n")
 
     def _calibrate_controller_checkpoint(
         self,
@@ -516,34 +608,13 @@ class TrainingLoopMixin:
                     ),
                     projected_z=projected_flat,
                 )
-            # Materialize the hard-routing identity view once per chunk.
-            # Counts and slot indices are already final and independent of
-            # retrieval/working-memory state.
-            frontier_count = frontier_flat.mask.sum(dim=-1)
-            packed_counts = torch.stack(
-                [
-                    frontier_count,
-                    frontier_flat.visited_mask.sum(dim=-1),
-                    frontier_flat.expanded_mask.sum(dim=-1),
-                ],
-                dim=-1,
-            ).detach().cpu()
-            frontier_indices_cpu = (
-                frontier_flat.node_indices.detach().cpu()
+            # Keep the complete hard-routing identity view packed on the
+            # device. ``frontier_rows`` remains only as a lazy compatibility
+            # view; the normal Wake path never indexes it.
+            frontier_rows = _LazyFrontierRows(
+                frontier_flat,
+                self.tree.all_node_ids,
             )
-            all_node_ids = tuple(self.tree.all_node_ids)
-            frontier_rows = []
-            for row_index in range(frontier_indices_cpu.size(0)):
-                size, visited, branches = packed_counts[row_index].tolist()
-                node_ids = tuple(
-                    all_node_ids[int(node_index)]
-                    for node_index in frontier_indices_cpu[
-                        row_index, : int(size)
-                    ].tolist()
-                )
-                frontier_rows.append(
-                    (node_ids, int(visited), int(branches))
-                )
             lengths = flat["sequence_lengths"].detach().cpu().tolist()
             yield {
                 "sequences": sequences,
@@ -646,6 +717,8 @@ class TrainingLoopMixin:
             wake_prediction = 0.0
             wake_wm = 0.0
             writes = 0
+            append_writes = 0
+            refresh_writes = 0
             write_decisions = 0
             memorizes = 0
             queue_splits = 0
@@ -711,7 +784,15 @@ class TrainingLoopMixin:
                 for result in batch_results:
                     wake_prediction += result["prediction_nll"]
                     wake_wm += result["wm_penalty"]
-                    writes += result["write_count"]
+                    accepted_write_count = int(
+                        result.get(
+                            "accepted_write_count",
+                            result.get("write_count", 0),
+                        )
+                    )
+                    writes += accepted_write_count
+                    append_writes += int(result.get("append_count", 0))
+                    refresh_writes += int(result.get("refresh_count", 0))
                     write_decisions += result["write_decision_count"]
                     memorizes += result["memorize_count"]
                     queue_splits += result["queue_split_count"]
@@ -888,8 +969,8 @@ class TrainingLoopMixin:
                     accepted_writes_since_sleep
                 )
                 # Raw p_write*p_split remains a controller diagnostic only.
-                # Topology demand is computed from promoted-memory queue
-                # increments in TrainingSleepMixin._continuous_split_demand.
+                # Topology demand is computed from persistent Bank split_mass
+                # in TrainingSleepMixin._continuous_split_demand.
             topology_prune_enabled = (
                 epoch > self.structure_config.prune_warmup_epochs
             )
@@ -922,6 +1003,10 @@ class TrainingLoopMixin:
                 sleep_result = self.train_sleep(
                     responsibilities,
                     **sleep_kwargs,
+                )
+                self._write_unified_topology_log(
+                    epoch,
+                    sleep_result.get("unified_topology_log_lines", ()),
                 )
                 self.sleep_state["accepted_writes_since_sleep"] = 0
                 transaction = sleep_result.get("transaction") or {}
@@ -1006,6 +1091,7 @@ class TrainingLoopMixin:
                 torch.cuda.synchronize(self.device)
             sleep_seconds = time.perf_counter() - sleep_started
             epoch_seconds = time.perf_counter() - epoch_started
+            prototype_count, evidence_mass = self._persistent_memory_stats()
             cuda_peak_memory_mb = (
                 float(torch.cuda.max_memory_allocated(self.device))
                 / (1024.0 * 1024.0)
@@ -1017,6 +1103,11 @@ class TrainingLoopMixin:
                 "wake_loss_per_event": wake_loss,
                 "wake_prediction_nll_per_event": wake_prediction / max(event_count, 1),
                 "writes": writes,
+                "accepted_write_count": writes,
+                "append_count": append_writes,
+                "refresh_count": refresh_writes,
+                "prototype_count": prototype_count,
+                "evidence_mass": evidence_mass,
                 "write_decisions": write_decisions,
                 "memorizes": memorizes,
                 "queue_splits": queue_splits,

@@ -3,9 +3,102 @@
 from __future__ import annotations
 
 from Train.TrainingComponents import *  # noqa: F403
+from MemoryResiduals.MemoryBank import EffectiveHawkesParameters
 
 
 class TrainingLikelihoodMixin:
+    def _effective_parameters_from_theta(
+        self,
+        theta: Tensor,
+        *,
+        detach: bool = False,
+    ) -> EffectiveHawkesParameters:
+        """Build constrained Hawkes parameters from an effective raw theta.
+
+        Wake's routing/episodic composition is affine in unconstrained
+        parameter space.  Once that affine reduction has been performed, a
+        second call through ``compose_effective_parameters`` would only redo
+        the same weighted sum.  Keeping this small constructor here lets the
+        packed wavefront reuse the reduced bases while preserving the public
+        ``EffectiveHawkesParameters`` contract used by the likelihood code.
+        """
+        if theta.ndim < 1 or theta.size(-1) != self.tree.param_dim:
+            raise ValueError(
+                "effective theta must end with the tree parameter dimension"
+            )
+        if detach:
+            theta = theta.detach()
+        D = self.hawkes.num_types
+        M = self.hawkes.num_basis
+        raw_mu = theta[..., :D]
+        raw_W = theta[..., D:].reshape(*theta.shape[:-1], D, D, M)
+        return EffectiveHawkesParameters(
+            theta=theta,
+            raw_mu=raw_mu,
+            raw_W=raw_W,
+            mu=F.softplus(raw_mu),
+            W=F.softplus(raw_W),
+            decays=self.hawkes.decays,
+        )
+
+    def _batched_sequence_event_nll_and_grad(
+        self,
+        flat: Mapping[str, Tensor],
+        effective: EffectiveHawkesParameters,
+    ) -> tuple[Tensor, Tensor]:
+        """Evaluate event NLL and its raw-theta gradient without autograd.
+
+        The Hawkes event objective is explicit in the constrained ``mu`` and
+        ``W`` values.  Its derivative is the integral statistic minus the
+        target-event contribution, followed by the softplus Jacobian.  This
+        is exactly the gradient that ``autograd.grad`` produced for the old
+        per-wavefront call, but it avoids constructing and destroying one
+        graph for every active event batch.
+        """
+        types = flat["types"].long()
+        history = flat[HAWKES_HISTORY_STATS_KEY]
+        interval = flat[HAWKES_INTERVAL_STATS_KEY]
+        duration = flat["duration"]
+        if effective.mu.ndim != 2 or effective.mu.size(0) != types.numel():
+            raise ValueError("effective parameters must align with flat events")
+        intensity_unclamped = (
+            effective.mu
+            + torch.einsum("ndem,nem->nd", effective.W, history)
+        )
+        intensity = intensity_unclamped.clamp_min(1e-8)
+        target = types.reshape(-1, 1)
+        target_intensity = intensity.gather(1, target).squeeze(1)
+        log_term = -target_intensity.log()
+        integral = (
+            effective.mu.sum(dim=-1) * duration
+            + torch.einsum("ndem,nem->n", effective.W, interval)
+        )
+        nll = log_term + integral
+
+        # ``clamp_min`` has a zero derivative on the clamped branch.  The
+        # positive softplus parameters normally keep this branch unreachable,
+        # but retaining it makes the analytic path bit-for-bit consistent
+        # with PyTorch autograd in extreme underflow cases.
+        unclamped_target = intensity_unclamped.gather(1, target).squeeze(1)
+        target_scale = (
+            unclamped_target > 1e-8
+        ).to(dtype=intensity.dtype) / target_intensity
+        target_indicator = F.one_hot(types, num_classes=self.hawkes.num_types)
+        grad_mu = duration[:, None] - target_scale[:, None] * target_indicator
+        grad_W = interval[:, None, :, :].expand_as(effective.W).clone()
+        grad_W = grad_W - (
+            target_scale[:, None, None, None]
+            * target_indicator[:, :, None, None].to(grad_W)
+            * history[:, None, :, :]
+        )
+        grad_mu = grad_mu * torch.sigmoid(effective.raw_mu)
+        grad_W = grad_W * torch.sigmoid(effective.raw_W)
+        gradient = torch.cat(
+            [grad_mu, grad_W.reshape(grad_W.size(0), -1)],
+            dim=-1,
+        )
+        return nll, gradient
+
     def _sequence_event_nll(
         self,
         sequence: Mapping[str, Tensor],

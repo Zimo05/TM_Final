@@ -32,7 +32,7 @@ RUN_NAME="${RUN_NAME:-dws_17_08281630}"
 EPOCHS="${EPOCHS:-10}"
 # Two-level effective-Hawkes-law matching.  Keep duplicate stricter than mode.
 # Cold-start similarity priors only. After enough accepted observations each
-# dynamics mode calibrates its own Q90 duplicate and Q95 local-variation radii.
+# dynamics mode calibrates its own Q80 duplicate and Q95 local-variation radii.
 PROTOTYPE_DUP_THRESHOLD="${PROTOTYPE_DUP_THRESHOLD:-0.98}"
 PROTOTYPE_MODE_THRESHOLD="${PROTOTYPE_MODE_THRESHOLD:-0.90}"
 PROTOTYPE_MODE_CAPACITY="${PROTOTYPE_MODE_CAPACITY:-12}"

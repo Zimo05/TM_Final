@@ -1,3 +1,154 @@
+Using device: cuda
+DataFrame shape: (1700, 3)
+Columns: ['event_times', 'event_types', 'cluster']
+加载了 1700 个序列
+检测到 8 种事件类型: [0, 1, 2, 3, 4, 5, 6, 7]
+第一个序列长度: 80
+[Hawkes Cold Start][001/010] train_nll/event=4.273062 val_nll/event=3.740769 max_grad=1.7795
+[Hawkes Cold Start][002/010] train_nll/event=3.405243 val_nll/event=3.259835 max_grad=0.5574
+[Hawkes Cold Start][003/010] train_nll/event=3.097862 val_nll/event=3.072356 max_grad=0.2723
+[Hawkes Cold Start][004/010] train_nll/event=2.981458 val_nll/event=3.004127 max_grad=0.1706
+[Hawkes Cold Start][005/010] train_nll/event=2.938245 val_nll/event=2.976134 max_grad=0.1754
+[Hawkes Cold Start][006/010] train_nll/event=2.918717 val_nll/event=2.961527 max_grad=0.1807
+[Hawkes Cold Start][007/010] train_nll/event=2.908339 val_nll/event=2.953137 max_grad=0.1811
+[Hawkes Cold Start][008/010] train_nll/event=2.902360 val_nll/event=2.948058 max_grad=0.1843
+[Hawkes Cold Start][009/010] train_nll/event=2.898798 val_nll/event=2.945133 max_grad=0.1862
+[Hawkes Cold Start][010/010] train_nll/event=2.896611 val_nll/event=2.943036 max_grad=0.1869
+[Hawkes Cold Start] checkpoint saved to /home/xinye/HawkesMemory_wfy/checkpoints/hawkes_backbone_init.pt
+[Hawkes Cold Start] spectral_radius=0.756667, min_mu=8.554223e-03
+[H_tree] initialized 33/33 node_emb from /home/xinye/HawkesMemory_wfy/Data/tree_17/h_tree_one_circle.pt
+[Routing] mode=active_frontier frontier=2..7 temperature=1.100 exploration=0.000
+
+[Residual init]:   0%|          | 0/1700 [00:00<?, ?seq/s]
+[Residual init]:   2%|▏         | 28/1700 [00:00<00:06, 274.94seq/s]
+[Residual init]:   4%|▍         | 64/1700 [00:00<00:05, 320.54seq/s]
+[Residual init]:   6%|▌         | 99/1700 [00:00<00:04, 333.84seq/s]
+[Residual init]:   8%|▊         | 135/1700 [00:00<00:04, 341.05seq/s]
+[Residual init]:  10%|█         | 170/1700 [00:00<00:04, 338.98seq/s]
+[Residual init]:  12%|█▏        | 206/1700 [00:00<00:04, 343.77seq/s]
+[Residual init]:  14%|█▍        | 242/1700 [00:00<00:04, 346.17seq/s]
+[Residual init]:  16%|█▋        | 278/1700 [00:00<00:04, 349.98seq/s]
+[Residual init]:  18%|█▊        | 314/1700 [00:00<00:03, 350.31seq/s]
+[Residual init]:  21%|██        | 350/1700 [00:01<00:03, 351.47seq/s]
+[Residual init]:  23%|██▎       | 386/1700 [00:01<00:03, 350.22seq/s]
+[Residual init]:  25%|██▍       | 422/1700 [00:01<00:03, 350.41seq/s]
+[Residual init]:  27%|██▋       | 458/1700 [00:01<00:03, 348.99seq/s]
+[Residual init]:  29%|██▉       | 493/1700 [00:01<00:03, 345.14seq/s]
+[Residual init]:  31%|███       | 530/1700 [00:01<00:03, 350.66seq/s]
+[Residual init]:  33%|███▎      | 566/1700 [00:01<00:03, 352.11seq/s]
+[Residual init]:  35%|███▌      | 602/1700 [00:01<00:03, 352.19seq/s]
+[Residual init]:  38%|███▊      | 638/1700 [00:01<00:03, 350.22seq/s]
+[Residual init]:  40%|███▉      | 674/1700 [00:01<00:02, 352.82seq/s]
+[Residual init]:  42%|████▏     | 710/1700 [00:02<00:02, 354.72seq/s]
+[Residual init]:  44%|████▍     | 746/1700 [00:02<00:02, 354.21seq/s]
+[Residual init]:  46%|████▌     | 782/1700 [00:02<00:02, 354.57seq/s]
+[Residual init]:  48%|████▊     | 818/1700 [00:02<00:02, 354.84seq/s]
+[Residual init]:  50%|█████     | 854/1700 [00:02<00:02, 353.12seq/s]
+[Residual init]:  52%|█████▏    | 890/1700 [00:02<00:02, 353.29seq/s]
+[Residual init]:  54%|█████▍    | 926/1700 [00:02<00:02, 352.79seq/s]
+[Residual init]:  57%|█████▋    | 962/1700 [00:02<00:02, 353.84seq/s]
+[Residual init]:  59%|█████▊    | 998/1700 [00:02<00:01, 353.46seq/s]
+[Residual init]:  61%|██████    | 1034/1700 [00:02<00:01, 346.76seq/s]
+[Residual init]:  63%|██████▎   | 1070/1700 [00:03<00:01, 348.02seq/s]
+[Residual init]:  65%|██████▌   | 1106/1700 [00:03<00:01, 350.82seq/s]
+[Residual init]:  67%|██████▋   | 1142/1700 [00:03<00:01, 352.39seq/s]
+[Residual init]:  69%|██████▉   | 1178/1700 [00:03<00:01, 351.81seq/s]
+[Residual init]:  71%|███████▏  | 1214/1700 [00:03<00:01, 352.24seq/s]
+[Residual init]:  74%|███████▎  | 1250/1700 [00:03<00:01, 352.26seq/s]
+[Residual init]:  76%|███████▌  | 1286/1700 [00:03<00:01, 350.28seq/s]
+[Residual init]:  78%|███████▊  | 1322/1700 [00:03<00:01, 351.39seq/s]
+[Residual init]:  80%|███████▉  | 1358/1700 [00:03<00:00, 352.59seq/s]
+[Residual init]:  82%|████████▏ | 1394/1700 [00:03<00:00, 352.82seq/s]
+[Residual init]:  84%|████████▍ | 1430/1700 [00:04<00:00, 351.83seq/s]
+[Residual init]:  86%|████████▌ | 1466/1700 [00:04<00:00, 351.13seq/s]
+[Residual init]:  88%|████████▊ | 1502/1700 [00:04<00:00, 351.32seq/s]
+[Residual init]:  90%|█████████ | 1538/1700 [00:04<00:00, 352.06seq/s]
+[Residual init]:  93%|█████████▎| 1574/1700 [00:04<00:00, 345.99seq/s]
+[Residual init]:  95%|█████████▍| 1609/1700 [00:04<00:00, 346.73seq/s]
+[Residual init]:  97%|█████████▋| 1644/1700 [00:04<00:00, 347.30seq/s]
+[Residual init]:  99%|█████████▉| 1680/1700 [00:04<00:00, 349.15seq/s]
+[Residual init]: 100%|██████████| 1700/1700 [00:04<00:00, 349.32seq/s]
+[Residual Initialization] sequences=1700 rank=4 grad_norm=5.301e+00/9.817e+00/1.504e+01 clipped=0.000 membership=[100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0] target_mass=[0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943]
+[Initialization] mode=residual_signature semantic_blend=0.0000 semantic_delta_mean=1.8265e-02 semantic_delta_max=2.7678e-01 offset_mode=path_additive route_balance=0.1000
+[Symmetry] mode=residual_signature router_gain=0.0500 router_norm_mean=7.3961e-02 leaf_delta_mean=2.3055e-02 leaf_mean_error=9.537e-07 spectral_radius=[0.751336,0.762674]
+
+[H-align 01/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 01/05]:   7%|▋         | 8/107 [00:00<00:01, 74.09batch/s, acc=0.609, loss=0.663]
+[H-align 01/05]:  16%|█▌        | 17/107 [00:00<00:01, 83.06batch/s, acc=0.628, loss=0.656]
+[H-align 01/05]:  24%|██▍       | 26/107 [00:00<00:00, 85.44batch/s, acc=0.626, loss=0.653]
+[H-align 01/05]:  34%|███▎      | 36/107 [00:00<00:00, 87.61batch/s, acc=0.622, loss=0.653]
+[H-align 01/05]:  42%|████▏     | 45/107 [00:00<00:00, 87.33batch/s, acc=0.623, loss=0.651]
+[H-align 01/05]:  51%|█████▏    | 55/107 [00:00<00:00, 88.43batch/s, acc=0.629, loss=0.647]
+[H-align 01/05]:  61%|██████    | 65/107 [00:00<00:00, 89.14batch/s, acc=0.627, loss=0.647]
+[H-align 01/05]:  70%|███████   | 75/107 [00:00<00:00, 89.92batch/s, acc=0.626, loss=0.648]
+[H-align 01/05]:  79%|███████▉  | 85/107 [00:00<00:00, 90.40batch/s, acc=0.627, loss=0.648]
+[H-align 01/05]:  89%|████████▉ | 95/107 [00:01<00:00, 90.33batch/s, acc=0.628, loss=0.646]
+[H-align 01/05]:  98%|█████████▊| 105/107 [00:01<00:00, 90.59batch/s, acc=0.634, loss=0.642]
+[H-align 01/05]: 100%|██████████| 107/107 [00:01<00:00, 88.75batch/s, acc=0.634, loss=0.641]
+[H-align] epoch=1/5 loss=0.641366 acc=0.6343 p_target=0.5466 confidence=1.0000 grad_max=8.154e-01
+
+[H-align 02/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 02/05]:   9%|▉         | 10/107 [00:00<00:01, 90.69batch/s, acc=0.724, loss=0.528]
+[H-align 02/05]:  19%|█▊        | 20/107 [00:00<00:00, 90.13batch/s, acc=0.717, loss=0.53] 
+[H-align 02/05]:  28%|██▊       | 30/107 [00:00<00:00, 90.29batch/s, acc=0.728, loss=0.51]
+[H-align 02/05]:  37%|███▋      | 40/107 [00:00<00:00, 90.12batch/s, acc=0.745, loss=0.486]
+[H-align 02/05]:  47%|████▋     | 50/107 [00:00<00:00, 90.04batch/s, acc=0.753, loss=0.468]
+[H-align 02/05]:  56%|█████▌    | 60/107 [00:00<00:00, 89.94batch/s, acc=0.763, loss=0.451]
+[H-align 02/05]:  65%|██████▌   | 70/107 [00:00<00:00, 90.48batch/s, acc=0.772, loss=0.437]
+[H-align 02/05]:  75%|███████▍  | 80/107 [00:00<00:00, 89.43batch/s, acc=0.782, loss=0.42] 
+[H-align 02/05]:  84%|████████▍ | 90/107 [00:00<00:00, 90.19batch/s, acc=0.794, loss=0.402]
+[H-align 02/05]:  93%|█████████▎| 100/107 [00:01<00:00, 90.37batch/s, acc=0.805, loss=0.386]
+[H-align 02/05]: 100%|██████████| 107/107 [00:01<00:00, 90.31batch/s, acc=0.811, loss=0.376]
+[H-align] epoch=2/5 loss=0.376290 acc=0.8107 p_target=0.7379 confidence=1.0000 grad_max=3.830e+00
+
+[H-align 03/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 03/05]:   8%|▊         | 9/107 [00:00<00:01, 89.76batch/s, acc=0.919, loss=0.2]
+[H-align 03/05]:  17%|█▋        | 18/107 [00:00<00:01, 88.17batch/s, acc=0.921, loss=0.194]
+[H-align 03/05]:  25%|██▌       | 27/107 [00:00<00:00, 88.84batch/s, acc=0.923, loss=0.19] 
+[H-align 03/05]:  35%|███▍      | 37/107 [00:00<00:00, 89.31batch/s, acc=0.93, loss=0.177]
+[H-align 03/05]:  43%|████▎     | 46/107 [00:00<00:00, 89.18batch/s, acc=0.936, loss=0.168]
+[H-align 03/05]:  52%|█████▏    | 56/107 [00:00<00:00, 90.16batch/s, acc=0.941, loss=0.157]
+[H-align 03/05]:  62%|██████▏   | 66/107 [00:00<00:00, 90.35batch/s, acc=0.945, loss=0.148]
+[H-align 03/05]:  71%|███████   | 76/107 [00:00<00:00, 90.70batch/s, acc=0.948, loss=0.141]
+[H-align 03/05]:  80%|████████  | 86/107 [00:00<00:00, 90.90batch/s, acc=0.951, loss=0.136]
+[H-align 03/05]:  90%|████████▉ | 96/107 [00:01<00:00, 90.98batch/s, acc=0.953, loss=0.13] 
+[H-align 03/05]:  99%|█████████▉| 106/107 [00:01<00:00, 90.79batch/s, acc=0.956, loss=0.123]
+[H-align 03/05]: 100%|██████████| 107/107 [00:01<00:00, 90.37batch/s, acc=0.956, loss=0.123]
+[H-align] epoch=3/5 loss=0.122833 acc=0.9564 p_target=0.9195 confidence=1.0000 grad_max=3.731e+00
+
+[H-align 04/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 04/05]:   8%|▊         | 9/107 [00:00<00:01, 84.92batch/s, acc=0.984, loss=0.0546]
+[H-align 04/05]:  18%|█▊        | 19/107 [00:00<00:00, 90.03batch/s, acc=0.987, loss=0.0479]
+[H-align 04/05]:  27%|██▋       | 29/107 [00:00<00:00, 89.52batch/s, acc=0.988, loss=0.0457]
+[H-align 04/05]:  36%|███▋      | 39/107 [00:00<00:00, 90.89batch/s, acc=0.989, loss=0.0429]
+[H-align 04/05]:  46%|████▌     | 49/107 [00:00<00:00, 91.47batch/s, acc=0.989, loss=0.0418]
+[H-align 04/05]:  55%|█████▌    | 59/107 [00:00<00:00, 91.80batch/s, acc=0.989, loss=0.0417]
+[H-align 04/05]:  64%|██████▍   | 69/107 [00:00<00:00, 91.76batch/s, acc=0.989, loss=0.0409]
+[H-align 04/05]:  74%|███████▍  | 79/107 [00:00<00:00, 91.97batch/s, acc=0.989, loss=0.0397]
+[H-align 04/05]:  83%|████████▎ | 89/107 [00:00<00:00, 91.46batch/s, acc=0.99, loss=0.0378] 
+[H-align 04/05]:  93%|█████████▎| 99/107 [00:01<00:00, 91.86batch/s, acc=0.99, loss=0.0373]
+[H-align 04/05]: 100%|██████████| 107/107 [00:01<00:00, 91.44batch/s, acc=0.99, loss=0.0368]
+[H-align] epoch=4/5 loss=0.036831 acc=0.9899 p_target=0.9780 confidence=1.0000 grad_max=1.633e+00
+
+[H-align 05/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 05/05]:   9%|▉         | 10/107 [00:00<00:01, 91.16batch/s, acc=0.992, loss=0.0281]
+[H-align 05/05]:  19%|█▊        | 20/107 [00:00<00:00, 89.05batch/s, acc=0.992, loss=0.0256]
+[H-align 05/05]:  28%|██▊       | 30/107 [00:00<00:00, 90.71batch/s, acc=0.992, loss=0.0254]
+[H-align 05/05]:  37%|███▋      | 40/107 [00:00<00:00, 91.37batch/s, acc=0.993, loss=0.0234]
+[H-align 05/05]:  47%|████▋     | 50/107 [00:00<00:00, 91.40batch/s, acc=0.993, loss=0.0225]
+[H-align 05/05]:  56%|█████▌    | 60/107 [00:00<00:00, 91.38batch/s, acc=0.994, loss=0.0217]
+[H-align 05/05]:  65%|██████▌   | 70/107 [00:00<00:00, 91.41batch/s, acc=0.994, loss=0.0215]
+[H-align 05/05]:  75%|███████▍  | 80/107 [00:00<00:00, 91.39batch/s, acc=0.994, loss=0.0214]
+[H-align 05/05]:  84%|████████▍ | 90/107 [00:00<00:00, 91.04batch/s, acc=0.994, loss=0.0212]
+[H-align 05/05]:  93%|█████████▎| 100/107 [00:01<00:00, 90.44batch/s, acc=0.994, loss=0.0205]
+[H-align 05/05]: 100%|██████████| 107/107 [00:01<00:00, 90.72batch/s, acc=0.994, loss=0.0204]
+[H-align] epoch=5/5 loss=0.020387 acc=0.9938 p_target=0.9877 confidence=1.0000 grad_max=7.742e-01
+[H-align Complete] epochs=5 loss=0.692324->0.013900 accuracy=0.9955 p_target=0.9911 updated=encoder+router_compat frozen=hawkes+node_emb+semantics+memory
+
+[Init] Cache:   0%|                                                                 | 0/1700 [00:00<?, ?seq/s]
+[Init] Cache: 100%|#########################| 1700/1700 [00:01<00:00, 1128.15seq/s, built=1700, events=136000]
+[Cache] sequences=1700 events=136000 built=1700 device=cuda time=1.507s
+
 [Epoch 001] Wake: 100%|#########| 1700/1700 [02:13<00:00, 12.69seq/s, events=136000, loss=2.8606, writes=5751]
 [Epoch 001] Global: 100%|#################| 1700/1700 [00:40<00:00, 42.34seq-pass/s, batch=27/27, phase=train]
 [Epoch 001] Sleep: 100%|#############| 21/21 [00:09<00:00,  2.14step/s, actions=6, phase=deep, pressure=0.150]
@@ -203,3 +354,4 @@
 [Epoch 050] Global: 100%|#################| 1700/1700 [00:39<00:00, 43.01seq-pass/s, batch=27/27, phase=train]
 [Epoch 050] Sleep: 100%|#############| 15/15 [00:07<00:00,  2.03step/s, actions=4, phase=deep, pressure=0.283]
 [MemoryTree][050/050] wake/event=2.653341 sleep_residual_utility=0.015237 writes=1750 memorize=42 queue_split=38896 wake_actions=A96863/R199/M42/Q38896 novelty=0.0159 weighted_sim=0.9682 wm_grad_max=3.689e+00 global/event=2.651432 mix_diag=2.9110 global_steps=27 prior_KL=5.839e-02 seq_H_cond=0.3808 seq_H_marg=0.5649 seq_MI=1.841e-01 post_KL_diag=3.702e-01 branch_distill=2.931e-01 probe=6.135e+00/0.595->0.574/0.548/0.715 frontier=6.96/12.93/5.96 enc_gate=0.414 enc_scale=0.033 teacher_conf=0.411 teacher_JS=9.217e-02 max_mass=0.2203 owner_hard=[0, 0, 0, 0, 0, 1, 26, 2, 0, 63, 3, 151, 1221, 111, 4, 0, 0, 0, 0, 118, 0] mem_assign=[726, 512, 305, 2972, 567, 6228, 9713, 2446, 1527, 7500, 4083, 14475, 32754, 11986, 6191, 2343, 2744, 2035, 2632, 17704, 6557] topology_prune=on leaves=11 sleep_mode=deep light_absorb=2 deep_probability=0.283 topology_action=null topology_gain=0.000e+00 topology_candidates=19 collapsed=0 topology_lambda=0.000e+00 time=W133.1/G39.5/S7.5s cache=0/1700 cuda_peak=7065MiB sleep_actions=['promotion', 'promotion', 'promotion', 'promotion']
+[Training Plot] metrics=/home/xinye/HawkesMemory_wfy/Memory/Checkpoints/dws_13_09020040_last_training_metrics.json figure=/home/xinye/HawkesMemory_wfy/Memory/Checkpoints/dws_13_09020040_last_training_curves.png

@@ -111,18 +111,32 @@ class ControllerV6Tests(unittest.TestCase):
         self.assertEqual(trainer.build_split_proposals(), {})
         self.assertEqual(trainer.sleep_state["structural_evidence_buffer"], {})
 
-        # Raw local controller pressure is discarded. Only a queue increment
-        # originating at the persistent-memory boundary drives topology demand.
+        # Raw controller pressure is diagnostic only. It cannot create
+        # structural demand without evidence that crossed into a Bank.
         trainer.sleep_state["structural_mass_since_sleep"] = 100.0
         trainer.sleep_state["structural_observations_since_sleep"] = 1
         trainer.sleep_state["structural_demand_ema"] = 0.0
+        trainer.controller.split_queues["root"] = 39_000.0
         first = trainer._continuous_split_demand(accepted_writes=0)
         self.assertEqual(first["observation"], 0.0)
         self.assertEqual(first["value"], 0.0)
+        self.assertEqual(first["E_bank_struct"], 0.0)
+        self.assertEqual(first["Q_decision"], 39_000.0)
         self.assertEqual(first["discarded_raw_structural_mass"], 100.0)
-        trainer.controller.split_queues["root"] = 0.5
+
+        # Persistent split_mass is the structural source of truth. The
+        # controller queue may remain large or be cleared independently.
+        trainer.tree.episodic_memory.add_memory(
+            "root",
+            torch.tensor([1.0, 0.0, 0.0]),
+            torch.zeros(trainer.tree.param_dim),
+            write_quality=1.0,
+            queue_weight=0.5,
+        )
         second = trainer._continuous_split_demand(accepted_writes=1)
         self.assertGreater(second["observation"], 0.0)
+        self.assertAlmostEqual(second["E_bank_struct"], 0.5, places=6)
+        self.assertAlmostEqual(second["N_persistent"], 1.0, places=6)
 
     def test_read_without_item_is_read_only(self):
         memory = TreeEpisodicMemory(

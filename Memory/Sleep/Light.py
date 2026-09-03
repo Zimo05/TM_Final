@@ -9,7 +9,7 @@ then rebased so its effective Hawkes parameters remain exactly unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Collection, Dict, Mapping, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -366,6 +366,7 @@ def _reconcile_contracted_banks(
     tree,
     hawkes_ll: HawkesFamily,
     settings: LightSleepSettings,
+    protected_leaf_ids: Collection[str] = (),
 ) -> Dict[str, Any]:
     """Consume pending post-contraction overflow in a bounded Light step.
 
@@ -390,7 +391,11 @@ def _reconcile_contracted_banks(
     raw_energy_numerator = 0.0
     raw_energy_denominator = 0.0
 
+    protected = set(protected_leaf_ids)
     for node_id in list(pending):
+        if node_id in protected:
+            deferred += 1
+            continue
         bank = tree.episodic_memory.banks.get(node_id)
         if bank is None:
             pending.pop(node_id, None)
@@ -599,6 +604,7 @@ def run_light_sleep(
     optimizer: Optional[torch.optim.Optimizer] = None,
     settings: Optional[LightSleepSettings] = None,
     state: Optional[Dict[str, object]] = None,
+    protected_leaf_ids: Collection[str] = (),
 ) -> Dict[str, object]:
     """Run one fixed-topology, globally budgeted consolidation cycle."""
     settings = LightSleepSettings() if settings is None else settings
@@ -606,8 +612,9 @@ def run_light_sleep(
     state = {} if state is None else state
     scan_cursors = state.setdefault("scan_cursors", {})
     direction_summaries = state.setdefault("direction_summaries", {})
+    protected = set(protected_leaf_ids)
     reconciliation = _reconcile_contracted_banks(
-        tree, hawkes_ll, settings
+        tree, hawkes_ll, settings, protected
     )
     for node_id in reconciliation["reconciled_nodes"]:
         scan_cursors.pop(node_id, None)
@@ -621,6 +628,8 @@ def run_light_sleep(
         leaf_id
         for leaf_id in tree.leaf_ids
         if (
+            leaf_id not in protected
+            and
             leaf_id in tree.episodic_memory.banks
             and len(tree.episodic_memory.banks[leaf_id]) > 0
         )
@@ -652,6 +661,19 @@ def run_light_sleep(
         reconciliation["raw_energy_denominator"]
     )
     absorbed = 0
+
+    for leaf_id in sorted(protected.intersection(tree.leaf_ids)):
+        bank = tree.episodic_memory.banks.get(leaf_id)
+        leaf_records[leaf_id] = {
+            "bank_size": 0 if bank is None else len(bank),
+            "scanned_memories": 0,
+            "directions": 0,
+            "indexed_directions": 0,
+            "evaluated_directions": 0,
+            "replay_windows": 0,
+            "absorbed": False,
+            "protected_by_bank_mode_probe": True,
+        }
 
     for leaf_id in active_leaves:
         leaf_budget = min(
@@ -857,7 +879,10 @@ def run_light_sleep(
             sampled_utility_numerator
             / max(sampled_utility_denominator, settings.eps)
         ),
-        "active_leaves": len(active_leaves),
+        "active_leaves": len(active_leaves) + len(
+            protected.intersection(tree.leaf_ids)
+        ),
+        "protected_leaves": len(protected.intersection(tree.leaf_ids)),
         "absorbed_leaves": absorbed,
         "memory_reconciliation": reconciliation,
         "leaf_records": leaf_records,

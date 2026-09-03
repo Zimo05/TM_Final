@@ -447,8 +447,9 @@ class PrototypeMemoryTests(unittest.TestCase):
         mode_id = int(bank.mode_ids[0])
         duplicate_radius, mode_radius = bank.adaptive_radii(mode_id)
         expected = MemoryBank._rolling_quantile(
-            bank._mode_duplicate_distances[mode_id], 0.90
+            bank._mode_duplicate_distances[mode_id], bank.duplicate_quantile
         )
+        self.assertAlmostEqual(bank.duplicate_quantile, 0.80, places=7)
         self.assertAlmostEqual(duplicate_radius, expected, places=7)
         self.assertGreaterEqual(
             mode_radius, duplicate_radius + bank.radius_margin - 1e-12
@@ -486,7 +487,7 @@ class PrototypeMemoryTests(unittest.TestCase):
             (duplicate_radius, mode_radius),
         )
 
-    def test_split_uses_observation_support_after_physical_compression(self):
+    def test_split_keeps_persistent_support_separate_from_replay_ess(self):
         memory = TreeEpisodicMemory(
             key_dim=2,
             num_event_types=1,
@@ -516,7 +517,8 @@ class PrototypeMemoryTests(unittest.TestCase):
         self.assertEqual(len(bank), 1)
         self.assertEqual(float(bank.support[0]), 15.0)
         self.assertEqual(float(batch.sample_support[0]), 15.0)
-        self.assertAlmostEqual(float(batch.effective_sample_size), 15.0, places=5)
+        self.assertEqual(float(batch.replay_support[0]), 1.0)
+        self.assertAlmostEqual(float(batch.effective_sample_size), 1.0, places=5)
 
         module = SplitModule(P=2, z_dim=2)
         with torch.no_grad():
@@ -526,12 +528,159 @@ class PrototypeMemoryTests(unittest.TestCase):
             weights=batch.weights,
             theta_sem=torch.zeros(2),
             sample_support=batch.sample_support,
+            replay_support=batch.replay_support,
         )
         self.assertAlmostEqual(
-            float(structure["N_mass"].sum().detach()), 15.0, places=5
+            float(structure["N_mass"].sum().detach()), 1.0, places=5
         )
         torch.testing.assert_close(
-            structure["N_eff"], torch.full((2,), 15.0), atol=1e-5, rtol=1e-5
+            structure["N_eff"], torch.ones(2), atol=1e-5, rtol=1e-5
+        )
+
+    def test_bounded_replay_reserves_rows_from_both_bank_mode_sides(self):
+        scores = torch.tensor([10.0, 9.0, 8.0, 7.0, 0.2, 0.1])
+        q_bank = torch.tensor([
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ])
+
+        selected = SplitModule._mode_stratified_topk(
+            scores, q_bank, max_items=4, min_per_group=2
+        )
+        assignments = q_bank.index_select(0, selected).argmax(dim=-1)
+
+        self.assertEqual(int((assignments == 0).sum()), 2)
+        self.assertEqual(int((assignments == 1).sum()), 2)
+
+    def test_split_bank_keeps_raw_delta_and_uses_bank_modes(self):
+        bank = MemoryBank(
+            device="cpu",
+            key_dim=2,
+            param_dim=3,
+            capacity=8,
+            law_dim=3,
+        )
+        window = EventWindow(
+            times=torch.tensor([0.1]),
+            types=torch.tensor([0]),
+            node_id="root",
+            start_idx=0,
+            end_idx=1,
+            has_full_history=True,
+        )
+        bank.add(
+            torch.tensor([1.0, 0.0]),
+            torch.tensor([1.0, 2.0, 3.0]),
+            window,
+            write_quality=0.25,
+            queue_weight=0.5,
+            law_key=torch.tensor([1.0, 0.0, 0.0]),
+            prediction_gain=1.0,
+            force_new_mode_confirmation=True,
+        )
+        bank.add(
+            torch.tensor([0.0, 1.0]),
+            torch.tensor([1.0, 2.0, 3.0]),
+            window,
+            write_quality=1.0,
+            queue_weight=0.5,
+            law_key=torch.tensor([0.0, 1.0, 0.0]),
+            prediction_gain=1.0,
+            force_new_mode_confirmation=True,
+        )
+
+        batch = SplitModule.build_split_batch_from_memory_bank(bank)
+
+        self.assertIsNotNone(batch)
+        torch.testing.assert_close(batch.residuals, bank.deltas)
+        self.assertEqual(batch.mode_ids.tolist(), [0, 1])
+        torch.testing.assert_close(batch.law_keys, bank.law_keys)
+        torch.testing.assert_close(
+            batch.bank_group_weights,
+            torch.eye(2),
+        )
+        # Equal raw deltas and all other row factors make the base-weight
+        # ratio expose the quality-only responsibility directly.
+        self.assertAlmostEqual(
+            float(batch.base_weights[1] / batch.base_weights[0]),
+            4.0,
+            places=5,
+        )
+        torch.testing.assert_close(
+            batch.mode_summary["support"],
+            torch.ones(2),
+        )
+        torch.testing.assert_close(
+            batch.mode_summary["split_mass"],
+            torch.full((2,), 0.5),
+        )
+
+    def test_split_bank_groups_more_than_two_modes_by_law_key(self):
+        mode_ids = torch.tensor([10, 10, 20, 30])
+        law_keys = torch.tensor([
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.8, 0.6, 0.0],
+            [0.0, 1.0, 0.0],
+        ])
+        deltas = torch.tensor([
+            [100.0, 0.0],
+            [-100.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 2.0],
+        ])
+        q_bank, summary = SplitModule._build_bank_mode_groups(
+            mode_ids=mode_ids,
+            law_keys=law_keys,
+            deltas=deltas,
+            support=torch.tensor([2.0, 3.0, 1.0, 1.0]),
+            split_mass=torch.tensor([1.0, 1.5, 0.5, 0.5]),
+        )
+
+        # The two rows in mode 10 share one Bank-level assignment even though
+        # their residuals point in opposite directions.
+        torch.testing.assert_close(q_bank[0], q_bank[1])
+        self.assertEqual(int((q_bank.sum(dim=0) > 0).sum()), 2)
+        torch.testing.assert_close(
+            summary["support"],
+            torch.tensor([5.0, 1.0, 1.0]),
+        )
+        torch.testing.assert_close(
+            summary["split_mass"],
+            torch.tensor([2.5, 0.5, 0.5]),
+        )
+
+    def test_split_structure_consumes_bank_group_weights(self):
+        module = SplitModule(P=2, z_dim=1)
+        residuals = torch.tensor([
+            [10.0, 0.0],
+            [0.0, 10.0],
+        ])
+        q_bank = torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ])
+
+        with torch.no_grad():
+            structure = module.compute_soft_residual_structure(
+                residuals=residuals,
+                weights=torch.ones(2),
+                theta_sem=torch.zeros(2),
+                bank_group_weights=q_bank,
+            )
+
+        torch.testing.assert_close(structure["q"], q_bank)
+        torch.testing.assert_close(
+            structure["dist"],
+            torch.zeros(2, 2),
+        )
+        torch.testing.assert_close(
+            structure["delta_bar"],
+            residuals,
         )
 
 

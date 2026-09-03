@@ -1515,12 +1515,32 @@ class TrainInferenceTests(unittest.TestCase):
             self.assertEqual(len(history), 1)
             self.assertTrue(checkpoint.exists())
             self.assertIsNotNone(history[0]["sleep"])
+            # A write is an accepted evidence transaction.  Duplicate
+            # observations refresh an existing prototype, so accepted writes
+            # are intentionally distinct from the resident row count.
+            resident_prototypes = sum(
+                len(bank)
+                for bank in trainer.tree.episodic_memory.banks.values()
+            )
+            evidence_mass = sum(
+                float(bank.support[: len(bank)].sum())
+                for bank in trainer.tree.episodic_memory.banks.values()
+            )
             self.assertEqual(
-                sum(len(bank) for bank in trainer.tree.episodic_memory.banks.values()),
-                history[0]["writes"],
+                resident_prototypes,
+                history[0]["prototype_count"],
+            )
+            self.assertAlmostEqual(
+                evidence_mass,
+                history[0]["evidence_mass"],
+                places=6,
+            )
+            self.assertEqual(
+                history[0]["accepted_write_count"],
+                history[0]["append_count"] + history[0]["refresh_count"],
             )
             self.assertLessEqual(
-                history[0]["writes"],
+                history[0]["accepted_write_count"],
                 len(dataset) * 2,
             )
             self.assertFalse(history[0]["topology_prune_enabled"])
@@ -1613,7 +1633,7 @@ class TrainInferenceTests(unittest.TestCase):
         )
         result = trainer.train_wake_sequence(sequence)
         bank = tree.episodic_memory.get_bank("root")
-        self.assertEqual(result["write_count"], 1)
+        self.assertEqual(result["accepted_write_count"], 1)
         self.assertEqual(result["pending_write_count"], 2)
         self.assertEqual(
             sum(result["action_counts"].values()),
@@ -1928,7 +1948,7 @@ class TrainInferenceTests(unittest.TestCase):
             self.assertEqual(
                 result["action_counts"].get(forced_action.value, 0), 3
             )
-            self.assertEqual(result["write_count"], 0)
+            self.assertEqual(result["accepted_write_count"], 0)
             self.assertEqual(result["write_decision_count"], 0)
             self.assertEqual(
                 sum(len(bank) for bank in tree.episodic_memory.banks.values()),
@@ -1965,9 +1985,19 @@ class TrainInferenceTests(unittest.TestCase):
         result = trainer.train_wake_sequence(sequence)
         self.assertEqual(result["write_candidates"], 10)
         self.assertLessEqual(result["write_decision_count"], 4)
-        self.assertEqual(result["write_count"], result["write_decision_count"])
+        self.assertLessEqual(
+            result["accepted_write_count"], result["write_decision_count"]
+        )
         self.assertEqual(
-            len(tree.episodic_memory.get_bank("root")), result["write_count"]
+            result["accepted_write_count"],
+            result["append_count"] + result["refresh_count"],
+        )
+        bank = tree.episodic_memory.get_bank("root")
+        self.assertEqual(result["prototype_count"], len(bank))
+        self.assertAlmostEqual(
+            result["evidence_mass"],
+            float(bank.support[: len(bank)].sum()),
+            places=6,
         )
         self.assertEqual(result["harmful_write_count"], 0)
 
@@ -2112,10 +2142,19 @@ class TrainInferenceTests(unittest.TestCase):
             trainer.controller.bias_memorize.fill_(100.0)
             trainer.controller.bias_queue_split.fill_(100.0)
         wake_result = trainer.train_wake_sequence(sequence)
-        self.assertGreaterEqual(wake_result["write_count"], 1)
-        self.assertLessEqual(wake_result["write_count"], 2)
+        self.assertGreaterEqual(wake_result["accepted_write_count"], 1)
+        self.assertLessEqual(wake_result["accepted_write_count"], 2)
+        self.assertEqual(
+            wake_result["accepted_write_count"],
+            wake_result["append_count"] + wake_result["refresh_count"],
+        )
         bank = tree.episodic_memory.get_bank("root")
-        self.assertEqual(len(bank), wake_result["write_count"])
+        self.assertEqual(wake_result["prototype_count"], len(bank))
+        self.assertAlmostEqual(
+            wake_result["evidence_mass"],
+            float(bank.support[: len(bank)].sum()),
+            places=6,
+        )
         self.assertTrue(torch.all(
             (bank.write_quality >= 0.0) & (bank.write_quality <= 1.0)
         ))

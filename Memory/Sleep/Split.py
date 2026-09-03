@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -24,6 +26,10 @@ class SplitBatch:
     contexts:  [R, z_dim]
     weights:   [R]
     windows:   list of EventWindow, length R
+
+    Bank-backed batches additionally carry row-wise ``mode_ids`` and
+    effective-law ``law_keys``.  ``bank_group_weights`` is the resulting
+    binary proposal consumed by Split's unchanged likelihood path.
     """
     residuals: torch.Tensor
     contexts: torch.Tensor
@@ -37,8 +43,23 @@ class SplitBatch:
     structural_weights: Optional[torch.Tensor] = None
     structural_strength: Optional[torch.Tensor] = None
     effective_sample_size: Optional[torch.Tensor] = None
-    # Independent observation count represented by each physical row.
+    # Persistent observation support represented by each physical Bank row.
+    # This is evidence provenance, not a replay sample multiplier.
     sample_support: Optional[torch.Tensor] = None
+    # Number of independently replayable windows represented by each row.
+    # A compressed prototype with support=100 and one retained window has
+    # replay_support=1 and therefore contributes at most one unit of ESS.
+    replay_support: Optional[torch.Tensor] = None
+    # Bank provenance for mode-conditioned proposal formation.  These fields
+    # are optional so legacy, directly-constructed batches keep the original
+    # residual-clustering behavior.
+    mode_ids: Optional[torch.Tensor] = None
+    law_keys: Optional[torch.Tensor] = None
+    # Row-wise binary proposal q_bank generated from Bank mode summaries.
+    bank_group_weights: Optional[torch.Tensor] = None
+    # Full-bank mode summaries are retained for diagnostics and provenance;
+    # Split's likelihood/counterfactual path only consumes bank_group_weights.
+    mode_summary: Optional[Dict[str, torch.Tensor]] = None
 
 
 class SplitCommitState:
@@ -81,9 +102,9 @@ class SplitModule(nn.Module):
         tau_g: float = 1.0,
         tau_route: float = 1.0,
         tau_m: float = 1.0,
-        m_min: float = 10.0,
+        m_min: float = 0.0,
         lambda_tree: float = 1e-3,
-        lambda_mass: float = 1.0,
+        lambda_mass: float = 0.0,
         eps: float = 1e-8,
         controller: Optional[Controller] = None,
         nll_fn: Optional[HawkesFamily] = None,
@@ -181,6 +202,8 @@ class SplitModule(nn.Module):
         weights: torch.Tensor,
         theta_sem: torch.Tensor,
         sample_support: Optional[torch.Tensor] = None,
+        replay_support: Optional[torch.Tensor] = None,
+        bank_group_weights: Optional[torch.Tensor] = None,
     ):
         """
         Implements equations (20)-(23).
@@ -188,6 +211,7 @@ class SplitModule(nn.Module):
         residuals: [R, P]
         weights:   [R]
         theta_sem: [P]
+        bank_group_weights: optional [R, 2] proposal from Bank modes
 
         returns dictionary containing:
             q: [R, 2]
@@ -202,21 +226,49 @@ class SplitModule(nn.Module):
         """
         eps = self.eps
 
-        # Eq. (20): soft residual clustering.
-        dist = self.distance(residuals, self.centers)          # [R, 2]
-        logits = -dist / self.tau_c
-        q = F.softmax(logits, dim=-1)                          # [R, 2]
+        # Eq. (20): proposal formation.  Bank-backed batches already carry a
+        # binary proposal derived from persistent dynamics modes.  In that
+        # path, do not cluster q_write * delta_theta (or delta_theta) again:
+        # the Bank's effective Hawkes law identity is the source of truth.
+        if bank_group_weights is None:
+            dist = self.distance(residuals, self.centers)      # [R, 2]
+            logits = -dist / self.tau_c
+            q = F.softmax(logits, dim=-1)                      # [R, 2]
+        else:
+            if bank_group_weights.shape != (residuals.size(0), 2):
+                raise ValueError(
+                    "bank_group_weights must have shape [R, 2]"
+                )
+            if not bool(torch.isfinite(bank_group_weights).all()):
+                raise FloatingPointError(
+                    "bank_group_weights must contain only finite values"
+                )
+            if bool((bank_group_weights < 0.0).any()):
+                raise ValueError("bank_group_weights must be non-negative")
+            q = bank_group_weights.to(
+                device=residuals.device,
+                dtype=residuals.dtype,
+            )
+            row_mass = q.sum(dim=-1, keepdim=True)
+            if bool((row_mass <= eps).any()):
+                raise ValueError(
+                    "each bank_group_weights row must have positive mass"
+                )
+            q = q / row_mass
+            # Preserve the diagnostic shape expected by callers while making
+            # it explicit that no residual-distance computation was used.
+            dist = residuals.new_zeros(residuals.size(0), 2)
 
         # Eq. (21): child mass is used for prototypes, while child-wise ESS
         # measures whether each candidate is supported by independent replay
         # evidence rather than one dominant weighted memory.
         support = (
             torch.ones_like(weights)
-            if sample_support is None
-            else sample_support.to(weights).clamp_min(0.0)
+            if replay_support is None
+            else replay_support.to(weights).clamp_min(0.0)
         )
         if support.shape != weights.shape:
-            raise ValueError("sample_support and weights must be aligned vectors")
+            raise ValueError("replay_support and weights must be aligned vectors")
         weighted_q = weights[:, None] * q                      # [R, 2]
         N_mass = (support[:, None] * weighted_q).sum(dim=0)    # [2]
         N_eff = N_mass.square() / (
@@ -498,6 +550,47 @@ class SplitModule(nn.Module):
                     device=reference.device, dtype=reference.dtype
                 )
             ),
+            replay_support=(
+                None
+                if batch.replay_support is None
+                else batch.replay_support.to(
+                    device=reference.device, dtype=reference.dtype
+                )
+            ),
+            mode_ids=(
+                None
+                if batch.mode_ids is None
+                else batch.mode_ids.to(device=reference.device, dtype=torch.long)
+            ),
+            law_keys=(
+                None
+                if batch.law_keys is None
+                else batch.law_keys.to(
+                    device=reference.device, dtype=reference.dtype
+                )
+            ),
+            bank_group_weights=(
+                None
+                if batch.bank_group_weights is None
+                else batch.bank_group_weights.to(
+                    device=reference.device, dtype=reference.dtype
+                )
+            ),
+            mode_summary=(
+                None
+                if batch.mode_summary is None
+                else {
+                    name: value.to(
+                        device=reference.device,
+                        dtype=(
+                            torch.long
+                            if name in {"mode_ids", "group_ids"}
+                            else reference.dtype
+                        ),
+                    )
+                    for name, value in batch.mode_summary.items()
+                }
+            ),
         )
 
     def _module_reference(self, fallback: torch.Tensor) -> torch.Tensor:
@@ -519,7 +612,12 @@ class SplitModule(nn.Module):
             raise ValueError("batch.contexts and batch.residuals must have the same R")
         if batch.weights.shape != (R,):
             raise ValueError(f"batch.weights must have shape [{R}], got {tuple(batch.weights.shape)}")
-        for name in ("base_weights", "structural_weights", "sample_support"):
+        for name in (
+            "base_weights",
+            "structural_weights",
+            "sample_support",
+            "replay_support",
+        ):
             value = getattr(batch, name)
             if value is not None and value.shape != (R,):
                 raise ValueError(
@@ -532,6 +630,49 @@ class SplitModule(nn.Module):
                 raise ValueError(f"batch.{name} must be scalar")
         if len(batch.windows) != R:
             raise ValueError(f"batch.windows must contain {R} windows, got {len(batch.windows)}")
+        if batch.mode_ids is not None:
+            if batch.mode_ids.ndim != 1 or batch.mode_ids.shape != (R,):
+                raise ValueError(
+                    f"batch.mode_ids must have shape [{R}], "
+                    f"got {tuple(batch.mode_ids.shape)}"
+                )
+            if batch.mode_ids.dtype not in (
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            ):
+                raise ValueError("batch.mode_ids must be an integer tensor")
+        if batch.law_keys is not None:
+            if batch.law_keys.ndim != 2 or batch.law_keys.size(0) != R:
+                raise ValueError(
+                    "batch.law_keys must have shape [R, law_dim]"
+                )
+        if batch.bank_group_weights is not None:
+            if batch.bank_group_weights.shape != (R, 2):
+                raise ValueError(
+                    f"batch.bank_group_weights must have shape [{R}, 2], "
+                    f"got {tuple(batch.bank_group_weights.shape)}"
+                )
+        if batch.mode_summary is not None:
+            if not isinstance(batch.mode_summary, Mapping):
+                raise ValueError("batch.mode_summary must be a mapping")
+            required = {
+                "mode_ids",
+                "law_keys",
+                "support",
+                "split_mass",
+                "delta_means",
+                "mode_weights",
+                "group_ids",
+            }
+            missing = required.difference(batch.mode_summary)
+            if missing:
+                raise ValueError(
+                    "batch.mode_summary is missing "
+                    + ", ".join(sorted(missing))
+                )
 
     def forward(
         self,
@@ -559,12 +700,19 @@ class SplitModule(nn.Module):
             if batch.sample_support is None
             else batch.sample_support
         )
+        replay_support = (
+            torch.ones_like(weights)
+            if batch.replay_support is None
+            else batch.replay_support
+        )
 
         struct = self.compute_soft_residual_structure(
             residuals=residuals,
             weights=weights,
             theta_sem=theta_sem,
             sample_support=sample_support,
+            replay_support=replay_support,
+            bank_group_weights=batch.bank_group_weights,
         )
 
         replay = self.compute_replay_loglikelihood(
@@ -576,7 +724,7 @@ class SplitModule(nn.Module):
         )
 
         objective = self.compute_split_training_objective(
-            weights=weights * sample_support,
+            weights=weights * replay_support,
             ell_split=replay["ell_split"],
             g_split=replay["g_split"],
             N_eff=struct["N_eff"],
@@ -642,13 +790,14 @@ class SplitModule(nn.Module):
         base_weights: torch.Tensor,
         structural_weights: torch.Tensor,
         sample_support: Optional[torch.Tensor] = None,
+        replay_support: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Put Split mass on replay-count scale without hiding weak evidence.
 
-        ``normalized`` is used by the differentiable Split objective, while
-        ``structural_strength`` and ``effective_sample_size`` remain on their
-        original scale and are checked separately before a split can commit.
+        Persistent support scales evidence confidence, but replay ESS is
+        computed only from physically retained windows.  This prevents a
+        compressed prototype from impersonating many independent replays.
         """
         if base_weights.ndim != 1 or structural_weights.shape != base_weights.shape:
             raise ValueError(
@@ -665,15 +814,23 @@ class SplitModule(nn.Module):
         )
         if support.shape != base.shape:
             raise ValueError("sample_support and base_weights must be aligned vectors")
-        evidence = base * structural
-        evidence_sum = (support * evidence).sum()
-        support_sum = support.sum()
+        replay = (
+            torch.ones_like(base)
+            if replay_support is None
+            else replay_support.to(base).clamp_min(0.0)
+        )
+        if replay.shape != base.shape:
+            raise ValueError("replay_support and base_weights must be aligned vectors")
+        evidence = support * base * structural
+        evidence_sum = evidence.sum()
+        replay_count = replay.sum()
         normalized = (
-            support_sum * evidence / (evidence_sum + eps)
+            replay_count * evidence / (evidence_sum + eps)
         )
         structural_strength = evidence_sum / ((support * base).sum() + eps)
-        effective_sample_size = evidence_sum.square() / (
-            (support * evidence.square()).sum() + eps
+        replay_evidence = replay * evidence
+        effective_sample_size = replay_evidence.sum().square() / (
+            replay_evidence.square().sum() + eps
         )
         return (
             normalized.detach(),
@@ -682,10 +839,252 @@ class SplitModule(nn.Module):
         )
 
     @staticmethod
+    @torch.no_grad()
+    def _build_bank_mode_groups(
+        mode_ids: torch.Tensor,
+        law_keys: torch.Tensor,
+        deltas: torch.Tensor,
+        support: torch.Tensor,
+        split_mass: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Turn persistent Bank modes into one binary Split proposal.
+
+        The reduction is intentionally performed before replay-row truncation,
+        so compressed rows still contribute their historical support and
+        structural mass.  Only the final row-wise ``q_bank`` is passed to the
+        existing Split objective.
+        """
+        if mode_ids.ndim != 1:
+            raise ValueError("mode_ids must have shape [R]")
+        if law_keys.ndim != 2 or law_keys.size(0) != mode_ids.numel():
+            raise ValueError("law_keys must have shape [R, law_dim]")
+        if deltas.ndim != 2 or deltas.size(0) != mode_ids.numel():
+            raise ValueError("deltas must have shape [R, P]")
+        if support.shape != mode_ids.shape or split_mass.shape != mode_ids.shape:
+            raise ValueError(
+                "support and split_mass must have shape [R]"
+            )
+        if eps <= 0.0:
+            raise ValueError("eps must be positive")
+
+        law_keys = F.normalize(law_keys, dim=-1)
+        mode_ids = mode_ids.to(device=law_keys.device, dtype=torch.long)
+        support = support.to(device=law_keys.device, dtype=law_keys.dtype).clamp_min(0.0)
+        split_mass = split_mass.to(
+            device=law_keys.device, dtype=law_keys.dtype
+        ).clamp_min(0.0)
+        deltas = deltas.to(device=law_keys.device)
+
+        unique_modes, inverse = torch.unique(
+            mode_ids,
+            sorted=True,
+            return_inverse=True,
+        )
+        mode_count = int(unique_modes.numel())
+        mode_support = law_keys.new_zeros(mode_count)
+        mode_support.index_add_(0, inverse, support)
+        mode_split_mass = law_keys.new_zeros(mode_count)
+        mode_split_mass.index_add_(0, inverse, split_mass)
+
+        mode_law_keys = law_keys.new_zeros(
+            mode_count, law_keys.size(-1)
+        )
+        mode_law_keys.index_add_(
+            0,
+            inverse,
+            support[:, None] * law_keys,
+        )
+        mode_law_keys = F.normalize(
+            mode_law_keys / (mode_support[:, None] + eps),
+            dim=-1,
+        )
+
+        mode_delta_means = deltas.new_zeros(mode_count, deltas.size(-1))
+        mode_delta_means.index_add_(
+            0,
+            inverse,
+            support.to(deltas)[:, None] * deltas,
+        )
+        mode_delta_means = mode_delta_means / (
+            mode_support.to(deltas)[:, None] + eps
+        )
+
+        # This is the structural mode weight from the proposal:
+        # omega_m = S_m * E_m^struct / (S_m + eps).
+        mode_weights = mode_support * mode_split_mass / (
+            mode_support + eps
+        )
+
+        if mode_count == 1:
+            # A single Bank mode has no preferred binary side.  Keep the
+            # batch usable for the existing relaxed objective while making the
+            # proposal independent of residual geometry.
+            mode_group_weights = law_keys.new_full((1, 2), 0.5)
+            mode_group_ids = torch.zeros(
+                1, device=law_keys.device, dtype=torch.long
+            )
+        elif mode_count == 2:
+            mode_group_weights = torch.eye(
+                2, device=law_keys.device, dtype=law_keys.dtype
+            )
+            mode_group_ids = torch.arange(
+                2, device=law_keys.device, dtype=torch.long
+            )
+        else:
+            # Weighted two-center clustering runs only on mode-level law
+            # identities z_m^law.  Row residuals never enter this proposal.
+            points = F.normalize(mode_law_keys, dim=-1)
+            pairwise_distance = 1.0 - points @ points.transpose(0, 1)
+            pairwise_distance = pairwise_distance.masked_fill(
+                torch.eye(
+                    mode_count,
+                    device=points.device,
+                    dtype=torch.bool,
+                ),
+                -torch.inf,
+            )
+            farthest_pair = int(torch.argmax(pairwise_distance).item())
+            first = farthest_pair // mode_count
+            second = farthest_pair % mode_count
+            centers = points[[first, second]].clone()
+            cluster_weights = mode_weights.clamp_min(eps)
+            assignments = torch.zeros(
+                mode_count,
+                device=points.device,
+                dtype=torch.long,
+            )
+
+            for _ in range(12):
+                distances = 1.0 - points @ centers.transpose(0, 1)
+                assignments = distances.argmin(dim=-1)
+                present = [
+                    bool((assignments == child).any()) for child in range(2)
+                ]
+                if not all(present):
+                    occupied = 1 if present[1] else 0
+                    missing = 1 - occupied
+                    candidate = torch.argmax(
+                        distances[:, occupied]
+                    )
+                    assignments[candidate] = missing
+
+                next_centers = []
+                for child in range(2):
+                    child_weight = cluster_weights * (
+                        assignments == child
+                    ).to(cluster_weights.dtype)
+                    child_mass = child_weight.sum()
+                    if bool(child_mass <= eps):
+                        next_centers.append(centers[child])
+                    else:
+                        next_centers.append(
+                            F.normalize(
+                                (child_weight[:, None] * points).sum(0)
+                                / child_mass,
+                                dim=-1,
+                            )
+                        )
+                centers = torch.stack(next_centers, dim=0)
+
+            mode_group_weights = F.one_hot(
+                assignments,
+                num_classes=2,
+            ).to(dtype=law_keys.dtype)
+            mode_group_ids = assignments
+
+        row_group_weights = mode_group_weights.index_select(0, inverse)
+        summary = {
+            "mode_ids": unique_modes.detach(),
+            "law_keys": mode_law_keys.detach(),
+            "support": mode_support.detach(),
+            "split_mass": mode_split_mass.detach(),
+            "delta_means": mode_delta_means.detach(),
+            "mode_weights": mode_weights.detach(),
+            "group_ids": mode_group_ids.detach(),
+        }
+        return row_group_weights.detach(), summary
+
+    @staticmethod
+    def _mode_stratified_topk(
+        scores: torch.Tensor,
+        bank_group_weights: Optional[torch.Tensor],
+        max_items: int,
+        min_per_group: int = 2,
+    ) -> torch.Tensor:
+        """Reserve physical replay rows on both candidate sides, then Top-K.
+
+        Persistent support affects ``scores`` but never creates extra replay
+        rows.  The reservation is best-effort when a side has fewer retained
+        windows or the total budget is smaller than the requested reserve.
+        """
+        if scores.ndim != 1:
+            raise ValueError("scores must be one-dimensional")
+        if max_items <= 0:
+            raise ValueError("max_items must be positive")
+        if min_per_group < 0:
+            raise ValueError("min_per_group must be non-negative")
+        count = int(scores.numel())
+        if count <= max_items:
+            return torch.arange(count, device=scores.device)
+        if bank_group_weights is None:
+            return torch.topk(scores, k=max_items).indices
+        if bank_group_weights.shape != (count, 2):
+            raise ValueError("bank_group_weights must have shape [R, 2]")
+
+        assignments = bank_group_weights.argmax(dim=-1)
+        ranked_by_group = []
+        for group in range(2):
+            group_indices = torch.nonzero(
+                assignments == group, as_tuple=False
+            ).flatten()
+            if group_indices.numel() == 0:
+                ranked_by_group.append(group_indices)
+                continue
+            order = torch.argsort(
+                scores.index_select(0, group_indices), descending=True
+            )
+            ranked_by_group.append(group_indices.index_select(0, order))
+
+        reserved: list[int] = []
+        # Round-robin reservation prevents the first side from consuming a
+        # small budget before the second side receives one physical replay.
+        for rank in range(min_per_group):
+            for group in range(2):
+                if len(reserved) >= max_items:
+                    break
+                ranked = ranked_by_group[group]
+                if rank < int(ranked.numel()):
+                    reserved.append(int(ranked[rank].item()))
+            if len(reserved) >= max_items:
+                break
+
+        selected_mask = torch.zeros(
+            count, device=scores.device, dtype=torch.bool
+        )
+        if reserved:
+            reserved_tensor = torch.tensor(
+                reserved, device=scores.device, dtype=torch.long
+            )
+            selected_mask[reserved_tensor] = True
+        remaining = max_items - len(reserved)
+        if remaining > 0:
+            available = torch.nonzero(
+                ~selected_mask, as_tuple=False
+            ).flatten()
+            fill_order = torch.topk(
+                scores.index_select(0, available), k=remaining
+            ).indices
+            fill = available.index_select(0, fill_order)
+            selected_mask[fill] = True
+        return torch.nonzero(selected_mask, as_tuple=False).flatten()
+
+    @staticmethod
     def combine_split_batches(
         batches: Sequence[Optional[SplitBatch]],
         *,
         max_items: Optional[int] = None,
+        min_replay_per_group: int = 2,
     ) -> Optional[SplitBatch]:
         """Union disjoint episodic and Sleep-only structural evidence."""
         present = [batch for batch in batches if batch is not None]
@@ -726,18 +1125,49 @@ class SplitModule(nn.Module):
             ).to(reference)
             for batch in present
         ])
+        replay_support = torch.cat([
+            (
+                torch.ones_like(batch.weights)
+                if batch.replay_support is None
+                else batch.replay_support
+            ).to(reference)
+            for batch in present
+        ])
+        mode_ids = None
+        if all(batch.mode_ids is not None for batch in present):
+            mode_ids = torch.cat([
+                batch.mode_ids.to(device=reference.device, dtype=torch.long)
+                for batch in present
+            ])
+        law_keys = None
+        if all(batch.law_keys is not None for batch in present):
+            law_keys = torch.cat([
+                batch.law_keys.to(device=reference.device)
+                for batch in present
+            ], dim=0)
+        bank_group_weights = None
+        if all(batch.bank_group_weights is not None for batch in present):
+            bank_group_weights = torch.cat([
+                batch.bank_group_weights.to(reference)
+                for batch in present
+            ], dim=0)
+        mode_summary = (
+            present[0].mode_summary
+            if len(present) == 1
+            else None
+        )
         windows = [
             window for batch in present for window in batch.windows
         ]
         if max_items is not None and residuals.size(0) > int(max_items):
-            selected = torch.topk(
+            selected = SplitModule._mode_stratified_topk(
                 base_weights.clamp_min(0.0)
                 * structural_weights.clamp(0.0, 1.0)
                 * sample_support.clamp_min(0.0),
-                # Prefer rows representing more independent observations when
-                # a bounded physical-row replay budget is applied.
-                k=int(max_items),
-            ).indices
+                bank_group_weights,
+                int(max_items),
+                min_per_group=min_replay_per_group,
+            )
             selected_cpu = selected.detach().cpu().tolist()
             residuals = residuals.index_select(0, selected)
             contexts = contexts.index_select(0, selected)
@@ -746,12 +1176,22 @@ class SplitModule(nn.Module):
                 0, selected
             )
             sample_support = sample_support.index_select(0, selected)
+            replay_support = replay_support.index_select(0, selected)
+            if mode_ids is not None:
+                mode_ids = mode_ids.index_select(0, selected)
+            if law_keys is not None:
+                law_keys = law_keys.index_select(0, selected)
+            if bank_group_weights is not None:
+                bank_group_weights = bank_group_weights.index_select(
+                    0, selected
+                )
             windows = [windows[index] for index in selected_cpu]
         weights, structural_strength, effective_sample_size = (
             SplitModule.normalize_split_evidence(
                 base_weights,
                 structural_weights,
                 sample_support,
+                replay_support,
             )
         )
         return SplitBatch(
@@ -764,6 +1204,11 @@ class SplitModule(nn.Module):
             structural_strength=structural_strength,
             effective_sample_size=effective_sample_size,
             sample_support=sample_support.detach(),
+            replay_support=replay_support.detach(),
+            mode_ids=mode_ids,
+            law_keys=law_keys,
+            bank_group_weights=bank_group_weights,
+            mode_summary=mode_summary,
         )
 
     @staticmethod
@@ -779,39 +1224,45 @@ class SplitModule(nn.Module):
         if not valid_items:
             return None
 
+        # Keep residual geometry equal to the learned dynamics update.  Write
+        # quality is confidence and belongs in evidence weights, not in the
+        # law vector used to form Split candidates.
         residuals = torch.stack(
-            [
-                float(item.write_quality) * item.delta_theta.reshape(-1)
-                for item in valid_items
-            ],
+            [item.delta_theta.reshape(-1) for item in valid_items],
             dim=0,
         )
         contexts = torch.stack([item.key.reshape(-1) for item in valid_items], dim=0)
         base_weights = torch.stack(
             [
                 SplitModule.compute_memory_weight(
-                    residual=residuals[index],
+                    residual=item.delta_theta.reshape(-1),
                     age=float(item.age),
                     usage_count=float(item.usage),
                     reliability=float(getattr(item, "reliability", 1.0)),
                     tau_age=tau_age,
                     residual_norm_ema=residual_norm_ema,
                 )
-                for index, item in enumerate(valid_items)
+                for item in valid_items
             ],
             dim=0,
         )
+        write_quality = base_weights.new_tensor([
+            float(item.write_quality) for item in valid_items
+        ]).clamp(0.0, 1.0)
+        base_weights = (base_weights * write_quality).detach()
         structural_weights = base_weights.new_tensor(
             [float(item.queue_weight) for item in valid_items]
         )
         sample_support = base_weights.new_tensor([
             float(getattr(item, "support", 1.0)) for item in valid_items
         ]).clamp_min(0.0)
+        replay_support = torch.ones_like(base_weights)
         weights, structural_strength, effective_sample_size = (
             SplitModule.normalize_split_evidence(
                 base_weights,
                 structural_weights,
                 sample_support,
+                replay_support,
             )
         )
         windows = [item.window for item in valid_items]
@@ -826,6 +1277,7 @@ class SplitModule(nn.Module):
             structural_strength=structural_strength,
             effective_sample_size=effective_sample_size,
             sample_support=sample_support.detach(),
+            replay_support=replay_support.detach(),
         )
 
     @staticmethod
@@ -834,44 +1286,69 @@ class SplitModule(nn.Module):
         tau_age: float = 20.0,
         residual_norm_ema: float = 1.0,
         max_items: Optional[int] = None,
+        min_replay_per_group: int = 2,
     ) -> Optional[SplitBatch]:
         """Build a bounded evidence batch from one leaf memory bank."""
         if max_items is not None and max_items <= 0:
             raise ValueError("max_items must be positive when provided")
+        bank._ensure_prototype_state()
+        count = len(bank)
+        if count == 0:
+            return None
+        mode_group_weights_all, mode_summary = (
+            SplitModule._build_bank_mode_groups(
+                mode_ids=bank.mode_ids[:count],
+                law_keys=bank.law_keys[:count],
+                deltas=bank.deltas[:count],
+                support=bank.support[:count],
+                split_mass=bank.split_mass[:count],
+            )
+        )
         valid_indices = [
             index for index, window in enumerate(bank.windows) if window is not None
         ]
         if not valid_indices:
             return None
-        bank._ensure_prototype_state()
         indices = torch.tensor(valid_indices, device=bank.device, dtype=torch.long)
-        residuals = (
-            bank.write_quality[indices].unsqueeze(-1)
-            * bank.deltas[indices]
-        )
+        # Raw delta_theta determines the dynamics identity; quality is applied
+        # only to base evidence weights below.
+        residuals = bank.deltas[indices]
         contexts = bank.keys[indices]
+        mode_ids = bank.mode_ids[indices].detach().to(dtype=torch.long)
+        law_keys = bank.law_keys[indices].detach()
+        bank_group_weights = mode_group_weights_all.index_select(0, indices)
         recency = torch.exp(-bank.age[indices] / tau_age)
         usage = 1.0 + torch.log1p(bank.usage[indices])
         strength = residuals.norm(dim=-1) / (residual_norm_ema + 1e-8)
-        base_weights = (recency * usage * strength).detach()
+        quality = bank.write_quality[indices].detach().clamp(0.0, 1.0)
+        base_weights = (recency * usage * strength * quality).detach()
         structural_weights = bank.queue_weight[indices].detach()
         sample_support = bank.support[indices].detach().clamp_min(0.0)
+        replay_support = torch.ones_like(base_weights)
         evidence_weights = base_weights * structural_weights * sample_support
         if max_items is not None and indices.numel() > max_items:
-            selected = torch.topk(
-                evidence_weights, k=int(max_items)
-            ).indices
+            selected = SplitModule._mode_stratified_topk(
+                evidence_weights,
+                bank_group_weights,
+                int(max_items),
+                min_per_group=min_replay_per_group,
+            )
             indices = indices.index_select(0, selected)
             residuals = residuals.index_select(0, selected)
             contexts = contexts.index_select(0, selected)
             base_weights = base_weights.index_select(0, selected)
             structural_weights = structural_weights.index_select(0, selected)
             sample_support = sample_support.index_select(0, selected)
+            replay_support = replay_support.index_select(0, selected)
+            mode_ids = mode_ids.index_select(0, selected)
+            law_keys = law_keys.index_select(0, selected)
+            bank_group_weights = bank_group_weights.index_select(0, selected)
         weights, structural_strength, effective_sample_size = (
             SplitModule.normalize_split_evidence(
                 base_weights,
                 structural_weights,
                 sample_support,
+                replay_support,
             )
         )
         selected_indices = indices.detach().cpu().tolist()
@@ -885,6 +1362,11 @@ class SplitModule(nn.Module):
             structural_strength=structural_strength,
             effective_sample_size=effective_sample_size,
             sample_support=sample_support,
+            replay_support=replay_support,
+            mode_ids=mode_ids,
+            law_keys=law_keys,
+            bank_group_weights=bank_group_weights,
+            mode_summary=mode_summary,
         )
 
     @staticmethod
@@ -912,6 +1394,155 @@ class SplitModule(nn.Module):
             "of MemoryItem objects."
         )
 
+    @torch.no_grad()
+    def bank_mode_counterfactual_probe(
+        self,
+        *,
+        theta_sem: torch.Tensor | HawkesParams | Any,
+        batch: SplitBatch,
+        hawkes_ll: Optional[HawkesFamily] = None,
+        alpha_max: float = 0.25,
+        trust_radius: float = 0.10,
+        gain_reference: float = 0.05,
+    ) -> Optional[Dict[str, Any]]:
+        """Compare shared Light absorption with Bank-mode specialization.
+
+        The method is deliberately non-mutating.  Both hypotheses are
+        evaluated on the same frozen semantic parameter and the same bounded
+        physical replay rows.  Bank mode assignment forms H1; residuals are
+        never re-clustered and write quality only affects reliability weights.
+        """
+        if alpha_max < 0.0 or trust_radius < 0.0 or gain_reference <= 0.0:
+            raise ValueError("invalid Light probe step-size settings")
+        if batch.bank_group_weights is None or batch.mode_summary is None:
+            return None
+        if int(batch.mode_summary["mode_ids"].numel()) < 2:
+            return None
+
+        hawkes_ll = self._resolve_hawkes_ll(hawkes_ll)
+        self.validate_batch(batch)
+        reference = self._module_reference(batch.residuals)
+        theta = self._theta_sem_to_flat(theta_sem, reference).detach().clone()
+        frozen = self._batch_to_device(batch, theta)
+        q = frozen.bank_group_weights
+        if q is None:
+            return None
+        q = q / q.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+
+        persistent_support = (
+            torch.ones_like(frozen.weights)
+            if frozen.sample_support is None
+            else frozen.sample_support.clamp_min(0.0)
+        )
+        replay_support = (
+            torch.ones_like(frozen.weights)
+            if frozen.replay_support is None
+            else frozen.replay_support.clamp_min(0.0)
+        )
+        base = (
+            frozen.weights
+            if frozen.base_weights is None
+            else frozen.base_weights.clamp_min(0.0)
+        )
+        reliability = base * persistent_support * replay_support
+        total_weight = reliability.sum()
+        if not bool(torch.isfinite(total_weight)) or bool(total_weight <= self.eps):
+            return None
+
+        weighted_sum = (reliability[:, None] * frozen.residuals).sum(0)
+        shared_delta = weighted_sum / total_weight
+        energy = (
+            reliability
+            * frozen.residuals.square().sum(dim=-1)
+        ).sum()
+        coherence = (
+            weighted_sum.square().sum()
+            / (total_weight * energy).clamp_min(self.eps)
+        ).clamp(0.0, 1.0)
+
+        replay_cache = build_replay_batch_cache(
+            frozen.windows, hawkes_ll, theta
+        )
+        # The optimized replay kernel evaluates the parent plus exactly two
+        # alternatives. Duplicate the shared alternative for this H0
+        # step-size calibration pass.
+        shared_models = torch.stack(
+            (theta, theta + shared_delta, theta + shared_delta), dim=0
+        )
+        shared_nll = batched_replay_log_likelihood(
+            replay_cache,
+            shared_models,
+            hawkes_ll,
+            normalize_by_events=True,
+        )
+        full_step_gain = (
+            reliability * (shared_nll[:, 0] - shared_nll[:, 1])
+        ).sum() / total_weight
+        trust = min(
+            1.0,
+            float(trust_radius)
+            / (float(shared_delta.norm().item()) + self.eps),
+        )
+        gain_scale = min(
+            1.0,
+            max(0.0, float(full_step_gain.item())) / float(gain_reference),
+        )
+        alpha_light = (
+            float(alpha_max)
+            * float(coherence.item())
+            * trust
+            * gain_scale
+        )
+        theta_h0 = theta + alpha_light * shared_delta
+
+        grouped_weight = reliability[:, None] * q
+        group_mass = grouped_weight.sum(dim=0)
+        # This is availability, not a persistence threshold: H1 is undefined
+        # when the frozen replay contains no physical window for one side.
+        if bool((group_mass <= self.eps).any()):
+            return None
+        group_delta = grouped_weight.transpose(0, 1) @ frozen.residuals
+        group_delta = group_delta / group_mass[:, None]
+        theta_h1 = theta[None, :] + group_delta
+
+        probe_models = torch.cat((theta_h0[None, :], theta_h1), dim=0)
+        probe_nll = batched_replay_log_likelihood(
+            replay_cache,
+            probe_models,
+            hawkes_ll,
+            normalize_by_events=True,
+        )
+        loss_h0 = (reliability * probe_nll[:, 0]).sum() / total_weight
+        row_h1_nll = (q * probe_nll[:, 1:3]).sum(dim=-1)
+        loss_h1 = (reliability * row_h1_nll).sum() / total_weight
+        advantage = loss_h0 - loss_h1
+        probability = reliability / total_weight
+        replay_ess = 1.0 / probability.square().sum().clamp_min(self.eps)
+
+        return {
+            "theta_sem_snapshot": theta.detach(),
+            "batch": batch,
+            "mode_ids": batch.mode_summary["mode_ids"].detach().clone(),
+            "mode_group_ids": batch.mode_summary["group_ids"].detach().clone(),
+            "bank_group_weights": q.detach(),
+            "shared_delta": shared_delta.detach(),
+            "group_delta": group_delta.detach(),
+            "theta_h0": theta_h0.detach(),
+            "theta_h1": theta_h1.detach(),
+            "alpha_light": float(alpha_light),
+            "coherence": float(coherence.item()),
+            "full_step_gain": float(full_step_gain.item()),
+            "loss_h0": float(loss_h0.item()),
+            "loss_h1": float(loss_h1.item()),
+            "advantage": float(advantage.item()),
+            "protect": bool(advantage > 0.0),
+            "replay_ess": float(replay_ess.item()),
+            "replay_rows": int(frozen.residuals.size(0)),
+            "replay_weights": (
+                reliability / total_weight * reliability.numel()
+            ).detach(),
+        }
+
     @staticmethod
     def detach_split_output(value: Any) -> Any:
         if torch.is_tensor(value):
@@ -931,11 +1562,11 @@ class SplitModule(nn.Module):
     def evaluate_split_eligibility(
         out: Mapping[str, Any],
         commit_state: SplitCommitState,
-        m_min: float = 10.0,
+        m_min: float = 0.0,
         min_structural_strength: float = 0.0,
         min_effective_sample_size: float = 0.0,
     ) -> bool:
-        """Check statistical support without deciding action preference."""
+        """Validate a proposal without imposing hand-designed thresholds."""
         N_mass = torch.as_tensor(out["N"]).detach()
         N_eff = torch.as_tensor(
             out.get("N_eff", N_mass)
@@ -951,13 +1582,15 @@ class SplitModule(nn.Module):
             ).detach().item()
         )
 
-        support_ok = bool((N_eff >= m_min).all().item())
-        structural_ok = structural_strength > min_structural_strength
-        effective_sample_ok = (
-            effective_sample_size >= min_effective_sample_size
+        # m_min, structural strength and proposal ESS are retained only as
+        # diagnostics/backward-compatible arguments.  Bank admission owns
+        # persistence; the predictive objective owns the decision boundary.
+        eligible = bool(
+            bool(torch.isfinite(N_mass).all())
+            and bool(torch.isfinite(N_eff).all())
+            and math.isfinite(structural_strength)
+            and math.isfinite(effective_sample_size)
         )
-
-        eligible = support_ok and structural_ok and effective_sample_ok
         commit_state.consecutive_ready = int(eligible)
         return eligible
 
@@ -1079,7 +1712,7 @@ class SplitModule(nn.Module):
         num_steps: int = 200,
         lr: float = 1e-3,
         leaf_to_commit_state: Optional[Mapping[Any, SplitCommitState]] = None,
-        m_min: float = 10.0,
+        m_min: float = 0.0,
         lambda_T: Optional[float | torch.Tensor] = None,
         delta_complexity: float | torch.Tensor = 1.0,
         tau_age: float = 20.0,

@@ -42,6 +42,7 @@ class TrainingLifecycleMixin:
         self.tree.episodic_memory.configure_prototype_memory(
             duplicate_threshold=self.wake_config.prototype_duplicate_threshold,
             mode_threshold=self.wake_config.prototype_mode_threshold,
+            duplicate_quantile=self.wake_config.prototype_duplicate_quantile,
             mode_capacity=self.wake_config.prototype_mode_capacity,
             context_alias_capacity=(
                 self.wake_config.prototype_context_alias_capacity
@@ -177,6 +178,10 @@ class TrainingLifecycleMixin:
             )
         if self.sleep_config.deep_evidence_budget <= 0:
             raise ValueError("deep_evidence_budget must be positive")
+        if self.sleep_config.split_min_replay_per_group < 0:
+            raise ValueError(
+                "split_min_replay_per_group must be non-negative"
+            )
         if self.sleep_config.deep_availability_tau <= 0.0:
             raise ValueError("deep_availability_tau must be positive")
         if not 0.0 <= self.sleep_config.deep_accumulator_decay < 1.0:
@@ -358,6 +363,9 @@ class TrainingLifecycleMixin:
             "last_deep_epoch": 0,
             "deep_cycle_count": 0,
             "structural_demand_ema": 0.0,
+            # Persistent Bank structural evidence has its own snapshot.  The
+            # legacy split_queue_snapshot remains a controller diagnostic.
+            "split_mass_snapshot": {},
             "split_queue_snapshot": {},
             "accepted_writes_since_sleep": 0,
             "structural_mass_since_sleep": 0.0,

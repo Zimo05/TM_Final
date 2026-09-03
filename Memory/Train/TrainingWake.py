@@ -32,7 +32,9 @@ class TrainingWakeMixin:
         prediction_total = torch.zeros((), device=self.device)
         wm_penalty_total = torch.zeros((), device=self.device)
         write_penalty_total = torch.zeros((), device=self.device)
-        write_count = 0
+        accepted_write_count = 0
+        append_count = 0
+        refresh_count = 0
         write_decision_count = 0
         memorize_count = 0
         queue_split_count = 0
@@ -522,21 +524,29 @@ class TrainingWakeMixin:
         # Physical memory mutation follows causal sequence order.  Ranking
         # decides *which* rows survive the per-sequence budget; it does not
         # reorder the committed transaction.
-        persistent_writes = selected_writes
+        persistent_writes = []
         selected_writes.sort(
             key=lambda request: int(request["event_index"])
         )
         if not self.training_config.controller_only_finetune:
-            persistent_flags = self._commit_write_requests_batch(
-                sequence, selected_writes
+            admission_actions = self._commit_write_requests_batch(
+                sequence,
+                selected_writes,
+                return_actions=True,
             )
             persistent_writes = [
                 request
-                for request, persistent in zip(
-                    selected_writes, persistent_flags
+                for request, action in zip(
+                    selected_writes, admission_actions
                 )
-                if persistent
+                if action != "queue"
             ]
+            append_count = sum(
+                action == "append" for action in admission_actions
+            )
+            refresh_count = sum(
+                action == "refresh" for action in admission_actions
+            )
             source_id = int(torch.as_tensor(
                 sequence.get(
                     "source_index",
@@ -595,10 +605,15 @@ class TrainingWakeMixin:
             self.controller_utility_replay.finalize_write_group(
                 int(torch.as_tensor(sequence.get("source_index", -1)).detach().cpu())
             )
-        # Selection/probe counts remain diagnostic, while accepted/write
-        # counts describe rows that actually became persistent prototypes.
+        # Selection/probe counts remain diagnostic.  An accepted write is a
+        # persistent admission transaction and may either append a new law
+        # prototype or refresh an existing one.
         write_decision_count = len(selected_writes)
-        write_count = len(persistent_writes)
+        accepted_write_count = append_count + refresh_count
+        # ``write_count`` is retained as a compatibility alias for callers
+        # written before the evidence/prototype distinction was exposed.
+        write_count = accepted_write_count
+        prototype_count, evidence_mass = self._persistent_memory_stats()
         pending_writes = incomplete_writes
         action_values = tuple(Action)
         action_index_values = (
@@ -653,6 +668,11 @@ class TrainingWakeMixin:
             "prediction_nll": prediction_total_value,
             "wm_penalty": wm_penalty_total_value,
             "write_penalty": write_penalty_total_value,
+            "accepted_write_count": accepted_write_count,
+            "append_count": append_count,
+            "refresh_count": refresh_count,
+            "prototype_count": prototype_count,
+            "evidence_mass": evidence_mass,
             "write_count": write_count,
             "write_decision_count": write_decision_count,
             "memorize_count": memorize_count,
@@ -663,10 +683,10 @@ class TrainingWakeMixin:
             "write_candidate_count": write_candidates,
             "write_priority_pass_count": write_decision_count,
             "write_window_complete_count": write_probe_count,
-            "write_accepted_count": write_count,
+            "write_accepted_count": accepted_write_count,
             "write_retrieved_later_count": 0,
             "write_beneficial_count": max(
-                write_count - sum(
+                accepted_write_count - sum(
                     float(request["window_evidence"]["write_utility"].detach().cpu()) <= 0.0
                     for request in persistent_writes
                 ),
@@ -1210,6 +1230,21 @@ class TrainingWakeMixin:
                     similarity_count_flat,
                 )
 
+                # Routing composition is affine in unconstrained parameter
+                # space.  Reduce the semantic and episodic expert axes once
+                # for the complete flat wavefront; the recurrent loop then
+                # only adds its causal working-memory row and retrieval gate.
+                semantic_base_flat = torch.einsum(
+                    "nkp,nk->np",
+                    memory_output_flat["frontier_semantic_theta"],
+                    memory_output_flat["r"],
+                )
+                episodic_base_flat = torch.einsum(
+                    "nkp,nk->np",
+                    memory_output_flat["frontier_episodic_delta"],
+                    memory_output_flat["r"],
+                )
+
                 node_to_leaf = torch.full(
                     (node_count,),
                     -1,
@@ -1254,7 +1289,6 @@ class TrainingWakeMixin:
                 if active.numel() == 0:
                     continue
                 flat_rows = offsets_tensor.index_select(0, active) + event_index
-                active_frontier = frontier_flat.index_select(flat_rows)
                 working_delta = self.tree.working_memory.make_trainable_rows(
                     working_state,
                     active,
@@ -1268,7 +1302,6 @@ class TrainingWakeMixin:
                         HAWKES_INTERVAL_STATS_KEY,
                     )
                 }
-                posterior = posterior_flat.index_select(0, flat_rows)
                 owner_indices = owner_indices_flat.index_select(0, flat_rows)
                 owner_confidence = owner_confidence_flat.index_select(
                     0,
@@ -1286,11 +1319,12 @@ class TrainingWakeMixin:
                 # The controller consumes the no-retrieval pre-action NLL.
                 # Do not evaluate the tree output's full-retrieval NLL here:
                 # the final Wake objective below uses only the gated result.
-                pre_action_effective = self._controller_effective_parameters(
-                    memory_output_flat,
-                    working_delta,
-                    working_delta.new_zeros(active.numel()),
-                    row_indices=flat_rows,
+                semantic_base = semantic_base_flat.index_select(0, flat_rows)
+                episodic_base = episodic_base_flat.index_select(0, flat_rows)
+                pre_action_theta = semantic_base + working_delta
+                pre_action_effective = self._effective_parameters_from_theta(
+                    pre_action_theta,
+                    detach=True,
                 )
                 pre_action_nll = self._batched_sequence_event_nll(
                     step_flat,
@@ -1325,17 +1359,19 @@ class TrainingWakeMixin:
                     "raw_probabilities",
                     action_probabilities,
                 )
-                gated_effective = self._controller_effective_parameters(
-                    memory_output_flat,
-                    working_delta,
-                    action_probabilities[:, 1],
-                    row_indices=flat_rows,
+                gated_theta = (
+                    pre_action_theta
+                    + action_probabilities[:, 1, None] * episodic_base
+                )
+                gated_effective = self._effective_parameters_from_theta(
+                    gated_theta,
+                    detach=True,
                 )
                 # This is the only prediction NLL used for Wake loss and the
                 # recurrent working-memory gradient at this time position.
-                prediction_nll = self._batched_sequence_event_nll(
+                prediction_nll, working_grad = self._batched_sequence_event_nll_and_grad(
                     step_flat,
-                    {"effective_params": gated_effective},
+                    gated_effective,
                 )
                 action_index = action_probabilities.detach().argmax(dim=-1)
                 wm_penalty = (
@@ -1353,11 +1389,6 @@ class TrainingWakeMixin:
                     wake_loss,
                     "batched wake objective became non-finite",
                 )
-                working_grad = torch.autograd.grad(
-                    prediction_nll.sum(),
-                    working_delta,
-                    retain_graph=False,
-                )[0]
                 gradient_norm = working_grad.detach().double().norm(dim=-1)
                 self.tree.working_memory.update_batch_rows(
                     working_state,
@@ -1365,32 +1396,6 @@ class TrainingWakeMixin:
                     working_grad,
                     adaptation_probability=action_probabilities[:, 0],
                 )
-
-                if not self.training_config.controller_only_finetune:
-                    if cycle_usage_credit is None:
-                        cycle_usage_credit = packed_memory_info_flat[
-                            "alpha"
-                        ].new_zeros(
-                            len(cycle_usage_node_ids),
-                            packed_memory_info_flat["alpha"].size(-1),
-                        )
-                    self.tree.episodic_memory.credit_retrieval_packed(
-                        alpha=packed_memory_info_flat["alpha"].index_select(
-                            0,
-                            flat_rows,
-                        ),
-                        visited_node_indices=active_frontier.visited_indices,
-                        visited_node_mask=active_frontier.visited_mask,
-                        path_incidence=active_frontier.path_incidence,
-                        routing_weights=posterior,
-                        retrieval_probability=action_probabilities[:, 1].detach(),
-                        node_ids=cycle_usage_node_ids,
-                        cycle_usage_accumulator=cycle_usage_credit,
-                    )
-                # Preserve a global event-count age clock while treating rows
-                # at the same wavefront position as simultaneous readers.
-                if not self.training_config.controller_only_finetune:
-                    self.tree.episodic_memory.step_age(active.numel())
 
                 prediction_total.index_add_(
                     0,
@@ -1475,6 +1480,27 @@ class TrainingWakeMixin:
                     ) < self.controller.exploration_rate,
                 )
 
+            # Retrieval credit is additive and independent of the causal
+            # working-memory transition.  Reduce all flat rows once after the
+            # wavefront instead of launching one packed contraction per time
+            # position.  The age clock follows the same event-count update.
+            if not self.training_config.controller_only_finetune:
+                cycle_usage_credit = packed_memory_info_flat["alpha"].new_zeros(
+                    len(cycle_usage_node_ids),
+                    packed_memory_info_flat["alpha"].size(-1),
+                )
+                self.tree.episodic_memory.credit_retrieval_packed(
+                    alpha=packed_memory_info_flat["alpha"],
+                    visited_node_indices=frontier_flat.visited_indices,
+                    visited_node_mask=frontier_flat.visited_mask,
+                    path_incidence=frontier_flat.path_incidence,
+                    routing_weights=posterior_flat,
+                    retrieval_probability=action_probability_flat[:, 1],
+                    node_ids=cycle_usage_node_ids,
+                    cycle_usage_accumulator=cycle_usage_credit,
+                )
+                self.tree.episodic_memory.step_age(cursor)
+
             action_probability_total.index_add_(
                 0,
                 sequence_index_flat,
@@ -1502,19 +1528,26 @@ class TrainingWakeMixin:
                 ),
             )
 
-        # The recurrent GPU phase is complete. Materialize the small set of
-        # Python objects required by delayed Adapt/Write selection in flat
-        # sequence order, reusing the full-batch static output for every row.
-        flat_sequence_rows = [
-            sequence_row
-            for sequence_row, length in enumerate(lengths)
-            for _ in range(length)
-        ]
-        flat_event_indices = [
-            event_index
-            for length in lengths
-            for event_index in range(length)
-        ]
+        # The recurrent GPU phase is complete.  The optimized v4/v5 path keeps
+        # delayed Adapt/Write candidates as a tensor-backed probe buffer.  No
+        # per-event Python request is created; only top-C probes cross the
+        # host boundary below.  The controller-only/v6 fallback retains its
+        # historical request objects because its disjoint future sampler is
+        # not yet packed.
+        if batched_write_path:
+            flat_sequence_rows = ()
+            flat_event_indices = ()
+        else:
+            flat_sequence_rows = [
+                sequence_row
+                for sequence_row, length in enumerate(lengths)
+                for _ in range(length)
+            ]
+            flat_event_indices = [
+                event_index
+                for length in lengths
+                for event_index in range(length)
+            ]
         owner_indices_cpu = owner_indices_flat.detach().cpu().tolist()
         action_indices_cpu = action_index_flat.detach().cpu().tolist()
         adapt_exploration_cpu = (
@@ -1528,14 +1561,49 @@ class TrainingWakeMixin:
         frontier_node_counts_cpu = (
             frontier_node_counts_tensor.detach().cpu().tolist()
         )
-        for flat_row, (sequence_row, event_index) in enumerate(zip(
-            flat_sequence_rows,
-            flat_event_indices,
-        )):
-            frontier_node_ids = frontier_rows[flat_row][0]
-            owner_id = node_ids[owner_indices_cpu[flat_row]]
-            action = action_values[action_indices_cpu[flat_row]]
-            if not batched_write_path:
+        probe_buffer: Optional[Dict[str, Tensor]] = None
+        if batched_write_path:
+            sequence_rows_tensor = sequence_index_flat
+            event_indices_tensor = (
+                torch.arange(cursor, device=self.device, dtype=torch.long)
+                - offsets_tensor.index_select(0, sequence_rows_tensor)
+            )
+            probe_buffer = {
+                "sequence_rows": sequence_rows_tensor,
+                "event_indices": event_indices_tensor,
+                "ready_indices": event_indices_tensor
+                + int(self.wake_config.write_horizon),
+                "queries": query_flat.detach(),
+                "frontier_node_indices": memory_output_flat[
+                    "frontier_node_indices"
+                ].detach(),
+                "frontier_mask": memory_output_flat["frontier_mask"].detach(),
+                "frontier_mass": memory_output_flat["frontier_mass"].detach(),
+                "frontier_theta": memory_output_flat["frontier_theta"].detach(),
+                # Delayed packing uses the raw policy probabilities, matching
+                # the scalar request builder's write/queue metadata.
+                "action_probabilities": raw_action_probability_flat.detach(),
+                "write_gate": raw_action_probability_flat[:, 2].detach(),
+                "novelty": novelty_flat.detach(),
+                "queue_weight": self.controller.queue_weight(
+                    raw_action_probability_flat
+                ).detach(),
+                "adapt_exploration": adapt_exploration_flat.detach(),
+                "write_exploration": write_exploration_flat.detach(),
+                "controller_inputs": controller_inputs_flat.detach(),
+                "assimilation_theta": assimilation_theta_flat.detach(),
+                "assimilation_grad": working_gradient_flat.detach(),
+                "owner_indices": owner_indices_flat.detach(),
+            }
+            write_candidates = [int(length) for length in lengths]
+        else:
+            for flat_row, (sequence_row, event_index) in enumerate(zip(
+                flat_sequence_rows,
+                flat_event_indices,
+            )):
+                frontier_node_ids = frontier_rows[flat_row][0]
+                owner_id = node_ids[owner_indices_cpu[flat_row]]
+                action = action_values[action_indices_cpu[flat_row]]
                 write_probe_contexts[sequence_row].append(
                     self._write_probe_context(
                         event_index=event_index,
@@ -1549,50 +1617,40 @@ class TrainingWakeMixin:
                         no_write_theta=assimilation_theta_flat[flat_row],
                     )
                 )
-            controller_inputs = {
-                name: controller_inputs_flat[flat_row, index]
-                for index, name in enumerate(controller_input_names)
-            }
-            request = self._make_write_request(
-                event_index,
-                owner_id,
-                query_flat[flat_row],
-                novelty_flat[flat_row],
-                memory_output_flat,
-                action_probability_flat[flat_row],
-                action_index_flat[flat_row],
-                posterior_flat[flat_row],
-                frontier_node_ids=frontier_node_ids,
-                hard_action=action,
-                batch_index=flat_row,
-                controller_inputs=controller_inputs,
-                assimilation_theta=assimilation_theta_flat[flat_row],
-                assimilation_grad=working_gradient_flat[flat_row],
-                future_contexts=(
-                    None
-                    if batched_write_path
-                    else write_probe_contexts[sequence_row]
-                ),
-                raw_action_probabilities=raw_action_probability_flat[
-                    flat_row
-                ],
-                exploration=(
-                    write_exploration_flat[flat_row].detach().clone()
-                    if batched_write_path
-                    else bool(write_exploration_cpu[flat_row])
-                ),
-                controller_version=controller_version,
-            )
-            request["_sequence_row"] = sequence_row
-            adapt_request = dict(request)
-            adapt_request["exploration"] = (
-                adapt_exploration_flat[flat_row].detach().clone()
-                if batched_write_path
-                else bool(adapt_exploration_cpu[flat_row])
-            )
-            adapt_probes[sequence_row].append(adapt_request)
-            pending_writes[sequence_row].append(request)
-            write_candidates[sequence_row] += 1
+                controller_inputs = {
+                    name: controller_inputs_flat[flat_row, index]
+                    for index, name in enumerate(controller_input_names)
+                }
+                request = self._make_write_request(
+                    event_index,
+                    owner_id,
+                    query_flat[flat_row],
+                    novelty_flat[flat_row],
+                    memory_output_flat,
+                    action_probability_flat[flat_row],
+                    action_index_flat[flat_row],
+                    posterior_flat[flat_row],
+                    frontier_node_ids=frontier_node_ids,
+                    hard_action=action,
+                    batch_index=flat_row,
+                    controller_inputs=controller_inputs,
+                    assimilation_theta=assimilation_theta_flat[flat_row],
+                    assimilation_grad=working_gradient_flat[flat_row],
+                    future_contexts=write_probe_contexts[sequence_row],
+                    raw_action_probabilities=raw_action_probability_flat[
+                        flat_row
+                    ],
+                    exploration=bool(write_exploration_cpu[flat_row]),
+                    controller_version=controller_version,
+                )
+                request["_sequence_row"] = sequence_row
+                adapt_request = dict(request)
+                adapt_request["exploration"] = bool(
+                    adapt_exploration_cpu[flat_row]
+                )
+                adapt_probes[sequence_row].append(adapt_request)
+                pending_writes[sequence_row].append(request)
+                write_candidates[sequence_row] += 1
 
         assignment_counts = []
         action_counts = []
@@ -1646,7 +1704,9 @@ class TrainingWakeMixin:
 
         # Commit persistent writes only after the read-only wavefront
         # transaction is complete. Sequence order is deterministic here.
-        write_counts = [0 for _ in range(batch_size)]
+        accepted_write_counts = [0 for _ in range(batch_size)]
+        append_counts = [0 for _ in range(batch_size)]
+        refresh_counts = [0 for _ in range(batch_size)]
         write_decision_counts = [0 for _ in range(batch_size)]
         write_probe_counts = [0 for _ in range(batch_size)]
         write_gate_pass_counts = [0 for _ in range(batch_size)]
@@ -1657,20 +1717,24 @@ class TrainingWakeMixin:
         if batched_write_path:
             if padded_wake is None:
                 raise RuntimeError("batched Wake cache was not prepared")
-            # Adapt utility has the same candidate/request packing as Write;
-            # perform all selected future-window evaluations in one call.
-            all_adapt_requests = [
-                request
-                for requests in adapt_probes
-                for request in requests
-            ]
-            selected_adapt, adapt_packed = self._select_probe_requests_batch(
-                all_adapt_requests,
+            if probe_buffer is None:
+                raise RuntimeError("batched Wake probe buffer was not prepared")
+            # Adapt utility has the same candidate packing as Write; perform
+            # selection and all future-window evaluations on device.  Python
+            # metadata is materialized only for the selected top-C rows.
+            selected_adapt_indices, adapt_packed = self._select_probe_buffer_batch(
+                probe_buffer,
                 topc=self.wake_config.controller_adapt_probe_topc,
                 score="adapt",
                 sequence_count=batch_size,
+                exploration_key="adapt",
             )
-            if selected_adapt:
+            selected_adapt = self._materialize_probe_requests_batch(
+                probe_buffer,
+                selected_adapt_indices,
+                exploration_key="adapt",
+            )
+            if selected_adapt_indices.numel():
                 self._record_adapt_utility_batch(
                     sequences,
                     selected_adapt,
@@ -1679,15 +1743,26 @@ class TrainingWakeMixin:
                 )
             write_summary = self._finalize_write_probe_batch(
                 sequences,
-                pending_writes,
+                probe_buffer,
                 lengths,
                 padded_wake,
                 frontier_static_cache.semantic_theta_table,
                 controller_version=controller_version,
             )
-            write_counts = write_summary["write_counts"]
+            accepted_write_counts = write_summary.get(
+                "accepted_write_counts",
+                write_summary["write_counts"],
+            )
+            append_counts = write_summary.get(
+                "append_counts",
+                [0 for _ in range(batch_size)],
+            )
+            refresh_counts = write_summary.get(
+                "refresh_counts",
+                [0 for _ in range(batch_size)],
+            )
             write_decision_counts = write_summary.get(
-                "write_decision_counts", list(write_counts)
+                "write_decision_counts", list(accepted_write_counts)
             )
             write_probe_counts = write_summary["write_probe_counts"]
             write_gate_pass_counts = write_summary[
@@ -1781,16 +1856,24 @@ class TrainingWakeMixin:
                     ]
                 else:
                     selected = []
-                persistent_selected = selected
+                persistent_selected = []
                 if not self.training_config.controller_only_finetune:
-                    persistent_flags = self._commit_write_requests_batch(
-                        sequence, selected
+                    admission_actions = self._commit_write_requests_batch(
+                        sequence,
+                        selected,
+                        return_actions=True,
                     )
                     persistent_selected = [
                         request
-                        for request, persistent in zip(selected, persistent_flags)
-                        if persistent
+                        for request, action in zip(selected, admission_actions)
+                        if action != "queue"
                     ]
+                    append_counts[row] = sum(
+                        action == "append" for action in admission_actions
+                    )
+                    refresh_counts[row] = sum(
+                        action == "refresh" for action in admission_actions
+                    )
                     source_id = int(torch.as_tensor(
                         sequence.get("source_index", row)
                     ).detach().cpu())
@@ -1855,7 +1938,9 @@ class TrainingWakeMixin:
                 # not a persistent write yet. Keep decision/probe/gate
                 # diagnostics on their pre-admission masks, but report
                 # accepted/write metrics from the actual admission result.
-                write_counts[row] = len(persistent_selected)
+                accepted_write_counts[row] = (
+                    append_counts[row] + refresh_counts[row]
+                )
                 write_decision_counts[row] = len(selected)
                 accepted_write_utility_sums[row] = sum(
                     float(
@@ -1915,6 +2000,7 @@ class TrainingWakeMixin:
         ).cpu().tolist()
         gate_activation_total_cpu = gate_activation_total.detach().cpu().tolist()
 
+        prototype_count, evidence_mass = self._persistent_memory_stats()
         results = []
         for row, values in enumerate(metric_matrix):
             (
@@ -1938,7 +2024,13 @@ class TrainingWakeMixin:
                 "prediction_nll": prediction_value,
                 "wm_penalty": wm_value,
                 "write_penalty": write_penalty_value,
-                "write_count": write_counts[row],
+                "accepted_write_count": accepted_write_counts[row],
+                "append_count": append_counts[row],
+                "refresh_count": refresh_counts[row],
+                "prototype_count": prototype_count,
+                "evidence_mass": evidence_mass,
+                # Compatibility alias for the pre-split metric name.
+                "write_count": accepted_write_counts[row],
                 "write_decision_count": write_decision_counts[row],
                 "memorize_count": action_counts[row][
                     Action.MEMORIZE.value
@@ -1952,10 +2044,10 @@ class TrainingWakeMixin:
                 "write_candidate_count": write_candidates[row],
                 "write_priority_pass_count": write_decision_counts[row],
                 "write_window_complete_count": write_probe_counts[row],
-                "write_accepted_count": write_counts[row],
+                "write_accepted_count": accepted_write_counts[row],
                 "write_retrieved_later_count": 0,
                 "write_beneficial_count": max(
-                    write_counts[row] - harmful_write_counts[row], 0
+                    accepted_write_counts[row] - harmful_write_counts[row], 0
                 ),
                 "queue_split_count": action_counts[row][
                     Action.QUEUE_SPLIT.value

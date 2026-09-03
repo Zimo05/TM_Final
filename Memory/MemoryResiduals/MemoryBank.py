@@ -45,7 +45,11 @@ class MemoryItem:
 
 
 def _signed_hash_projection(feature: Tensor, output_dim: int) -> Tensor:
-    """Deterministically project a physical-law feature without parameters."""
+    """Legacy projection helper retained for old imports/checkpoints.
+
+    New law identities never call this function; they preserve every basis
+    coordinate in ``effective_hawkes_law_key`` below.
+    """
     if feature.ndim == 0:
         raise ValueError("feature must have at least one dimension")
     feature_dim = feature.size(-1)
@@ -76,14 +80,21 @@ def effective_hawkes_law_key(
     *,
     num_event_types: int,
     num_basis: int,
-    key_dim: int,
+    key_dim: Optional[int] = None,
 ) -> Tensor:
-    """Identity of the effective physical Hawkes law.
+    """Return a basis-preserving identity of the effective physical law.
 
     The key is derived from ``semantic_theta + delta_theta`` after mapping the
     unconstrained baseline and kernels to physical parameters.  Consequently
     a Light-Sleep semantic rebase that preserves the effective law also
-    preserves this identity.
+    preserves this identity.  Every basis slice remains in the feature, so
+    fast/slow excitation allocations cannot collapse to the same identity
+    merely because their integrated sums agree.
+
+    ``key_dim`` is retained as an ignored compatibility keyword for callers
+    written against the old signed-hash implementation.  Law identities now
+    always have the physical feature width
+    ``D + D * D * M``; retrieval/context keys keep their own ``key_dim``.
     """
     expected = num_event_types + num_event_types * num_event_types * num_basis
     semantic = semantic_theta.detach()
@@ -111,13 +122,13 @@ def effective_hawkes_law_key(
         *batch_shape, num_event_types, num_event_types, num_basis
     )
     mu = F.softplus(raw_mu)
-    integrated_excitation = (
-        F.softplus(raw_w) / decay.reshape(*((1,) * len(batch_shape)), 1, 1, -1)
-    ).sum(-1)
-    return _signed_hash_projection(
-        torch.cat([mu, integrated_excitation.reshape(*batch_shape, -1)], dim=-1),
-        key_dim,
+    excitation_by_basis = F.softplus(raw_w) / decay.reshape(
+        *((1,) * len(batch_shape)), 1, 1, -1
     )
+    law_feature = torch.cat(
+        [mu, excitation_by_basis.reshape(*batch_shape, -1)], dim=-1
+    )
+    return F.normalize(law_feature, dim=-1)
 
 
 @dataclass
@@ -955,12 +966,25 @@ class MemoryBank:
         key_dim: int,
         param_dim: int,
         capacity: int = 128,
+        law_dim: Optional[int] = None,
     ):
         if capacity <= 0:
             raise ValueError("capacity must be positive")
+        if key_dim <= 0:
+            raise ValueError("key_dim must be positive")
+        if param_dim <= 0:
+            raise ValueError("param_dim must be positive")
 
         self.key_dim = key_dim
         self.param_dim = param_dim
+        # Law identity is intentionally independent from retrieval/context
+        # identity.  Standalone legacy banks with a wider retrieval key keep
+        # that width by default, while the common Hawkes case (``param_dim``
+        # wider than ``key_dim``) naturally gets the full physical width.  The
+        # tree adapter supplies the physical Hawkes feature width explicitly.
+        self.law_dim = max(key_dim, param_dim) if law_dim is None else int(law_dim)
+        if self.law_dim <= 0:
+            raise ValueError("law_dim must be positive")
         self.capacity = capacity
         self.device = torch.device(device)
 
@@ -986,7 +1010,7 @@ class MemoryBank:
         # Prototype/mode state.  ``keys`` remain the retrieval (context)
         # identity; ``law_keys`` are used only for duplicate and dynamics-mode
         # matching.
-        self.law_keys = torch.empty(0, key_dim, device=self.device)
+        self.law_keys = torch.empty(0, self.law_dim, device=self.device)
         self.support = torch.empty(0, device=self.device)
         self.quality_mass = torch.empty(0, device=self.device)
         self.split_mass = torch.empty(0, device=self.device)
@@ -1009,7 +1033,10 @@ class MemoryBank:
         # determine both radii.
         self.adaptive_history_size = 64
         self.adaptive_min_samples = 8
-        self.duplicate_quantile = 0.90
+        # Accepted-sample calibrated duplicate radius.  The lower quantile
+        # keeps the duplicate gate from inheriting the upper-tail bias caused
+        # by its own admission censoring.
+        self.duplicate_quantile = 0.80
         self.mode_quantile = 0.95
         self.radius_margin = 1e-3
         self.gain_quantile = 0.95
@@ -1111,6 +1138,10 @@ class MemoryBank:
 
     def __setstate__(self, state) -> None:
         self.__dict__.update(state)
+        if not hasattr(self, "law_dim"):
+            # Banks pickled before law/context identities were separated used
+            # ``key_dim`` for both tensors.
+            self.law_dim = int(getattr(self, "key_dim", 0))
         self._ensure_storage_metadata()
         # Directly pickled banks bypass ``TreeEpisodicMemory.set_extra_state``.
         # Migrate those legacy ``keys``-only payloads at load time as well, so
@@ -1275,7 +1306,7 @@ class MemoryBank:
         retention_age_weight: float = 0.1,
         adaptive_history_size: int = 64,
         adaptive_min_samples: int = 8,
-        duplicate_quantile: float = 0.90,
+        duplicate_quantile: float = 0.80,
         mode_quantile: float = 0.95,
         radius_margin: float = 1e-3,
         gain_quantile: float = 0.95,
@@ -1352,11 +1383,96 @@ class MemoryBank:
         self._trim_adaptive_histories()
 
     @torch.no_grad()
+    def _normalize_law_keys(
+        self,
+        law_keys: Tensor,
+        *,
+        batch_size: Optional[int] = None,
+        name: str = "law_key",
+    ) -> Tensor:
+        """Normalize law identities and migrate legacy retrieval-width vectors.
+
+        New tree banks store the full physical-law feature in ``law_dim``.
+        Older callers/checkpoints may still provide a retrieval key (or an
+        old law key) with ``key_dim`` values.  Padding/truncating that legacy
+        representation is only a load/API compatibility path; all newly
+        computed Hawkes identities already have the exact physical width.
+        """
+        if not torch.is_tensor(law_keys):
+            raise ValueError(f"{name} must be a tensor")
+        values = law_keys.detach().to(
+            device=self.device,
+            dtype=self.keys.dtype,
+        )
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        if values.ndim != 2:
+            raise ValueError(
+                f"{name} must have shape [B, {self.law_dim}], "
+                f"got {tuple(values.shape)}"
+            )
+        if batch_size is not None and values.size(0) != int(batch_size):
+            raise ValueError(
+                f"{name} must have {int(batch_size)} rows, got {values.size(0)}"
+            )
+        width = int(values.size(-1))
+        if width != self.law_dim:
+            # ``key_dim`` is the only legacy identity width used by the
+            # previous implementation.  ``param_dim`` is accepted as well
+            # for intermediate checkpoints that briefly stored raw law
+            # features without an explicit ``law_dim`` field.
+            if width not in {self.key_dim, self.param_dim}:
+                raise ValueError(
+                    f"{name} must contain {self.law_dim} values "
+                    f"(legacy widths: {self.key_dim}, {self.param_dim}); "
+                    f"got {width}"
+                )
+            migrated = values.new_zeros(values.size(0), self.law_dim)
+            copy_width = min(width, self.law_dim)
+            if copy_width:
+                migrated[:, :copy_width] = values[:, :copy_width]
+            values = migrated
+        return F.normalize(values, dim=-1)
+
+    @torch.no_grad()
     def _ensure_prototype_state(self) -> None:
         """Repair old checkpoints and topology operations lazily."""
         count = len(self)
-        if self.law_keys.shape != (count, self.key_dim):
-            self.law_keys = self.keys.detach().clone()
+        law_dim = int(getattr(self, "law_dim", self.key_dim))
+        if law_dim <= 0:
+            law_dim = int(self.key_dim)
+            self.law_dim = law_dim
+        stored_law_keys = getattr(self, "law_keys", None)
+        law_keys = None
+        if (
+            torch.is_tensor(stored_law_keys)
+            and stored_law_keys.ndim == 2
+            and stored_law_keys.size(0) == count
+            and stored_law_keys.size(1) == law_dim
+        ):
+            law_keys = stored_law_keys.to(
+                device=self.keys.device,
+                dtype=self.keys.dtype,
+            )
+        elif torch.is_tensor(stored_law_keys) and stored_law_keys.ndim == 2:
+            try:
+                migrated_law_keys = self._normalize_law_keys(stored_law_keys)
+                if migrated_law_keys.shape == (count, law_dim):
+                    law_keys = migrated_law_keys
+            except ValueError:
+                law_keys = None
+        if law_keys is None:
+            # A legacy ``keys``-only row has no recoverable physical-law
+            # feature.  Keep it usable until the tree-level migration can
+            # rebuild it from semantic parameters.
+            law_keys = self._normalize_law_keys(self.keys, batch_size=count)
+        if (
+            not torch.is_tensor(getattr(self, "law_keys", None))
+            or self.law_keys.shape != (count, law_dim)
+            or self.law_keys.device != law_keys.device
+            or self.law_keys.dtype != law_keys.dtype
+        ):
+            self.law_keys = law_keys
         if self.support.shape != (count,):
             self.support = self.keys.new_ones(count)
         configured_capacity = getattr(self, "context_alias_capacity", None)
@@ -1483,7 +1599,7 @@ class MemoryBank:
         policy_defaults = {
             "adaptive_history_size": 64,
             "adaptive_min_samples": 8,
-            "duplicate_quantile": 0.90,
+            "duplicate_quantile": 0.80,
             "mode_quantile": 0.95,
             "radius_margin": 1e-3,
             "gain_quantile": 0.95,
@@ -1495,6 +1611,31 @@ class MemoryBank:
         for name, default in policy_defaults.items():
             if not hasattr(self, name):
                 setattr(self, name, default)
+        # Pending candidates in an old checkpoint can carry retrieval-width
+        # identities.  Migrate them before any candidate similarity is
+        # evaluated; an unconvertible malformed record is safely discarded.
+        for mode_id, candidates in list(
+            getattr(self, "_mode_pending_candidates", {}).items()
+        ):
+            migrated_candidates = []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_law = candidate.get("law_key")
+                if not torch.is_tensor(candidate_law):
+                    continue
+                try:
+                    candidate_law = self._normalize_law_keys(candidate_law).reshape(-1)
+                except ValueError:
+                    continue
+                migrated = dict(candidate)
+                migrated["law_key"] = candidate_law
+                migrated_candidates.append(migrated)
+            if migrated_candidates:
+                self._mode_pending_candidates[int(mode_id)] = migrated_candidates
+                self._sync_legacy_pending_state(int(mode_id))
+            else:
+                self._mode_pending_candidates.pop(int(mode_id), None)
 
     @torch.no_grad()
     def _sync_legacy_key(self, index: int) -> None:
@@ -2103,6 +2244,11 @@ class MemoryBank:
             refreshed_law = law_key_builder(self.deltas[index])
         else:
             refreshed_law = (1.0 - beta) * self.law_keys[index] + beta * law_key.reshape(-1)
+        refreshed_law = self._normalize_law_keys(
+            refreshed_law,
+            batch_size=1,
+            name="refreshed law_key",
+        ).reshape(-1)
         self.law_keys[index] = F.normalize(
             refreshed_law.detach().reshape(1, -1).to(self.law_keys), dim=-1
         ).reshape(-1)
@@ -2217,6 +2363,11 @@ class MemoryBank:
                 (normalized[:, None] * self.law_keys[indices]).sum(0, keepdim=True),
                 dim=-1,
             ).reshape(-1)
+        compressed_law = self._normalize_law_keys(
+            compressed_law,
+            batch_size=1,
+            name="compressed law_key",
+        ).reshape(-1)
         total_support = support.sum()
         support_average = support / total_support.clamp_min(1.0)
         self.keys[target] = compressed_key
@@ -2477,23 +2628,11 @@ class MemoryBank:
                 law_keys = keys
             else:
                 law_keys = law_key_builder(deltas)
-        else:
-            law_keys = law_keys.detach().to(
-                device=self.device,
-                dtype=self.keys.dtype,
-            )
-        if law_keys.ndim == 1:
-            if batch_size != 1 or law_keys.numel() != self.key_dim:
-                raise ValueError(
-                    f"law_keys must have shape [B, {self.key_dim}]"
-                )
-            law_keys = law_keys.reshape(1, -1)
-        if law_keys.shape != (batch_size, self.key_dim):
-            raise ValueError(
-                f"law_keys must have shape {(batch_size, self.key_dim)}, "
-                f"got {tuple(law_keys.shape)}"
-            )
-        law_keys = F.normalize(law_keys, dim=-1)
+        law_keys = self._normalize_law_keys(
+            law_keys,
+            batch_size=batch_size,
+            name="law_keys",
+        )
         if not bool(
             torch.isfinite(keys).all()
             & torch.isfinite(deltas).all()
@@ -2595,17 +2734,19 @@ class MemoryBank:
         # still flow through the differentiable retrieval weights.
         key = F.normalize(key.detach().reshape(1, -1), dim=-1)
         delta_theta = delta_theta.detach().reshape(1, -1)
+        if law_key is None and law_key_builder is not None:
+            law_key = law_key_builder(delta_theta.reshape(-1))
         if law_key is None:
             law_key = key.reshape(-1)
-        law_key = F.normalize(
-            law_key.detach().reshape(1, -1).to(device=self.device, dtype=self.keys.dtype),
-            dim=-1,
+        law_key = self._normalize_law_keys(
+            law_key,
+            batch_size=1,
+            name="law_key",
         )
-        if law_key.shape != (1, self.key_dim):
-            raise ValueError(f"law_key must contain {self.key_dim} values")
         memory_values_finite = (
             torch.isfinite(key).all()
             & torch.isfinite(delta_theta).all()
+            & torch.isfinite(law_key).all()
         )
         if not bool(memory_values_finite):
             raise FloatingPointError(
@@ -3014,6 +3155,7 @@ class MemoryBank:
         if (
             self.key_dim != source.key_dim
             or self.param_dim != source.param_dim
+            or self.law_dim != source.law_dim
             or target_alias_capacity != source_alias_capacity
         ):
             raise ValueError("source and target MemoryBank dimensions must match")

@@ -53,6 +53,14 @@ class TreeEpisodicMemory(nn.Module):
             num_basis=num_basis,
         )
         self.param_dim = self.parameter_update.param_dim
+        # Hawkes-law identity uses the complete physical parameter feature;
+        # retrieval/context identities remain ``key_dim`` wide.  Keep this
+        # expression explicit so the law-key width follows the configured
+        # event/basis geometry (``D + D * D * M``), rather than any example
+        # configuration's resulting constant.
+        D = self.parameter_update.D
+        M = self.parameter_update.M
+        self.law_dim = int(D + D * D * M)
         self._prototype_policy = {
             "duplicate_threshold": 0.98,
             "mode_threshold": 0.90,
@@ -65,7 +73,7 @@ class TreeEpisodicMemory(nn.Module):
             "retention_age_weight": 0.1,
             "adaptive_history_size": 64,
             "adaptive_min_samples": 8,
-            "duplicate_quantile": 0.90,
+            "duplicate_quantile": 0.80,
             "mode_quantile": 0.95,
             "radius_margin": 1e-3,
             "gain_quantile": 0.95,
@@ -299,6 +307,7 @@ class TreeEpisodicMemory(nn.Module):
                 key_dim=self.key_dim,
                 param_dim=self.param_dim,
                 capacity=self.capacity_per_node,
+                law_dim=self.law_dim,
             )
             bank.configure_prototype_policy(**self._prototype_policy)
             bank._age_reference_clock = self._age_clock
@@ -318,6 +327,7 @@ class TreeEpisodicMemory(nn.Module):
                 key_dim=self.key_dim,
                 param_dim=self.param_dim,
                 capacity=self.capacity_per_node,
+                law_dim=self.law_dim,
             )
         validator.configure_prototype_policy(**merged)
         self._prototype_policy = merged

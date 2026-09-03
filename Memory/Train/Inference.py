@@ -123,6 +123,7 @@ class MemoryTreeInference:
                 if self.config.prototype_mode_threshold is None
                 else self.config.prototype_mode_threshold
             ),
+            duplicate_quantile=self.wake_config.prototype_duplicate_quantile,
             mode_capacity=self.wake_config.prototype_mode_capacity,
             context_alias_capacity=(
                 self.wake_config.prototype_context_alias_capacity

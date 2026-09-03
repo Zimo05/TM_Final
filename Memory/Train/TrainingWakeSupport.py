@@ -6,6 +6,26 @@ from Train.TrainingComponents import *  # noqa: F403
 
 
 class TrainingWakeSupportMixin:
+    def _persistent_memory_stats(self) -> tuple[int, float]:
+        """Return resident prototype count and evidence mass.
+
+        A physical bank row is a prototype/storage identity.  Repeated
+        accepted observations may refresh that row, so ``support`` is the
+        evidence mass and must not be confused with the number of rows.
+        Values are aggregated across the currently resident node-local banks
+        for use by Wake/training diagnostics.
+        """
+        prototype_count = 0
+        evidence_mass = 0.0
+        for bank in self.tree.episodic_memory.banks.values():
+            count = len(bank)
+            prototype_count += count
+            if count:
+                evidence_mass += float(
+                    bank.support[:count].detach().sum().cpu()
+                )
+        return prototype_count, evidence_mass
+
     def _controller_effective_parameters(
         self,
         memory_output: Mapping[str, Any],
@@ -1150,6 +1170,154 @@ class TrainingWakeSupportMixin:
             return [], {}
         return selected_requests, self._pack_probe_requests(selected_requests)
 
+    def _pack_probe_buffer(
+        self,
+        buffer: Mapping[str, Tensor],
+        indices: Tensor,
+        *,
+        exploration_key: str,
+    ) -> Dict[str, Tensor]:
+        """Pack a tensor-backed probe buffer for a selected subset.
+
+        The wavefront keeps one row per event entirely on device.  This is the
+        tensor analogue of ``_pack_probe_requests``: it deliberately contains
+        no Python request dictionaries, strings, or detached per-event
+        objects.  Only the final top-C rows are materialized at the host
+        boundary by ``_materialize_probe_requests_batch`` when replay metadata
+        is needed.
+        """
+        if indices.ndim != 1 or indices.dtype != torch.long:
+            raise ValueError("probe indices must be a one-dimensional long tensor")
+        if indices.numel() == 0:
+            return {}
+        exploration = buffer[f"{exploration_key}_exploration"]
+        return {
+            "sequence_rows": buffer["sequence_rows"].index_select(0, indices),
+            "event_indices": buffer["event_indices"].index_select(0, indices),
+            "queries": buffer["queries"].index_select(0, indices),
+            "frontier_node_indices": buffer["frontier_node_indices"].index_select(0, indices),
+            "frontier_mask": buffer["frontier_mask"].index_select(0, indices),
+            "frontier_mass": buffer["frontier_mass"].index_select(0, indices),
+            "frontier_theta": buffer["frontier_theta"].index_select(0, indices),
+            "action_probabilities": buffer["action_probabilities"].index_select(0, indices),
+            "write_gate": buffer["write_gate"].index_select(0, indices),
+            "novelty": buffer["novelty"].index_select(0, indices),
+            "queue_weight": buffer["queue_weight"].index_select(0, indices),
+            "exploration": exploration.index_select(0, indices),
+            "controller_inputs": buffer["controller_inputs"].index_select(0, indices),
+            "assimilation_theta": buffer["assimilation_theta"].index_select(0, indices),
+            "assimilation_grad": buffer["assimilation_grad"].index_select(0, indices),
+        }
+
+    def _select_probe_buffer_batch(
+        self,
+        buffer: Mapping[str, Tensor],
+        *,
+        topc: int,
+        score: str,
+        sequence_count: int,
+        exploration_key: str,
+        eligible_mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Dict[str, Tensor]]:
+        """Select top-C tensor rows plus exploration without host objects."""
+        if score not in {"adapt", "write"}:
+            raise ValueError("probe score must be 'adapt' or 'write'")
+        sequence_rows = buffer["sequence_rows"]
+        exploration = buffer[f"{exploration_key}_exploration"].to(torch.bool)
+        if eligible_mask is None:
+            eligible_mask = torch.ones_like(exploration)
+        else:
+            eligible_mask = eligible_mask.to(device=exploration.device, dtype=torch.bool)
+            if eligible_mask.shape != exploration.shape:
+                raise ValueError("probe eligibility must align with buffer rows")
+        selected = exploration & eligible_mask
+        values = (
+            buffer["action_probabilities"][:, 0]
+            if score == "adapt"
+            else buffer["write_gate"] * buffer["novelty"]
+        )
+        for sequence_row in range(int(sequence_count)):
+            candidates = torch.nonzero(
+                (sequence_rows == sequence_row)
+                & eligible_mask
+                & ~exploration,
+                as_tuple=False,
+            ).flatten()
+            if candidates.numel() == 0:
+                continue
+            order = torch.argsort(
+                values.index_select(0, candidates),
+                descending=True,
+                stable=True,
+            )
+            selected[candidates.index_select(0, order[: int(topc)])] = True
+        selected_indices = torch.nonzero(selected, as_tuple=False).flatten()
+        if selected_indices.numel() == 0:
+            return selected_indices, {}
+        return selected_indices, self._pack_probe_buffer(
+            buffer,
+            selected_indices,
+            exploration_key=exploration_key,
+        )
+
+    def _materialize_probe_requests_batch(
+        self,
+        buffer: Mapping[str, Tensor],
+        indices: Tensor,
+        *,
+        exploration_key: str,
+    ) -> list[Dict[str, Any]]:
+        """Materialize only selected probe metadata at the Python boundary."""
+        if indices.numel() == 0:
+            return []
+        names = (
+            "surprise", "novelty", "count", "owner_confidence",
+            "retrieval_similarity", "retrieval_residual_norm",
+            "working_memory_norm", "pending_write_ratio",
+        )
+        selected_cpu = indices.detach().cpu().tolist()
+        sequence_rows = buffer["sequence_rows"].index_select(0, indices)
+        event_indices = buffer["event_indices"].index_select(0, indices)
+        owner_indices = buffer["owner_indices"].index_select(0, indices)
+        exploration = buffer[f"{exploration_key}_exploration"].index_select(
+            0, indices
+        )
+        requests: list[Dict[str, Any]] = []
+        for local_row, source_index in enumerate(selected_cpu):
+            sequence_row = int(sequence_rows[local_row].detach().cpu())
+            event_index = int(event_indices[local_row].detach().cpu())
+            owner_index = int(owner_indices[local_row].detach().cpu())
+            controller_inputs = {
+                name: buffer["controller_inputs"][source_index, column]
+                .detach()
+                .clone()
+                for column, name in enumerate(names)
+            }
+            requests.append({
+                "_sequence_row": sequence_row,
+                "event_index": event_index,
+                "ready_index": int(
+                    buffer["ready_indices"][source_index].detach().cpu()
+                ),
+                "provisional_owner_id": self.tree.all_node_ids[owner_index],
+                "query": buffer["queries"][source_index].detach().clone(),
+                "action_probabilities": buffer["action_probabilities"][source_index]
+                .detach()
+                .clone(),
+                "write_gate": buffer["write_gate"][source_index].detach().clone(),
+                "novelty": buffer["novelty"][source_index].detach().clone(),
+                "queue_weight": buffer["queue_weight"][source_index].detach().clone(),
+                "controller_inputs": controller_inputs,
+                "assimilation_theta": buffer["assimilation_theta"][source_index]
+                .detach()
+                .clone(),
+                "assimilation_grad": buffer["assimilation_grad"][source_index]
+                .detach()
+                .clone(),
+                "exploration": bool(exploration[local_row].detach().cpu()),
+            })
+        return requests
+
     def _batched_window_event_nll(
         self,
         theta: Tensor,
@@ -1358,7 +1526,7 @@ class TrainingWakeSupportMixin:
     def _finalize_write_probe_batch(
         self,
         sequences: Sequence[Mapping[str, Tensor]],
-        pending_writes: Sequence[Sequence[Mapping[str, Any]]],
+        pending_writes: Sequence[Sequence[Mapping[str, Any]]] | Mapping[str, Tensor],
         lengths: Sequence[int],
         padded: Mapping[str, Tensor],
         semantic_theta_table: Tensor,
@@ -1384,41 +1552,62 @@ class TrainingWakeSupportMixin:
                     )
                 )
 
-        eligible = [
-            request
-            for row, requests in enumerate(pending_writes)
-            for request in requests
-            if int(request["ready_index"]) < int(lengths[row])
-        ]
-        incomplete_counts = [
-            sum(
-                int(request["ready_index"]) >= int(lengths[row])
-                for request in requests
+        tensor_buffer = isinstance(pending_writes, Mapping)
+        if tensor_buffer:
+            buffer = pending_writes
+            sequence_rows = buffer["sequence_rows"]
+            ready_indices = buffer["ready_indices"]
+            length_tensor = torch.as_tensor(
+                lengths,
+                device=sequence_rows.device,
+                dtype=sequence_rows.dtype,
+            ).index_select(0, sequence_rows)
+            eligible_mask = ready_indices < length_tensor
+            incomplete_counts = torch.bincount(
+                sequence_rows,
+                weights=(~eligible_mask).to(torch.float32),
+                minlength=batch_size,
+            ).to(torch.long).detach().cpu().tolist()
+            selected_indices, packed = self._select_probe_buffer_batch(
+                buffer,
+                topc=self.wake_config.controller_write_probe_topc,
+                score="write",
+                sequence_count=batch_size,
+                exploration_key="write",
+                eligible_mask=eligible_mask,
             )
-            for row, requests in enumerate(pending_writes)
-        ]
-        if not eligible:
-            finalize_write_groups()
-            return {
-                "write_counts": [0] * batch_size,
-                "write_decision_counts": [0] * batch_size,
-                "write_probe_counts": [0] * batch_size,
-                "write_gate_pass_counts": [0] * batch_size,
-                "write_utility_pass_counts": [0] * batch_size,
-                "accepted_write_utility_sums": [0.0] * batch_size,
-                "harmful_write_counts": [0] * batch_size,
-                "pending_counts": incomplete_counts,
-            }
-        probe_requests, packed = self._select_probe_requests_batch(
-            eligible,
-            topc=self.wake_config.controller_write_probe_topc,
-            score="write",
-            sequence_count=batch_size,
-        )
+            probe_requests = self._materialize_probe_requests_batch(
+                buffer,
+                selected_indices,
+                exploration_key="write",
+            )
+        else:
+            eligible = [
+                request
+                for row, requests in enumerate(pending_writes)
+                for request in requests
+                if int(request["ready_index"]) < int(lengths[row])
+            ]
+            incomplete_counts = [
+                sum(
+                    int(request["ready_index"]) >= int(lengths[row])
+                    for request in requests
+                )
+                for row, requests in enumerate(pending_writes)
+            ]
+            probe_requests, packed = self._select_probe_requests_batch(
+                eligible,
+                topc=self.wake_config.controller_write_probe_topc,
+                score="write",
+                sequence_count=batch_size,
+            )
         if not probe_requests:
             finalize_write_groups()
             return {
                 "write_counts": [0] * batch_size,
+                "accepted_write_counts": [0] * batch_size,
+                "append_counts": [0] * batch_size,
+                "refresh_counts": [0] * batch_size,
                 "write_decision_counts": [0] * batch_size,
                 "write_probe_counts": [0] * batch_size,
                 "write_gate_pass_counts": [0] * batch_size,
@@ -1602,6 +1791,9 @@ class TrainingWakeSupportMixin:
             for probe_index, item in zip(selected_cpu, selected_items)
         }
         persistent_selected = torch.zeros_like(selected)
+        append_counts = [0] * batch_size
+        refresh_counts = [0] * batch_size
+        sequence_rows_cpu = sequence_rows.detach().cpu().tolist()
         for owner_id, owner_items in grouped_items.items():
             reference = owner_items[0].key
             admission = self.tree.episodic_memory.add_memory_batch(
@@ -1636,9 +1828,20 @@ class TrainingWakeSupportMixin:
                 decays=self.hawkes.decays.detach(),
             )
             for item, result in zip(owner_items, admission):
-                persistent = result["action"] != "queue"
+                action = str(result["action"])
+                if action not in {"append", "refresh", "queue"}:
+                    raise RuntimeError(
+                        f"unexpected MemoryBank admission action: {action!r}"
+                    )
+                probe_index = probe_index_by_item[id(item)]
+                sequence_row = int(sequence_rows_cpu[probe_index])
+                if action == "append":
+                    append_counts[sequence_row] += 1
+                elif action == "refresh":
+                    refresh_counts[sequence_row] += 1
+                persistent = action != "queue"
                 if persistent:
-                    persistent_selected[probe_index_by_item[id(item)]] = True
+                    persistent_selected[probe_index] = True
                     self.controller.split_queues[owner_id] += item.queue_weight
 
         def request_token(probe_index: int) -> tuple[int, int]:
@@ -1709,6 +1912,9 @@ class TrainingWakeSupportMixin:
         )
         return {
             "write_counts": accepted_counts,
+            "accepted_write_counts": accepted_counts,
+            "append_counts": append_counts,
+            "refresh_counts": refresh_counts,
             "write_decision_counts": per_sequence_count(selected),
             "write_probe_counts": [int(value) for value in write_probe_counts],
             "write_gate_pass_counts": per_sequence_count(gate_pass),
@@ -2118,15 +2324,18 @@ class TrainingWakeSupportMixin:
         self,
         sequence: Mapping[str, Tensor],
         requests: Sequence[Mapping[str, Any]],
-    ) -> list[bool]:
-        """Commit selected writes and report which rows became persistent.
+        *,
+        return_actions: bool = False,
+    ) -> list[bool] | list[str]:
+        """Commit selected writes and report their admission outcomes.
 
         ``MemoryBank.add_memory_batch`` can deliberately return ``queue`` for
         a law outlier while it collects confirmation evidence.  Such a row is
         selected/probed, but it is not a physical prototype yet.  Returning a
-        flag for every input request keeps Wake's accepted-write metrics,
-        utility sums, and structural tokens aligned with the actual admission
-        result instead of the pre-admission selection mask.
+        boolean flag for every input request keeps the historical private
+        helper contract.  ``return_actions=True`` exposes the underlying
+        ``append``/``refresh``/``queue`` result so Wake can distinguish
+        evidence writes from new prototype rows.
         """
         if not requests:
             return []
@@ -2158,7 +2367,7 @@ class TrainingWakeSupportMixin:
         grouped_items = {}
         for owner_id, item in zip(owner_ids, items):
             grouped_items.setdefault(owner_id, []).append(item)
-        persistent_by_item: dict[int, bool] = {}
+        action_by_item: dict[int, str] = {}
         for owner_id, owner_items in grouped_items.items():
             reference = owner_items[0].key
             owner_keys = torch.stack([
@@ -2197,11 +2406,19 @@ class TrainingWakeSupportMixin:
                 decays=self.hawkes.decays.detach(),
             )
             for item, result in zip(owner_items, admission):
-                persistent = result["action"] != "queue"
-                persistent_by_item[id(item)] = persistent
+                action = str(result["action"])
+                if action not in {"append", "refresh", "queue"}:
+                    raise RuntimeError(
+                        f"unexpected MemoryBank admission action: {action!r}"
+                    )
+                action_by_item[id(item)] = action
+                persistent = action != "queue"
                 if persistent:
                     self.controller.split_queues[owner_id] += item.queue_weight
-        return [persistent_by_item.get(id(item), False) for item in items]
+        actions = [action_by_item.get(id(item), "queue") for item in items]
+        if return_actions:
+            return actions
+        return [action != "queue" for action in actions]
 
     def _encode_memory_event(
         self,

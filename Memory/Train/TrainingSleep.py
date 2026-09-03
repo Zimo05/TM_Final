@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 
 from Train.TrainingComponents import *  # noqa: F403
 from Train.TrainingComponents import (
@@ -21,15 +22,65 @@ class TrainingSleepMixin:
                 self.split_modules[leaf_id] = SplitModule(
                     P=self.tree.param_dim,
                     z_dim=self.tree.episodic_memory.key_dim,
-                    m_min=self.sleep_config.split_min_mass,
+                    m_min=0.0,
+                    lambda_mass=0.0,
                     nll_fn=self.hawkes,
                 ).to(self.device)
+            # Migrate old checkpoints away from the retired mass threshold
+            # and its soft surrogate as soon as the module becomes active.
+            self.split_modules[leaf_id].m_min = 0.0
+            self.split_modules[leaf_id].lambda_mass = 0.0
+
+    @torch.no_grad()
+    def _split_bank_diagnostics(
+        self,
+        leaf_id: str,
+        bank: Optional[Any] = None,
+    ) -> Dict[str, float]:
+        """Return the persistent evidence owned by one leaf bank.
+
+        ``split_queues`` records controller decisions and is intentionally
+        not part of the structural-evidence source of truth.  The bank keeps
+        the accumulated mass aligned with prototype support, including after
+        refresh and mode compression, so Split/Deep Sleep must read these
+        values directly from here.
+        """
+        if bank is None:
+            bank = self.tree.episodic_memory.get_bank(leaf_id)
+        bank._ensure_prototype_state()
+        count = len(bank)
+        if count == 0:
+            evidence_mass = 0.0
+            persistent_count = 0.0
+            law_mode_count = 0
+        else:
+            evidence_mass = float(
+                bank.split_mass[:count].detach().clamp_min(0.0).sum().cpu()
+            )
+            # ``support`` is the number of persistent observations represented
+            # by the bank's compact prototype rows, rather than the number of
+            # controller decisions that happened to precede admission.
+            persistent_count = float(
+                bank.support[:count].detach().clamp_min(0.0).sum().cpu()
+            )
+            law_mode_count = int(
+                torch.unique(bank.mode_ids[:count].detach()).numel()
+            )
+        return {
+            "Q_decision": float(
+                max(float(self.controller.split_queues.get(leaf_id, 0.0)), 0.0)
+            ),
+            "E_bank_struct": max(evidence_mass, 0.0),
+            "N_persistent": max(persistent_count, 0.0),
+            "K_law_mode": float(max(law_mode_count, 0)),
+        }
 
     def build_split_proposals(
         self,
         *,
         progress: Optional[tqdm] = None,
         max_evidence: Optional[int] = None,
+        bank_mode_probes: Optional[Mapping[str, Dict[str, Any]]] = None,
     ) -> Dict[str, tuple[SplitModule, Dict[str, Any]]]:
         self._sync_split_modules()
         proposals = {}
@@ -37,59 +88,140 @@ class TrainingSleepMixin:
         # deliberately ignored: Sleep structural evidence starts at the
         # persistent EpisodicMemory boundary.
         self.sleep_state["structural_evidence_buffer"] = {}
-        for leaf_id in list(self.tree.leaf_ids):
+        leaf_ids = (
+            list(self.tree.leaf_ids)
+            if bank_mode_probes is None
+            else list(bank_mode_probes)
+        )
+        for leaf_id in leaf_ids:
             if progress is not None:
                 progress.set_postfix(
                     phase="split",
                     leaf=leaf_id,
                     refresh=True,
                 )
-            if (
-                self.sleep_config.require_split_trigger
-                and self.controller.split_queues.get(leaf_id, 0) <= 0
-            ):
-                if progress is not None:
-                    progress.update(1)
-                continue
-            module = self.split_modules[leaf_id]
             bank = self.tree.episodic_memory.get_bank(leaf_id)
-            episodic_batch = module.build_split_batch_from_memory_bank(
+            bank_diagnostics = self._split_bank_diagnostics(
+                leaf_id,
                 bank,
-                max_items=max_evidence,
             )
-            batch = episodic_batch
+            module = self.split_modules[leaf_id]
+            probe = (
+                None
+                if bank_mode_probes is None
+                else bank_mode_probes[leaf_id]
+            )
+            if probe is None:
+                batch = module.build_split_batch_from_memory_bank(
+                    bank,
+                    max_items=max_evidence,
+                    min_replay_per_group=(
+                        self.sleep_config.split_min_replay_per_group
+                    ),
+                )
+                theta_snapshot = self.tree.semantic_theta(leaf_id)
+            else:
+                # Deep reuses the exact frozen physical rows and Bank-mode
+                # assignments from the probe.  Bank admission already owns
+                # structural persistence, so the predictive fit uses the
+                # probe's Light reliability weights rather than applying the
+                # old queue-strength criterion a second time.
+                batch = replace(
+                    probe["batch"],
+                    weights=probe["replay_weights"],
+                    effective_sample_size=torch.as_tensor(
+                        probe["replay_ess"],
+                        device=probe["replay_weights"].device,
+                        dtype=probe["replay_weights"].dtype,
+                    ),
+                )
+                theta_snapshot = probe["theta_sem_snapshot"]
             if batch is None or batch.residuals.shape[0] < 2:
                 if progress is not None:
                     progress.update(1)
                 continue
             output = module.optimize_leaf_split(
-                theta_sem=self.tree.semantic_theta(leaf_id),
+                theta_sem=theta_snapshot,
                 batch=batch,
                 hawkes_ll=self.hawkes,
                 num_steps=self.sleep_config.split_steps,
                 lr=self.sleep_config.split_lr,
-                m_min=self.sleep_config.split_min_mass,
-                min_structural_strength=(
-                    self.sleep_config.split_min_structural_strength
-                ),
-                min_effective_sample_size=(
-                    self.sleep_config.split_min_effective_sample_size
-                ),
+                m_min=0.0,
+                min_structural_strength=0.0,
+                min_effective_sample_size=0.0,
                 lambda_T=float(self.merge_lambda_T),
                 # Splitting one leaf creates exactly one internal node.
                 delta_complexity=1.0,
             )
             output["replay_weights"] = batch.weights.detach()
+            if probe is not None:
+                output["replay_weights"] = probe["replay_weights"].detach()
+                output["probe_advantage"] = float(probe["advantage"])
+                output["probe_loss_h0"] = float(probe["loss_h0"])
+                output["probe_loss_h1"] = float(probe["loss_h1"])
+                output["probe_mode_ids"] = probe["mode_ids"].detach()
+                output["probe_mode_group_ids"] = (
+                    probe["mode_group_ids"].detach()
+                )
             # Preserve evidence-size provenance for the diagnostic logger.
             # The current production path has no shadow buffer, so make that
             # explicit instead of conflating it with bounded replay rows.
             output["N_bank"] = int(len(bank))
             output["N_shadow"] = 0
             output["N_replay"] = int(batch.residuals.shape[0])
+            output.update(bank_diagnostics)
             proposals[leaf_id] = (module, output)
             if progress is not None:
                 progress.update(1)
         return proposals
+
+    @torch.no_grad()
+    def _build_bank_mode_probes(
+        self,
+        *,
+        max_evidence: int,
+        released_once: Sequence[str] = (),
+    ) -> Dict[str, Dict[str, Any]]:
+        """Freeze and probe every eligible node before Light can mutate it."""
+        released = set(released_once)
+        probes: Dict[str, Dict[str, Any]] = {}
+        light_settings = self._light_sleep_settings()
+        candidate_leaves = []
+        for leaf_id in list(self.tree.leaf_ids):
+            bank = self.tree.episodic_memory.get_bank(leaf_id)
+            bank._ensure_prototype_state()
+            if (
+                leaf_id not in released
+                and len(bank) > 0
+                and int(torch.unique(bank.mode_ids).numel()) >= 2
+            ):
+                candidate_leaves.append(leaf_id)
+        if not candidate_leaves:
+            return probes
+        self._sync_split_modules()
+        for leaf_id in candidate_leaves:
+            bank = self.tree.episodic_memory.get_bank(leaf_id)
+            module = self.split_modules[leaf_id]
+            batch = module.build_split_batch_from_memory_bank(
+                bank,
+                max_items=max_evidence,
+                min_replay_per_group=(
+                    self.sleep_config.split_min_replay_per_group
+                ),
+            )
+            if batch is None:
+                continue
+            probe = module.bank_mode_counterfactual_probe(
+                theta_sem=self.tree.semantic_theta(leaf_id).detach().clone(),
+                batch=batch,
+                hawkes_ll=self.hawkes,
+                alpha_max=light_settings.alpha_max,
+                trust_radius=light_settings.trust_radius,
+                gain_reference=light_settings.gain_reference,
+            )
+            if probe is not None:
+                probes[leaf_id] = probe
+        return probes
 
     def _light_sleep_settings(self) -> LightSleepSettings:
         return LightSleepSettings(
@@ -144,32 +276,52 @@ class TrainingSleepMixin:
         *,
         accepted_writes: int = 0,
     ) -> Dict[str, float]:
-        """Estimate structural pressure from persistent-memory votes only."""
+        """Estimate structural pressure from persistent Bank ``split_mass``."""
         if accepted_writes < 0:
             raise ValueError("accepted_writes must be non-negative")
-        previous_snapshot = dict(
+        previous_queue_snapshot = dict(
             self.sleep_state.get("split_queue_snapshot", {})
         )
-        next_snapshot: Dict[str, float] = {}
+        previous_mass_snapshot = dict(
+            self.sleep_state.get("split_mass_snapshot", {})
+        )
+        next_queue_snapshot: Dict[str, float] = {}
+        next_mass_snapshot: Dict[str, float] = {}
         queue_increment = 0.0
-        active_increment_count = 0
         queue_total = 0.0
+        structural_mass_total = 0.0
+        structural_mass_increment = 0.0
+        active_increment_count = 0
+        persistent_count_total = 0.0
+        law_mode_count_total = 0
         for leaf_id in self.tree.leaf_ids:
-            current = max(
-                float(self.controller.split_queues.get(leaf_id, 0.0)),
+            bank = self.tree.episodic_memory.get_bank(leaf_id)
+            bank_diagnostics = self._split_bank_diagnostics(
+                leaf_id,
+                bank,
+            )
+            current_queue = bank_diagnostics["Q_decision"]
+            current_mass = bank_diagnostics["E_bank_struct"]
+            previous_queue = max(
+                float(previous_queue_snapshot.get(leaf_id, 0.0)),
                 0.0,
             )
-            previous = max(
-                float(previous_snapshot.get(leaf_id, 0.0)),
+            previous_mass = max(
+                float(previous_mass_snapshot.get(leaf_id, 0.0)),
                 0.0,
             )
-            increment = max(current - previous, 0.0)
-            queue_increment += increment
-            queue_total += current
-            active_increment_count += int(increment > 0.0)
-            next_snapshot[leaf_id] = current
-        # Raw controller pressure is retained only as a discarded compatibility
-        # diagnostic. It cannot drive topology before memory persistence.
+            queue_increment += max(current_queue - previous_queue, 0.0)
+            queue_total += current_queue
+            structural_mass_total += current_mass
+            mass_increment = max(current_mass - previous_mass, 0.0)
+            structural_mass_increment += mass_increment
+            active_increment_count += int(mass_increment > 0.0)
+            persistent_count_total += bank_diagnostics["N_persistent"]
+            law_mode_count_total += int(bank_diagnostics["K_law_mode"])
+            next_queue_snapshot[leaf_id] = current_queue
+            next_mass_snapshot[leaf_id] = current_mass
+        # Legacy raw counters are retained only as discarded diagnostics. They
+        # cannot drive topology before evidence is present in a persistent bank.
         discarded_structural_mass = max(float(
             self.sleep_state.get("structural_mass_since_sleep", 0.0)
         ), 0.0)
@@ -178,15 +330,24 @@ class TrainingSleepMixin:
                 "structural_observations_since_sleep", 0
             )
         ), 0)
+        # ``deep_split_queue_scale`` is a checkpoint-compatible name; the
+        # quantity being scaled is now newly observed persistent Bank
+        # evidence, not Q_decision.  The current total remains available as
+        # E_bank_struct for eligibility and diagnostics.
         observation = 1.0 - math.exp(
-            -queue_increment / self.sleep_config.deep_split_queue_scale
+            -structural_mass_increment
+            / self.sleep_config.deep_split_queue_scale
         )
         previous_ema = float(
             self.sleep_state.get("structural_demand_ema", 0.0)
         )
         decay = self.sleep_config.deep_split_demand_decay
         demand = decay * previous_ema + (1.0 - decay) * observation
-        self.sleep_state["split_queue_snapshot"] = next_snapshot
+        # Keep Q_decision history for diagnostics/backward-compatible
+        # checkpoints, but use the separate Bank snapshot for structural
+        # evidence bookkeeping.
+        self.sleep_state["split_queue_snapshot"] = next_queue_snapshot
+        self.sleep_state["split_mass_snapshot"] = next_mass_snapshot
         self.sleep_state["structural_demand_ema"] = float(demand)
         self.sleep_state["structural_mass_since_sleep"] = 0.0
         self.sleep_state["structural_observations_since_sleep"] = 0
@@ -197,8 +358,15 @@ class TrainingSleepMixin:
             "queue_total": float(queue_total),
             "active_increment_count": float(active_increment_count),
             "accepted_writes": float(accepted_writes),
-            "structural_mass": 0.0,
-            "structural_observations": 0.0,
+            "structural_mass": float(structural_mass_total),
+            "structural_mass_increment": float(structural_mass_increment),
+            "structural_observations": float(persistent_count_total),
+            "persistent_count": float(persistent_count_total),
+            "law_mode_count": float(law_mode_count_total),
+            "Q_decision": float(queue_total),
+            "E_bank_struct": float(structural_mass_total),
+            "N_persistent": float(persistent_count_total),
+            "K_law_mode": float(law_mode_count_total),
             "discarded_raw_structural_mass": float(
                 discarded_structural_mass
             ),
@@ -324,6 +492,13 @@ class TrainingSleepMixin:
             "split_queue_total": split_demand["queue_total"],
             "split_observation": split_demand["observation"],
             "split_accepted_writes": split_demand["accepted_writes"],
+            "Q_decision": split_demand["Q_decision"],
+            "E_bank_struct": split_demand["E_bank_struct"],
+            "N_persistent": split_demand["N_persistent"],
+            "K_law_mode": split_demand["K_law_mode"],
+            "split_mass_increment": split_demand[
+                "structural_mass_increment"
+            ],
             "merge_candidates": 0.0,
             "topology_prune_candidates": float(prune_candidates),
             "topology_complexity": float(current_complexity),
@@ -355,6 +530,9 @@ class TrainingSleepMixin:
         split_proposals,
         merge_objective,
         topology_prune_proposals,
+        *,
+        topology_log_lines: Optional[list[str]] = None,
+        protected_leaf_ids: Sequence[str] = (),
     ):
         revision = int(self.sleep_state.get("topology_revision", 0))
         candidates = []
@@ -366,13 +544,11 @@ class TrainingSleepMixin:
                 topology_revision=revision,
                 lambda_T=float(self.merge_lambda_T),
                 uncertainty_kappa=self.sleep_config.action_uncertainty_kappa,
-                min_child_effective_mass=self.sleep_config.split_min_mass,
-                min_structural_strength=(
-                    self.sleep_config.split_min_structural_strength
-                ),
-                min_effective_sample_size=(
-                    self.sleep_config.split_min_effective_sample_size
-                ),
+                # Retained by the public builder signature for checkpoint/API
+                # compatibility; production Split no longer gates on them.
+                min_child_effective_mass=0.0,
+                min_structural_strength=0.0,
+                min_effective_sample_size=0.0,
             ))
         merge_pairs = tuple(merge_objective.get("pairs", ()))
         current_cycle = int(self.sleep_state.get("deep_cycle_count", 0))
@@ -433,6 +609,16 @@ class TrainingSleepMixin:
                 proposal,
                 topology_revision=revision,
             ))
+        protected = set(protected_leaf_ids)
+        if protected:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if (
+                    candidate.kind.value == "split"
+                    or candidate.claims.isdisjoint(protected)
+                )
+            ]
         candidates = smooth_candidate_gains(
             candidates,
             self.sleep_state.setdefault("unified_action_evidence", {}),
@@ -451,10 +637,12 @@ class TrainingSleepMixin:
             strength=self.sleep_config.topology_inertia_strength,
             tau=self.sleep_config.topology_inertia_tau,
         )
-        # This method is called only when evaluation_needed=True.  Log the
+        # This method is called only when evaluation_needed=True.  Capture the
         # final Split evidence after smoothing/inertia so it matches the
-        # candidate passed to the unified selector.
-        print_split_candidate_logs(candidates)
+        # candidate passed to the unified selector.  The training loop writes
+        # these lines under an epoch header; nothing is printed here.
+        if topology_log_lines is not None:
+            topology_log_lines.extend(split_candidate_log_lines(candidates))
         # TopologyPrune already applies its replay uncertainty. The common
         # selector owns action-type/target arbitration and the Null boundary.
         selection = self.topology_selector(
@@ -814,12 +1002,30 @@ class TrainingSleepMixin:
             low_mass = []
             sleep_progress.update(1)
 
+            # Probe the frozen post-consolidation snapshot before Light can
+            # alter semantics, rebase residuals, or reconcile Bank rows.
+            released_once = tuple(
+                self.sleep_state.pop(
+                    "bank_mode_probe_release_once", ()
+                )
+            )
+            bank_mode_probes = self._build_bank_mode_probes(
+                max_evidence=self.sleep_config.deep_evidence_budget,
+                released_once=released_once,
+            )
+            protected_probes = {
+                leaf_id: probe
+                for leaf_id, probe in bank_mode_probes.items()
+                if bool(probe["protect"])
+            }
+
             light_result = run_light_sleep(
                 self.tree,
                 self.hawkes,
                 optimizer=self.optimizer,
                 settings=self._light_sleep_settings(),
                 state=self.sleep_state.setdefault("light_index", {}),
+                protected_leaf_ids=protected_probes,
             )
             self.sleep_state["last_light_epoch"] = epoch_label
             sleep_progress.set_postfix(
@@ -850,7 +1056,12 @@ class TrainingSleepMixin:
             probe_due = (
                 cycle_count % self.sleep_config.deep_probe_interval == 0
             )
-            evaluation_needed = bool(deep_triggered or probe_due)
+            evaluation_needed = bool(
+                deep_triggered or probe_due or protected_probes
+            )
+            deep_execution_requested = bool(
+                deep_triggered or protected_probes
+            )
             pressure.pop("tensor")
             pressure["value"] = float(
                 torch.as_tensor(
@@ -939,6 +1150,7 @@ class TrainingSleepMixin:
                 "constraint": 0.0,
                 "lambda_T": float(self.merge_lambda_T),
             }
+            topology_log_lines: list[str] = []
             if evaluation_needed:
                 topology_prune_proposals, topology_prune_result = (
                     self._evaluate_topology_prune(
@@ -959,6 +1171,7 @@ class TrainingSleepMixin:
                         sleep_progress if show_progress else None
                     ),
                     max_evidence=self.sleep_config.deep_evidence_budget,
+                    bank_mode_probes=protected_probes,
                 )
                 if not show_progress:
                     sleep_progress.update(leaf_count)
@@ -967,6 +1180,8 @@ class TrainingSleepMixin:
                         split_proposals,
                         merge_objective,
                         topology_prune_proposals,
+                        topology_log_lines=topology_log_lines,
+                        protected_leaf_ids=protected_probes,
                     )
                 )
                 selection_log = selection.as_log_dict()
@@ -987,7 +1202,26 @@ class TrainingSleepMixin:
             else:
                 sleep_progress.update(leaf_count)
 
-            if deep_triggered:
+            selected_protected_split = set()
+            if (
+                selection is not None
+                and not selection.is_null
+                and selection.selected is not None
+                and selection.selected.kind.value == "split"
+                and selection.selected.target in protected_probes
+            ):
+                selected_protected_split.add(selection.selected.target)
+            rejected_probes = set(protected_probes).difference(
+                selected_protected_split
+            )
+            if rejected_probes:
+                # A rejected preservation probe gets exactly one unprotected
+                # Light cycle before Bank evidence may be probed again.
+                self.sleep_state["bank_mode_probe_release_once"] = sorted(
+                    rejected_probes
+                )
+
+            if deep_execution_requested:
                 promotion_kwargs = dict(
                     self.structure_config.promotion_kwargs
                 )
@@ -1022,6 +1256,7 @@ class TrainingSleepMixin:
                     allow_topology_prune=allow_topology_prune,
                     promotion_kwargs=promotion_kwargs,
                     statistics_prepared=True,
+                    protected_leaf_ids=protected_probes,
                 )
                 topology_settings = _topology_prune_settings(
                     self.structure_config.topology_prune_kwargs
@@ -1124,12 +1359,38 @@ class TrainingSleepMixin:
                     "activation_probability"
                 ],
                 "hard_gate": bool(deep_triggered),
+                "execution_requested": bool(deep_execution_requested),
                 "probe": bool(probe_due and not deep_triggered),
                 "evaluated": bool(evaluation_needed),
                 "gain": deep_gain,
                 "objective": gate_objective,
             },
             "unified_topology": selection_log,
+            "bank_mode_probe": {
+                "evaluated_nodes": len(bank_mode_probes),
+                "protected_nodes": sorted(protected_probes),
+                "released_once": sorted(rejected_probes),
+                "nodes": {
+                    leaf_id: {
+                        key: value
+                        for key, value in probe.items()
+                        if key not in {
+                            "batch",
+                            "theta_sem_snapshot",
+                            "bank_group_weights",
+                            "shared_delta",
+                            "group_delta",
+                            "theta_h0",
+                            "theta_h1",
+                            "replay_weights",
+                            "mode_ids",
+                            "mode_group_ids",
+                        }
+                    }
+                    for leaf_id, probe in bank_mode_probes.items()
+                },
+            },
+            "unified_topology_log_lines": topology_log_lines,
             "merge": merge_result,
             "topology_prune": topology_prune_result,
             "transaction": transaction,

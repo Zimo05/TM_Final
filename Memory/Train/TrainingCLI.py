@@ -22,6 +22,14 @@ def _parse_args():
     parser.add_argument("--validation-history-path", default=None)
     parser.add_argument("--controller-diagnostics-path", default=None)
     parser.add_argument(
+        "--unified-topology-log-path",
+        default=None,
+        help=(
+            "Plain-text per-epoch Split candidate diagnostics. Defaults to "
+            "<checkpoint_stem>_unified_topology.log."
+        ),
+    )
+    parser.add_argument(
         "--controller-v4-fresh", action="store_true",
         help="Enable the controller validation workflow and reject --resume.",
     )
@@ -68,9 +76,13 @@ def _parse_args():
     parser.add_argument(
         "--prototype-duplicate-threshold", type=float, default=0.98,
         help=(
-            "Cold-start duplicate cosine prior; mode-local Q90 distances take "
+            "Cold-start duplicate cosine prior; mode-local Q80 distances take "
             "over after calibration."
         ),
+    )
+    parser.add_argument(
+        "--prototype-duplicate-quantile", type=float, default=0.80,
+        help="Quantile for the accepted-sample calibrated duplicate radius.",
     )
     parser.add_argument(
         "--prototype-mode-threshold", type=float, default=0.90,
@@ -950,6 +962,9 @@ def main() -> None:
         trainer.training_config.controller_diagnostics_path = (
             args.controller_diagnostics_path
         )
+        trainer.training_config.unified_topology_log_path = (
+            args.unified_topology_log_path
+        )
         trainer.training_config.training_metrics_path = args.training_metrics_path
         trainer.training_config.training_plot_path = args.training_plot_path
         trainer.training_config.plot_after_training = not args.no_training_plots
@@ -1042,6 +1057,9 @@ def main() -> None:
         trainer.training_config.controller_diagnostics_path = (
             args.controller_diagnostics_path
         )
+        trainer.training_config.unified_topology_log_path = (
+            args.unified_topology_log_path
+        )
         trainer.training_config.router_lr_scale = args.router_lr_scale
         trainer.training_config.seed = args.seed
         trainer.training_config.plot_after_training = (
@@ -1051,6 +1069,12 @@ def main() -> None:
             args.training_metrics_path
         )
         trainer.training_config.training_plot_path = args.training_plot_path
+        trainer.wake_config.prototype_duplicate_quantile = (
+            args.prototype_duplicate_quantile
+        )
+        trainer.tree.episodic_memory.configure_prototype_memory(
+            duplicate_quantile=trainer.wake_config.prototype_duplicate_quantile
+        )
         trainer.wake_config.lambda_route_mi = args.route_mi_weight
         trainer.wake_config.lambda_route_posterior = (
             args.route_posterior_weight
@@ -1414,6 +1438,7 @@ def main() -> None:
         wake=WakeObjectiveConfig(
             prototype_duplicate_threshold=args.prototype_duplicate_threshold,
             prototype_mode_threshold=args.prototype_mode_threshold,
+            prototype_duplicate_quantile=args.prototype_duplicate_quantile,
             prototype_mode_capacity=args.prototype_mode_capacity,
             prototype_context_alias_capacity=args.prototype_context_alias_capacity,
             lambda_route_mi=args.route_mi_weight,
@@ -1490,6 +1515,7 @@ def main() -> None:
             best_checkpoint_path=args.best_checkpoint,
             validation_history_path=args.validation_history_path,
             controller_diagnostics_path=args.controller_diagnostics_path,
+            unified_topology_log_path=args.unified_topology_log_path,
             router_lr_scale=args.router_lr_scale,
             seed=args.seed,
             plot_after_training=not args.no_training_plots,

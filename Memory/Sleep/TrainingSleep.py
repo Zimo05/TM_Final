@@ -24,6 +24,40 @@ class TrainingSleepMixin:
                     nll_fn=self.hawkes,
                 ).to(self.device)
 
+    @torch.no_grad()
+    def _split_bank_diagnostics(
+        self,
+        leaf_id: str,
+        bank: Optional[Any] = None,
+    ) -> Dict[str, float]:
+        """Read Split evidence from persistent Bank state, not controller Q."""
+        if bank is None:
+            bank = self.tree.episodic_memory.get_bank(leaf_id)
+        bank._ensure_prototype_state()
+        count = len(bank)
+        if count == 0:
+            evidence_mass = 0.0
+            persistent_count = 0.0
+            law_mode_count = 0
+        else:
+            evidence_mass = float(
+                bank.split_mass[:count].detach().clamp_min(0.0).sum().cpu()
+            )
+            persistent_count = float(
+                bank.support[:count].detach().clamp_min(0.0).sum().cpu()
+            )
+            law_mode_count = int(
+                torch.unique(bank.mode_ids[:count].detach()).numel()
+            )
+        return {
+            "Q_decision": float(
+                max(float(self.controller.split_queues.get(leaf_id, 0.0)), 0.0)
+            ),
+            "E_bank_struct": max(evidence_mass, 0.0),
+            "N_persistent": max(persistent_count, 0.0),
+            "K_law_mode": float(max(law_mode_count, 0)),
+        }
+
     def build_split_proposals(
         self,
         *,
@@ -39,16 +73,22 @@ class TrainingSleepMixin:
                     leaf=leaf_id,
                     refresh=True,
                 )
+            bank = self.tree.episodic_memory.get_bank(leaf_id)
+            bank_diagnostics = self._split_bank_diagnostics(leaf_id, bank)
+            if bank_diagnostics["E_bank_struct"] <= 0.0:
+                if progress is not None:
+                    progress.update(1)
+                continue
             if (
                 self.sleep_config.require_split_trigger
-                and self.controller.split_queues.get(leaf_id, 0) <= 0
+                and bank_diagnostics["Q_decision"] <= 0.0
             ):
                 if progress is not None:
                     progress.update(1)
                 continue
             module = self.split_modules[leaf_id]
             batch = module.build_split_batch_from_memory_bank(
-                self.tree.episodic_memory.get_bank(leaf_id),
+                bank,
                 max_items=max_evidence,
             )
             if batch is None or batch.residuals.shape[0] < 2:
@@ -75,6 +115,10 @@ class TrainingSleepMixin:
                 delta_complexity=1.0,
             )
             output["replay_weights"] = batch.weights.detach()
+            output["N_bank"] = int(len(bank))
+            output["N_shadow"] = 0
+            output["N_replay"] = int(batch.residuals.shape[0])
+            output.update(bank_diagnostics)
             proposals[leaf_id] = (module, output)
             if progress is not None:
                 progress.update(1)
@@ -129,37 +173,56 @@ class TrainingSleepMixin:
 
     @torch.no_grad()
     def _continuous_split_demand(self) -> Dict[str, float]:
-        """Convert cumulative queue mass into a decaying per-cycle signal."""
-        previous_snapshot = dict(
+        """Convert persistent Bank ``split_mass`` into a decaying signal."""
+        previous_queue_snapshot = dict(
             self.sleep_state.get("split_queue_snapshot", {})
         )
-        next_snapshot: Dict[str, float] = {}
+        previous_mass_snapshot = dict(
+            self.sleep_state.get("split_mass_snapshot", {})
+        )
+        next_queue_snapshot: Dict[str, float] = {}
+        next_mass_snapshot: Dict[str, float] = {}
         queue_increment = 0.0
-        active_increment_count = 0
         queue_total = 0.0
+        structural_mass_total = 0.0
+        structural_mass_increment = 0.0
+        active_increment_count = 0
+        persistent_count_total = 0.0
+        law_mode_count_total = 0
         for leaf_id in self.tree.leaf_ids:
-            current = max(
-                float(self.controller.split_queues.get(leaf_id, 0.0)),
+            bank = self.tree.episodic_memory.get_bank(leaf_id)
+            bank_diagnostics = self._split_bank_diagnostics(leaf_id, bank)
+            current_queue = bank_diagnostics["Q_decision"]
+            current_mass = bank_diagnostics["E_bank_struct"]
+            previous_queue = max(
+                float(previous_queue_snapshot.get(leaf_id, 0.0)),
                 0.0,
             )
-            previous = max(
-                float(previous_snapshot.get(leaf_id, 0.0)),
+            previous_mass = max(
+                float(previous_mass_snapshot.get(leaf_id, 0.0)),
                 0.0,
             )
-            increment = max(current - previous, 0.0)
-            queue_increment += increment
-            queue_total += current
-            active_increment_count += int(increment > 0.0)
-            next_snapshot[leaf_id] = current
+            queue_increment += max(current_queue - previous_queue, 0.0)
+            queue_total += current_queue
+            structural_mass_total += current_mass
+            mass_increment = max(current_mass - previous_mass, 0.0)
+            structural_mass_increment += mass_increment
+            active_increment_count += int(mass_increment > 0.0)
+            persistent_count_total += bank_diagnostics["N_persistent"]
+            law_mode_count_total += int(bank_diagnostics["K_law_mode"])
+            next_queue_snapshot[leaf_id] = current_queue
+            next_mass_snapshot[leaf_id] = current_mass
         observation = 1.0 - math.exp(
-            -queue_increment / self.sleep_config.deep_split_queue_scale
+            -structural_mass_increment
+            / self.sleep_config.deep_split_queue_scale
         )
         previous_ema = float(
             self.sleep_state.get("structural_demand_ema", 0.0)
         )
         decay = self.sleep_config.deep_split_demand_decay
         demand = decay * previous_ema + (1.0 - decay) * observation
-        self.sleep_state["split_queue_snapshot"] = next_snapshot
+        self.sleep_state["split_queue_snapshot"] = next_queue_snapshot
+        self.sleep_state["split_mass_snapshot"] = next_mass_snapshot
         self.sleep_state["structural_demand_ema"] = float(demand)
         return {
             "value": float(min(max(demand, 0.0), 1.0)),
@@ -167,6 +230,14 @@ class TrainingSleepMixin:
             "queue_increment": float(queue_increment),
             "queue_total": float(queue_total),
             "active_increment_count": float(active_increment_count),
+            "structural_mass": float(structural_mass_total),
+            "structural_mass_increment": float(structural_mass_increment),
+            "persistent_count": float(persistent_count_total),
+            "law_mode_count": float(law_mode_count_total),
+            "Q_decision": float(queue_total),
+            "E_bank_struct": float(structural_mass_total),
+            "N_persistent": float(persistent_count_total),
+            "K_law_mode": float(law_mode_count_total),
         }
 
     @torch.no_grad()
@@ -257,6 +328,13 @@ class TrainingSleepMixin:
             "split_queue_increment": split_demand["queue_increment"],
             "split_queue_total": split_demand["queue_total"],
             "split_observation": split_demand["observation"],
+            "Q_decision": split_demand["Q_decision"],
+            "E_bank_struct": split_demand["E_bank_struct"],
+            "N_persistent": split_demand["N_persistent"],
+            "K_law_mode": split_demand["K_law_mode"],
+            "split_mass_increment": split_demand[
+                "structural_mass_increment"
+            ],
             "merge_candidates": 0.0,
             "topology_prune_candidates": float(prune_candidates),
             "topology_complexity": float(current_complexity),

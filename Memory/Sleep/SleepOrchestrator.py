@@ -39,7 +39,12 @@ class SleepOrchestrator:
         )
 
         evaluated = bool(result["deep_gate"]["evaluated"])
-        triggered = bool(result["deep_gate"]["hard_gate"])
+        triggered = bool(
+            result["deep_gate"].get(
+                "execution_requested",
+                result["deep_gate"]["hard_gate"],
+            )
+        )
         control_flow = ["light", "deep_gate"]
         if evaluated:
             control_flow.extend((

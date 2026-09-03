@@ -64,7 +64,7 @@ from Sleep.UnifiedTopology import (
     build_merge_candidate,
     build_split_candidate,
     build_topology_prune_candidate,
-    print_split_candidate_logs,
+    split_candidate_log_lines,
     smooth_candidate_gains,
 )
 from Train.ConstructTree import ConstructMemoryTree
@@ -234,6 +234,9 @@ class WakeObjectiveConfig:
     count_similarity_high: float = 0.65
     count_topk: Optional[int] = None
     count_saturation: float = 3.0
+    # Appended to preserve positional construction of older configs.
+    # Accepted-sample calibrated duplicate radius quantile.
+    prototype_duplicate_quantile: float = 0.80
 
 
 @dataclass
@@ -242,15 +245,18 @@ class SleepConfig:
 
     split_steps: int = 30
     split_lr: float = 1e-3
-    split_min_mass: float = 10.0
-    # Absolute p(QUEUE_SPLIT) evidence is checked before normalized replay
-    # mass can commit a split.  ESS prevents one memory from impersonating
-    # several replay-equivalent samples after normalization.
-    split_min_structural_strength: float = 0.05
-    split_min_effective_sample_size: float = 2.0
+    # Deprecated compatibility knobs. Bank admission owns persistence and
+    # Split is decided by counterfactual predictive competition, so these no
+    # longer gate proposals or add a child-mass penalty.
+    split_min_mass: float = 0.0
+    split_min_structural_strength: float = 0.0
+    split_min_effective_sample_size: float = 0.0
+    # Bounded replay reserves physical windows from both Bank-mode sides;
+    # this is sampling coverage, not an eligibility threshold.
+    split_min_replay_per_group: int = 2
     split_init_steps: int = 30
     split_init_lr: float = 1e-2
-    require_split_trigger: bool = True
+    require_split_trigger: bool = False
 
     # Light Sleep: fixed topology and fixed replay-evidence budget.
     light_replay_budget: int = 32
@@ -279,8 +285,9 @@ class SleepConfig:
     deep_cooldown_tau: Optional[float] = None
     deep_accumulator_decay: float = 0.8
     deep_split_demand_decay: float = 0.8
-    # Deprecated checkpoint compatibility field. Structural demand is now a
-    # per-accepted-write rate and no longer scales raw queue mass.
+    # Deprecated name retained for checkpoint/CLI compatibility. It scales
+    # persistent Bank ``split_mass`` when forming the bounded Deep pressure;
+    # controller queue mass is never used for that pressure.
     deep_split_queue_scale: float = 1.0
     deep_evidence_temperature: float = 1.0
     deep_hard_concrete_temperature: float = 2.0 / 3.0
@@ -392,6 +399,9 @@ class TrainingConfig:
     best_checkpoint_path: Optional[str] = None
     validation_history_path: Optional[str] = None
     controller_diagnostics_path: Optional[str] = None
+    # Plain-text per-epoch Split candidate diagnostics.  When omitted, the
+    # path is derived from ``checkpoint_path`` with a descriptive suffix.
+    unified_topology_log_path: Optional[str] = None
     # At the end of each train() call, persist a compact structured metrics
     # log and render one multi-panel PNG beside the checkpoint by default.
     plot_after_training: bool = True

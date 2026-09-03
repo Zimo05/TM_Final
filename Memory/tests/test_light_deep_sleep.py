@@ -319,7 +319,7 @@ class LightDeepSleepTests(unittest.TestCase):
             expected_prediction + expected_complexity + expected_mass,
         ))
 
-    def test_split_child_support_uses_effective_sample_size(self):
+    def test_split_child_support_is_diagnostic_not_a_hard_gate(self):
         module = SplitModule(4, 3)
         with torch.no_grad():
             module.centers.zero_()
@@ -352,9 +352,9 @@ class LightDeepSleepTests(unittest.TestCase):
             min_structural_strength=0.05,
             min_effective_sample_size=2.0,
         )
-        self.assertFalse(ready)
+        self.assertTrue(ready)
 
-    def test_split_readiness_rejects_weak_or_single_item_evidence(self):
+    def test_split_readiness_ignores_strength_and_ess_thresholds(self):
         common = {
             "g_split": torch.tensor(0.95),
             "N": torch.tensor([2.5, 2.5]),
@@ -384,8 +384,107 @@ class LightDeepSleepTests(unittest.TestCase):
             min_effective_sample_size=2.0,
         )
 
-        self.assertFalse(weak)
-        self.assertFalse(dominant)
+        self.assertTrue(weak)
+        self.assertTrue(dominant)
+
+    def test_light_sleep_does_not_mutate_probe_protected_leaf(self):
+        torch.manual_seed(421)
+        hawkes = HawkesFamily(2, 1, decays=torch.tensor([1.0]))
+        tree = HawkesTree(
+            3, 4, 2, 1, init_depth=0, memory_key_dim=3
+        )
+        window = EventWindow(
+            torch.tensor([0.1, 0.4, 0.8]),
+            torch.tensor([0, 1, 0]),
+            "root",
+            0,
+            3,
+            True,
+        )
+        delta = self._improving_residual(tree, hawkes, window)
+        for key in torch.eye(3):
+            tree.episodic_memory.add_memory(
+                "root", key, delta, window, write_quality=1.0
+            )
+        bank = tree.episodic_memory.get_bank("root")
+        theta_before = tree.semantic_theta("root").detach().clone()
+        delta_before = bank.deltas.detach().clone()
+
+        result = run_light_sleep(
+            tree,
+            hawkes,
+            settings=LightSleepSettings(replay_budget=2),
+            protected_leaf_ids={"root"},
+        )
+
+        torch.testing.assert_close(tree.semantic_theta("root"), theta_before)
+        torch.testing.assert_close(bank.deltas, delta_before)
+        self.assertEqual(result["protected_leaves"], 1)
+        self.assertEqual(result["absorbed_leaves"], 0)
+
+    def test_bank_mode_counterfactual_probe_is_non_mutating(self):
+        torch.manual_seed(423)
+        hawkes = HawkesFamily(2, 1, decays=torch.tensor([1.0]))
+        tree = HawkesTree(
+            3, 4, 2, 1, init_depth=0, memory_key_dim=3
+        )
+        bank = tree.episodic_memory.get_bank("root")
+        windows = [
+            EventWindow(
+                torch.tensor([0.1, 0.4, 0.8]),
+                torch.tensor([0, 1, 0]),
+                "root",
+                0,
+                3,
+                True,
+            ),
+            EventWindow(
+                torch.tensor([0.2, 0.5, 0.9]),
+                torch.tensor([1, 0, 1]),
+                "root",
+                0,
+                3,
+                True,
+            ),
+        ]
+        law_dim = bank.law_dim
+        law_a = torch.zeros(law_dim)
+        law_b = torch.zeros(law_dim)
+        law_a[0] = 1.0
+        law_b[min(1, law_dim - 1)] = 1.0
+        bank.add(
+            torch.tensor([1.0, 0.0, 0.0]),
+            torch.full((tree.param_dim,), 0.02),
+            windows[0],
+            law_key=law_a,
+            prediction_gain=1.0,
+            force_new_mode_confirmation=True,
+        )
+        bank.add(
+            torch.tensor([0.0, 1.0, 0.0]),
+            torch.full((tree.param_dim,), -0.02),
+            windows[1],
+            law_key=law_b,
+            prediction_gain=1.0,
+            force_new_mode_confirmation=True,
+        )
+        module = SplitModule(tree.param_dim, 3, nll_fn=hawkes)
+        batch = module.build_split_batch_from_memory_bank(bank)
+        theta_before = tree.semantic_theta("root").detach().clone()
+        delta_before = bank.deltas.detach().clone()
+        modes_before = bank.mode_ids.detach().clone()
+
+        probe = module.bank_mode_counterfactual_probe(
+            theta_sem=theta_before,
+            batch=batch,
+            hawkes_ll=hawkes,
+        )
+
+        self.assertIsNotNone(probe)
+        self.assertTrue(torch.isfinite(torch.tensor(probe["advantage"])))
+        torch.testing.assert_close(tree.semantic_theta("root"), theta_before)
+        torch.testing.assert_close(bank.deltas, delta_before)
+        torch.testing.assert_close(bank.mode_ids, modes_before)
 
     def test_split_eligibility_does_not_use_local_gate_or_persistence(self):
         state = SplitModule(4, 3).commit_state
@@ -553,7 +652,7 @@ class LightDeepSleepTests(unittest.TestCase):
             2e-3,
         )
 
-    def test_split_demand_uses_new_mass_then_decays(self):
+    def test_split_demand_uses_persistent_bank_mass_then_decays(self):
         hawkes = HawkesFamily(2, 1, decays=torch.tensor([1.0]))
         tree = HawkesTree(
             3, 4, 2, 1, init_depth=0, memory_key_dim=3
@@ -568,13 +667,26 @@ class LightDeepSleepTests(unittest.TestCase):
             ),
             device="cpu",
         )
-        trainer.controller.split_queues["root"] = 1e-8
+        trainer.tree.episodic_memory.add_memory(
+            "root",
+            torch.tensor([1.0, 0.0, 0.0]),
+            torch.zeros(tree.param_dim),
+            write_quality=1.0,
+            queue_weight=0.5,
+        )
         first = trainer._continuous_split_demand()
         second = trainer._continuous_split_demand()
-        trainer.controller.split_queues["root"] += 1.0
+        trainer.tree.episodic_memory.add_memory(
+            "root",
+            torch.tensor([0.0, 1.0, 0.0]),
+            torch.zeros(tree.param_dim),
+            write_quality=1.0,
+            queue_weight=0.5,
+        )
         third = trainer._continuous_split_demand()
 
-        self.assertLess(first["value"], 1e-6)
+        self.assertGreater(first["E_bank_struct"], 0.0)
+        self.assertGreater(first["value"], 0.0)
         self.assertLess(second["value"], first["value"])
         self.assertGreater(third["value"], second["value"])
 

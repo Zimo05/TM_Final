@@ -56,6 +56,7 @@ def run_sleep_cycle(
     split_init_lr: float = 1e-2,
     allow_topology_prune: bool = True,
     statistics_prepared: bool = False,
+    protected_leaf_ids: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """Commit at most one topology edit selected on a frozen snapshot.
 
@@ -69,6 +70,7 @@ def run_sleep_cycle(
             "Deep Sleep requires UnifiedTopologySelection"
         )
     promotion_kwargs = {} if promotion_kwargs is None else dict(promotion_kwargs)
+    protected = set(protected_leaf_ids)
 
     leaf_snapshot = list(tree.leaf_ids)
     pair_snapshot = leaf_sibling_pairs(tree, leaf_snapshot)
@@ -211,6 +213,8 @@ def run_sleep_cycle(
     # sibling regions untouched by the selected action are considered.
     if promote_when_structure_unchanged:
         for node_a, node_b in pair_snapshot:
+            if node_a in protected or node_b in protected:
+                continue
             if node_a in claimed or node_b in claimed:
                 continue
             if node_a not in tree.nodes or node_b not in tree.nodes:

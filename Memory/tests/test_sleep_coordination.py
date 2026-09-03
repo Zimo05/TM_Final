@@ -32,6 +32,7 @@ from Sleep.UnifiedTopology import (
     UnifiedTopologySelection,
     UnifiedTopologySelector,
     build_merge_candidate,
+    build_split_candidate,
     build_topology_prune_candidate,
 )
 
@@ -137,6 +138,30 @@ class SleepCoordinationTests(unittest.TestCase):
         )
         self.assertTrue(eligible.eligible)
         self.assertAlmostEqual(float(eligible.uncertainty), 1.0)
+
+    def test_split_candidate_does_not_reintroduce_retired_support_gates(self):
+        candidate = build_split_candidate(
+            "root",
+            torch.nn.Identity(),
+            {
+                "logp0": torch.tensor([-2.0]),
+                "logp_child_mix": torch.tensor([-1.0]),
+                "replay_weights": torch.ones(1),
+                "N_eff": torch.tensor([0.1, 0.1]),
+                "structural_strength": torch.tensor(0.0),
+                "effective_sample_size": torch.tensor(1.0),
+                "E_bank_struct": 0.0,
+            },
+            topology_revision=0,
+            lambda_T=0.0,
+            uncertainty_kappa=0.0,
+            min_child_effective_mass=10.0,
+            min_structural_strength=0.05,
+            min_effective_sample_size=2.0,
+        )
+
+        self.assertTrue(candidate.eligible)
+        self.assertTrue(candidate.ready)
 
     def test_prune_persistence_is_eligibility_not_preference(self):
         proposal = TopologyPruneProposal(

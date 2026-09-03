@@ -33,7 +33,7 @@ _PROTOTYPE_POLICY_DEFAULTS = {
     "retention_age_weight": 0.1,
     "adaptive_history_size": 64,
     "adaptive_min_samples": 8,
-    "duplicate_quantile": 0.90,
+    "duplicate_quantile": 0.80,
     "mode_quantile": 0.95,
     "radius_margin": 1e-3,
     "gain_quantile": 0.95,
@@ -186,6 +186,7 @@ def _empty_replacement_bank(
         key_dim=parent_bank.key_dim,
         param_dim=parent_bank.param_dim,
         capacity=max(int(capacity), 1),
+        law_dim=int(getattr(parent_bank, "law_dim", parent_bank.key_dim)),
     )
     # Preserve storage dtype without adding a synthetic row.
     parent_bank._ensure_prototype_state()
@@ -214,6 +215,7 @@ def _transient_empty_bank(memory) -> MemoryBank:
         key_dim=memory.key_dim,
         param_dim=memory.param_dim,
         capacity=memory.capacity_per_node,
+        law_dim=int(getattr(memory, "law_dim", memory.param_dim)),
     )
     # A transient bank participates in the same collapse transaction as the
     # tree's persistent banks.  Carry the tree-level policy into it so a

@@ -69,7 +69,12 @@ class UnifiedTopologyCandidate:
 def format_split_candidate_log(
     candidate: UnifiedTopologyCandidate,
 ) -> Optional[str]:
-    """Format the compact Split evidence line used during Deep evaluation."""
+    """Format one compact, node-first Split evidence line.
+
+    The training loop owns the destination of these diagnostics.  Keep this
+    formatter free of logging prefixes so a persisted epoch section can start
+    directly with the node identifier (for example ``root_L``).
+    """
     if candidate.kind is not TopologyActionKind.SPLIT:
         return None
 
@@ -103,11 +108,17 @@ def format_split_candidate_log(
             return int(default)
 
     reason = str(diagnostics.get("reason", "unknown"))
+    target = candidate.target if candidate.target is not None else "<unknown>"
     return (
-        f"[UnifiedTopology] split:{candidate.target} "
+        f"{target} "
+        f"Q_decision={scalar(diagnostics.get('Q_decision', 0.0)):.6g} "
+        f"E_bank_struct={scalar(diagnostics.get('E_bank_struct', 0.0)):.6g} "
+        f"N_persistent={scalar(diagnostics.get('N_persistent', 0.0)):.6g} "
+        f"K_law_mode={integer(diagnostics.get('K_law_mode', 0))} "
         f"N_bank={integer(diagnostics.get('N_bank', candidate.replay_size))} "
         f"N_shadow={integer(diagnostics.get('N_shadow', 0))} "
         f"N_replay={integer(diagnostics.get('N_replay', candidate.replay_size))} "
+        f"A_probe={scalar(diagnostics.get('probe_advantage', 0.0)):+.6g} "
         f"N_eff={scalar(candidate.effective_sample_size):.6g} "
         f"N_L_eff={scalar(child_left):.6g} "
         f"N_R_eff={scalar(child_right):.6g} "
@@ -122,14 +133,28 @@ def format_split_candidate_log(
     )
 
 
-def print_split_candidate_logs(
+def split_candidate_log_lines(
     candidates: Sequence[UnifiedTopologyCandidate],
-) -> None:
-    """Print one diagnostic line for every Split candidate in an evaluation."""
+) -> list[str]:
+    """Return one node-first diagnostic line for every Split candidate."""
+    lines = []
     for candidate in candidates:
         line = format_split_candidate_log(candidate)
         if line is not None:
-            print(line, flush=True)
+            lines.append(line)
+    return lines
+
+
+def print_split_candidate_logs(
+    candidates: Sequence[UnifiedTopologyCandidate],
+) -> list[str]:
+    """Compatibility alias returning lines without writing to stdout.
+
+    Older callers imported this helper by name.  Diagnostics are now routed
+    to the epoch log by the training loop, so the compatibility surface is
+    deliberately side-effect free.
+    """
+    return split_candidate_log_lines(candidates)
 
 
 @dataclass(frozen=True)
@@ -302,6 +327,11 @@ def build_split_candidate(
         device=parent.device,
         dtype=parent.dtype,
     ).detach().reshape(())
+    bank_structural_mass_tensor = torch.as_tensor(
+        output.get("E_bank_struct", 0.0),
+        device=parent.device,
+        dtype=parent.dtype,
+    ).detach().reshape(())
     proposal_ess_tensor = torch.as_tensor(
         output.get("effective_sample_size", effective_sample_size),
         device=parent.device,
@@ -309,18 +339,17 @@ def build_split_candidate(
     ).detach().reshape(())
     if child_ess.shape == (2,):
         child_ess_values = child_ess
-        support_ok_tensor = (
-            child_ess >= float(min_child_effective_mass)
-        ).all()
+        child_metrics_finite = torch.isfinite(child_ess).all()
     else:
         child_ess_values = parent.new_zeros(2)
-        support_ok_tensor = torch.zeros(
+        child_metrics_finite = torch.zeros(
             (), device=parent.device, dtype=torch.bool
         )
     eligible_tensor = (
-        support_ok_tensor
-        & structural_strength_tensor.ge(float(min_structural_strength))
-        & proposal_ess_tensor.ge(float(min_effective_sample_size))
+        child_metrics_finite
+        & torch.isfinite(bank_structural_mass_tensor)
+        & torch.isfinite(structural_strength_tensor)
+        & torch.isfinite(proposal_ess_tensor)
         & torch.isfinite(raw_gain)
         & torch.isfinite(uncertainty)
     )
@@ -360,6 +389,16 @@ def build_split_candidate(
     n_bank = output.get("N_bank", parent.numel())
     n_shadow = output.get("N_shadow", 0)
     n_replay = output.get("N_replay", parent.numel())
+    q_decision = float(torch.as_tensor(
+        output.get("Q_decision", 0.0)
+    ).detach().cpu())
+    e_bank_struct = float(bank_structural_mass_tensor.cpu())
+    n_persistent = float(torch.as_tensor(
+        output.get("N_persistent", 0.0)
+    ).detach().cpu())
+    k_law_mode = int(torch.as_tensor(
+        output.get("K_law_mode", 0)
+    ).detach().cpu())
     return UnifiedTopologyCandidate(
         action_id=action_id,
         kind=TopologyActionKind.SPLIT,
@@ -374,10 +413,23 @@ def build_split_candidate(
         effective_sample_size=float(effective_sample_size_value),
         replay_size=int(parent.numel()),
         diagnostics={
-            "reason": "ready" if eligible else "insufficient_split_support",
+            "reason": "objective_competition" if eligible else "nonfinite_split_metrics",
             "N_bank": int(n_bank),
             "N_shadow": int(n_shadow),
             "N_replay": int(n_replay),
+            "Q_decision": q_decision,
+            "E_bank_struct": e_bank_struct,
+            "N_persistent": n_persistent,
+            "K_law_mode": k_law_mode,
+            "probe_advantage": float(torch.as_tensor(
+                output.get("probe_advantage", 0.0)
+            ).detach().cpu()),
+            "probe_loss_h0": float(torch.as_tensor(
+                output.get("probe_loss_h0", 0.0)
+            ).detach().cpu()),
+            "probe_loss_h1": float(torch.as_tensor(
+                output.get("probe_loss_h1", 0.0)
+            ).detach().cpu()),
             "prediction_gain": float(mean_gain_value),
             "complexity_delta": 1.0,
             "lambda_T": float(lambda_T),
@@ -658,6 +710,25 @@ def smooth_candidate_gains(
         if not candidate.eligible:
             result.append(candidate)
             continue
+        if candidate.kind is TopologyActionKind.SPLIT:
+            # Bank admission already established persistence. A Split probe
+            # competes on its current frozen objective and never waits for a
+            # second hand-designed consecutive-ready count.
+            state.pop(candidate.action_id, None)
+            diagnostics = dict(candidate.diagnostics)
+            diagnostics.update({
+                "instantaneous_raw_gain": float(torch.as_tensor(
+                    candidate.raw_gain
+                ).detach().cpu()),
+                "gain_observations": 1,
+                "temporal_uncertainty": 0.0,
+            })
+            result.append(replace(
+                candidate,
+                ready=True,
+                diagnostics=diagnostics,
+            ))
+            continue
         previous = state.get(candidate.action_id)
         reference = torch.as_tensor(candidate.raw_gain).detach().reshape(())
         value = float(reference.cpu())
@@ -830,5 +901,8 @@ __all__ = [
     "build_merge_candidate",
     "build_split_candidate",
     "build_topology_prune_candidate",
+    "format_split_candidate_log",
+    "print_split_candidate_logs",
+    "split_candidate_log_lines",
     "smooth_candidate_gains",
 ]

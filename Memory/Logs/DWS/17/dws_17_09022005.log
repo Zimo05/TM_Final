@@ -1,3 +1,167 @@
+Using device: cuda
+DataFrame shape: (1700, 3)
+Columns: ['event_times', 'event_types', 'cluster']
+加载了 1700 个序列
+检测到 8 种事件类型: [0, 1, 2, 3, 4, 5, 6, 7]
+第一个序列长度: 80
+[Hawkes Cold Start][001/010] train_nll/event=4.273062 val_nll/event=3.740769 max_grad=1.7795
+[Hawkes Cold Start][002/010] train_nll/event=3.405243 val_nll/event=3.259835 max_grad=0.5574
+[Hawkes Cold Start][003/010] train_nll/event=3.097862 val_nll/event=3.072356 max_grad=0.2723
+[Hawkes Cold Start][004/010] train_nll/event=2.981458 val_nll/event=3.004127 max_grad=0.1706
+[Hawkes Cold Start][005/010] train_nll/event=2.938245 val_nll/event=2.976134 max_grad=0.1754
+[Hawkes Cold Start][006/010] train_nll/event=2.918717 val_nll/event=2.961527 max_grad=0.1807
+[Hawkes Cold Start][007/010] train_nll/event=2.908339 val_nll/event=2.953137 max_grad=0.1811
+[Hawkes Cold Start][008/010] train_nll/event=2.902360 val_nll/event=2.948058 max_grad=0.1843
+[Hawkes Cold Start][009/010] train_nll/event=2.898798 val_nll/event=2.945133 max_grad=0.1862
+[Hawkes Cold Start][010/010] train_nll/event=2.896611 val_nll/event=2.943036 max_grad=0.1869
+[Hawkes Cold Start] checkpoint saved to /home/xinye/HawkesMemory_wfy/checkpoints/hawkes_backbone_init.pt
+[Hawkes Cold Start] spectral_radius=0.756667, min_mu=8.554223e-03
+[H_tree] initialized 33/33 node_emb from /home/xinye/HawkesMemory_wfy/Data/tree_17/h_tree_one_circle.pt
+[Routing] mode=active_frontier frontier=2..7 temperature=1.100 exploration=0.000
+
+[Residual init]:   0%|          | 0/1700 [00:00<?, ?seq/s]
+[Residual init]:   1%|▏         | 25/1700 [00:00<00:06, 244.51seq/s]
+[Residual init]:   3%|▎         | 57/1700 [00:00<00:05, 283.38seq/s]
+[Residual init]:   5%|▌         | 88/1700 [00:00<00:05, 294.78seq/s]
+[Residual init]:   7%|▋         | 119/1700 [00:00<00:05, 300.24seq/s]
+[Residual init]:   9%|▉         | 151/1700 [00:00<00:05, 304.10seq/s]
+[Residual init]:  11%|█         | 182/1700 [00:00<00:04, 305.25seq/s]
+[Residual init]:  13%|█▎        | 213/1700 [00:00<00:04, 305.52seq/s]
+[Residual init]:  14%|█▍        | 244/1700 [00:00<00:04, 306.10seq/s]
+[Residual init]:  16%|█▌        | 275/1700 [00:00<00:04, 303.01seq/s]
+[Residual init]:  18%|█▊        | 307/1700 [00:01<00:04, 305.53seq/s]
+[Residual init]:  20%|█▉        | 338/1700 [00:01<00:04, 305.11seq/s]
+[Residual init]:  22%|██▏       | 369/1700 [00:01<00:04, 305.54seq/s]
+[Residual init]:  24%|██▎       | 400/1700 [00:01<00:04, 299.93seq/s]
+[Residual init]:  25%|██▌       | 431/1700 [00:01<00:04, 300.10seq/s]
+[Residual init]:  27%|██▋       | 462/1700 [00:01<00:04, 299.27seq/s]
+[Residual init]:  29%|██▉       | 492/1700 [00:01<00:04, 296.94seq/s]
+[Residual init]:  31%|███       | 522/1700 [00:01<00:04, 293.40seq/s]
+[Residual init]:  32%|███▏      | 552/1700 [00:01<00:03, 290.01seq/s]
+[Residual init]:  34%|███▍      | 582/1700 [00:01<00:03, 289.32seq/s]
+[Residual init]:  36%|███▌      | 612/1700 [00:02<00:03, 291.31seq/s]
+[Residual init]:  38%|███▊      | 642/1700 [00:02<00:03, 288.21seq/s]
+[Residual init]:  39%|███▉      | 671/1700 [00:02<00:03, 288.12seq/s]
+[Residual init]:  41%|████      | 700/1700 [00:02<00:03, 287.71seq/s]
+[Residual init]:  43%|████▎     | 729/1700 [00:02<00:03, 287.26seq/s]
+[Residual init]:  45%|████▍     | 759/1700 [00:02<00:03, 289.64seq/s]
+[Residual init]:  46%|████▋     | 788/1700 [00:02<00:03, 289.66seq/s]
+[Residual init]:  48%|████▊     | 817/1700 [00:02<00:03, 284.73seq/s]
+[Residual init]:  50%|████▉     | 847/1700 [00:02<00:02, 286.74seq/s]
+[Residual init]:  52%|█████▏    | 877/1700 [00:02<00:02, 288.01seq/s]
+[Residual init]:  53%|█████▎    | 907/1700 [00:03<00:02, 289.13seq/s]
+[Residual init]:  55%|█████▌    | 936/1700 [00:03<00:02, 288.76seq/s]
+[Residual init]:  57%|█████▋    | 965/1700 [00:03<00:02, 289.07seq/s]
+[Residual init]:  59%|█████▊    | 995/1700 [00:03<00:02, 291.06seq/s]
+[Residual init]:  60%|██████    | 1025/1700 [00:03<00:02, 292.44seq/s]
+[Residual init]:  62%|██████▏   | 1055/1700 [00:03<00:02, 293.52seq/s]
+[Residual init]:  64%|██████▍   | 1085/1700 [00:03<00:02, 294.08seq/s]
+[Residual init]:  66%|██████▌   | 1115/1700 [00:03<00:02, 291.39seq/s]
+[Residual init]:  67%|██████▋   | 1145/1700 [00:03<00:01, 293.67seq/s]
+[Residual init]:  69%|██████▉   | 1175/1700 [00:03<00:01, 293.45seq/s]
+[Residual init]:  71%|███████   | 1205/1700 [00:04<00:01, 293.01seq/s]
+[Residual init]:  73%|███████▎  | 1235/1700 [00:04<00:01, 293.08seq/s]
+[Residual init]:  74%|███████▍  | 1265/1700 [00:04<00:01, 292.83seq/s]
+[Residual init]:  76%|███████▌  | 1295/1700 [00:04<00:01, 293.28seq/s]
+[Residual init]:  78%|███████▊  | 1325/1700 [00:04<00:01, 294.37seq/s]
+[Residual init]:  80%|███████▉  | 1355/1700 [00:04<00:01, 293.26seq/s]
+[Residual init]:  81%|████████▏ | 1385/1700 [00:04<00:01, 294.23seq/s]
+[Residual init]:  83%|████████▎ | 1415/1700 [00:04<00:00, 294.74seq/s]
+[Residual init]:  85%|████████▌ | 1445/1700 [00:04<00:00, 294.48seq/s]
+[Residual init]:  87%|████████▋ | 1475/1700 [00:05<00:00, 293.99seq/s]
+[Residual init]:  89%|████████▊ | 1505/1700 [00:05<00:00, 293.04seq/s]
+[Residual init]:  90%|█████████ | 1536/1700 [00:05<00:00, 295.70seq/s]
+[Residual init]:  92%|█████████▏| 1567/1700 [00:05<00:00, 297.28seq/s]
+[Residual init]:  94%|█████████▍| 1597/1700 [00:05<00:00, 296.11seq/s]
+[Residual init]:  96%|█████████▌| 1628/1700 [00:05<00:00, 297.81seq/s]
+[Residual init]:  98%|█████████▊| 1659/1700 [00:05<00:00, 299.02seq/s]
+[Residual init]:  99%|█████████▉| 1689/1700 [00:05<00:00, 298.88seq/s]
+[Residual init]: 100%|██████████| 1700/1700 [00:05<00:00, 294.42seq/s]
+[Residual Initialization] sequences=1700 rank=4 grad_norm=5.301e+00/9.817e+00/1.504e+01 clipped=0.000 membership=[100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0] target_mass=[0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943, 0.05882352963089943]
+[Initialization] mode=residual_signature semantic_blend=0.0000 semantic_delta_mean=1.8265e-02 semantic_delta_max=2.7678e-01 offset_mode=path_additive route_balance=0.1000
+[Symmetry] mode=residual_signature router_gain=0.0500 router_norm_mean=7.3961e-02 leaf_delta_mean=2.3055e-02 leaf_mean_error=9.537e-07 spectral_radius=[0.751336,0.762674]
+
+[H-align 01/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 01/05]:   7%|▋         | 8/107 [00:00<00:01, 72.51batch/s, acc=0.609, loss=0.663]
+[H-align 01/05]:  16%|█▌        | 17/107 [00:00<00:01, 80.70batch/s, acc=0.628, loss=0.656]
+[H-align 01/05]:  24%|██▍       | 26/107 [00:00<00:00, 81.95batch/s, acc=0.626, loss=0.653]
+[H-align 01/05]:  33%|███▎      | 35/107 [00:00<00:00, 83.91batch/s, acc=0.621, loss=0.653]
+[H-align 01/05]:  41%|████      | 44/107 [00:00<00:00, 84.84batch/s, acc=0.624, loss=0.651]
+[H-align 01/05]:  50%|████▉     | 53/107 [00:00<00:00, 84.43batch/s, acc=0.628, loss=0.647]
+[H-align 01/05]:  58%|█████▊    | 62/107 [00:00<00:00, 84.90batch/s, acc=0.629, loss=0.646]
+[H-align 01/05]:  66%|██████▋   | 71/107 [00:00<00:00, 83.90batch/s, acc=0.627, loss=0.648]
+[H-align 01/05]:  75%|███████▍  | 80/107 [00:00<00:00, 83.75batch/s, acc=0.628, loss=0.648]
+[H-align 01/05]:  83%|████████▎ | 89/107 [00:01<00:00, 83.59batch/s, acc=0.628, loss=0.648]
+[H-align 01/05]:  92%|█████████▏| 98/107 [00:01<00:00, 83.59batch/s, acc=0.63, loss=0.646] 
+[H-align 01/05]: 100%|██████████| 107/107 [00:01<00:00, 82.89batch/s, acc=0.634, loss=0.641]
+[H-align 01/05]: 100%|██████████| 107/107 [00:01<00:00, 83.19batch/s, acc=0.634, loss=0.641]
+[H-align] epoch=1/5 loss=0.641366 acc=0.6343 p_target=0.5466 confidence=1.0000 grad_max=8.154e-01
+
+[H-align 02/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 02/05]:   8%|▊         | 9/107 [00:00<00:01, 82.08batch/s, acc=0.733, loss=0.524]
+[H-align 02/05]:  17%|█▋        | 18/107 [00:00<00:01, 83.29batch/s, acc=0.713, loss=0.535]
+[H-align 02/05]:  25%|██▌       | 27/107 [00:00<00:00, 83.15batch/s, acc=0.723, loss=0.518]
+[H-align 02/05]:  34%|███▎      | 36/107 [00:00<00:00, 83.47batch/s, acc=0.736, loss=0.497]
+[H-align 02/05]:  42%|████▏     | 45/107 [00:00<00:00, 83.74batch/s, acc=0.747, loss=0.478]
+[H-align 02/05]:  50%|█████     | 54/107 [00:00<00:00, 83.15batch/s, acc=0.757, loss=0.461]
+[H-align 02/05]:  59%|█████▉    | 63/107 [00:00<00:00, 81.09batch/s, acc=0.765, loss=0.447]
+[H-align 02/05]:  67%|██████▋   | 72/107 [00:00<00:00, 82.08batch/s, acc=0.774, loss=0.434]
+[H-align 02/05]:  76%|███████▌  | 81/107 [00:00<00:00, 82.68batch/s, acc=0.784, loss=0.417]
+[H-align 02/05]:  84%|████████▍ | 90/107 [00:01<00:00, 81.77batch/s, acc=0.794, loss=0.402]
+[H-align 02/05]:  93%|█████████▎| 99/107 [00:01<00:00, 81.79batch/s, acc=0.804, loss=0.387]
+[H-align 02/05]: 100%|██████████| 107/107 [00:01<00:00, 82.63batch/s, acc=0.811, loss=0.376]
+[H-align] epoch=2/5 loss=0.376290 acc=0.8107 p_target=0.7379 confidence=1.0000 grad_max=3.830e+00
+
+[H-align 03/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 03/05]:   8%|▊         | 9/107 [00:00<00:01, 81.82batch/s, acc=0.919, loss=0.2]
+[H-align 03/05]:  17%|█▋        | 18/107 [00:00<00:01, 82.81batch/s, acc=0.921, loss=0.194]
+[H-align 03/05]:  25%|██▌       | 27/107 [00:00<00:00, 82.66batch/s, acc=0.923, loss=0.19] 
+[H-align 03/05]:  34%|███▎      | 36/107 [00:00<00:00, 82.64batch/s, acc=0.929, loss=0.179]
+[H-align 03/05]:  42%|████▏     | 45/107 [00:00<00:00, 83.28batch/s, acc=0.935, loss=0.169]
+[H-align 03/05]:  50%|█████     | 54/107 [00:00<00:00, 83.67batch/s, acc=0.939, loss=0.16] 
+[H-align 03/05]:  59%|█████▉    | 63/107 [00:00<00:00, 83.21batch/s, acc=0.944, loss=0.149]
+[H-align 03/05]:  67%|██████▋   | 72/107 [00:00<00:00, 83.72batch/s, acc=0.947, loss=0.144]
+[H-align 03/05]:  76%|███████▌  | 81/107 [00:00<00:00, 83.00batch/s, acc=0.95, loss=0.138] 
+[H-align 03/05]:  84%|████████▍ | 90/107 [00:01<00:00, 83.23batch/s, acc=0.952, loss=0.134]
+[H-align 03/05]:  93%|█████████▎| 99/107 [00:01<00:00, 83.40batch/s, acc=0.954, loss=0.128]
+[H-align 03/05]: 100%|██████████| 107/107 [00:01<00:00, 83.43batch/s, acc=0.956, loss=0.123]
+[H-align] epoch=3/5 loss=0.122833 acc=0.9564 p_target=0.9195 confidence=1.0000 grad_max=3.731e+00
+
+[H-align 04/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 04/05]:   8%|▊         | 9/107 [00:00<00:01, 86.67batch/s, acc=0.984, loss=0.0546]
+[H-align 04/05]:  17%|█▋        | 18/107 [00:00<00:01, 86.98batch/s, acc=0.987, loss=0.049]
+[H-align 04/05]:  25%|██▌       | 27/107 [00:00<00:00, 85.31batch/s, acc=0.989, loss=0.0441]
+[H-align 04/05]:  34%|███▎      | 36/107 [00:00<00:00, 84.60batch/s, acc=0.988, loss=0.0438]
+[H-align 04/05]:  42%|████▏     | 45/107 [00:00<00:00, 83.99batch/s, acc=0.989, loss=0.0419]
+[H-align 04/05]:  50%|█████     | 54/107 [00:00<00:00, 84.72batch/s, acc=0.989, loss=0.0411]
+[H-align 04/05]:  59%|█████▉    | 63/107 [00:00<00:00, 84.69batch/s, acc=0.989, loss=0.0417]
+[H-align 04/05]:  67%|██████▋   | 72/107 [00:00<00:00, 84.48batch/s, acc=0.989, loss=0.0407]
+[H-align 04/05]:  76%|███████▌  | 81/107 [00:00<00:00, 83.98batch/s, acc=0.99, loss=0.0393] 
+[H-align 04/05]:  84%|████████▍ | 90/107 [00:01<00:00, 83.82batch/s, acc=0.99, loss=0.0376]
+[H-align 04/05]:  93%|█████████▎| 99/107 [00:01<00:00, 83.68batch/s, acc=0.99, loss=0.0373]
+[H-align 04/05]: 100%|██████████| 107/107 [00:01<00:00, 84.26batch/s, acc=0.99, loss=0.0368]
+[H-align] epoch=4/5 loss=0.036831 acc=0.9899 p_target=0.9780 confidence=1.0000 grad_max=1.633e+00
+
+[H-align 05/05]:   0%|          | 0/107 [00:00<?, ?batch/s]
+[H-align 05/05]:   8%|▊         | 9/107 [00:00<00:01, 84.01batch/s, acc=0.991, loss=0.0296]
+[H-align 05/05]:  17%|█▋        | 18/107 [00:00<00:01, 84.05batch/s, acc=0.992, loss=0.0253]
+[H-align 05/05]:  25%|██▌       | 27/107 [00:00<00:00, 83.89batch/s, acc=0.992, loss=0.0256]
+[H-align 05/05]:  34%|███▎      | 36/107 [00:00<00:00, 84.24batch/s, acc=0.993, loss=0.0242]
+[H-align 05/05]:  42%|████▏     | 45/107 [00:00<00:00, 81.61batch/s, acc=0.993, loss=0.0228]
+[H-align 05/05]:  50%|█████     | 54/107 [00:00<00:00, 82.22batch/s, acc=0.994, loss=0.0218]
+[H-align 05/05]:  59%|█████▉    | 63/107 [00:00<00:00, 83.00batch/s, acc=0.994, loss=0.0215]
+[H-align 05/05]:  67%|██████▋   | 72/107 [00:00<00:00, 83.13batch/s, acc=0.994, loss=0.0216]
+[H-align 05/05]:  76%|███████▌  | 81/107 [00:00<00:00, 83.98batch/s, acc=0.994, loss=0.0214]
+[H-align 05/05]:  84%|████████▍ | 90/107 [00:01<00:00, 84.43batch/s, acc=0.994, loss=0.0212]
+[H-align 05/05]:  93%|█████████▎| 99/107 [00:01<00:00, 84.17batch/s, acc=0.994, loss=0.0206]
+[H-align 05/05]: 100%|██████████| 107/107 [00:01<00:00, 83.64batch/s, acc=0.994, loss=0.0204]
+[H-align] epoch=5/5 loss=0.020387 acc=0.9938 p_target=0.9877 confidence=1.0000 grad_max=7.742e-01
+[H-align Complete] epochs=5 loss=0.692324->0.013900 accuracy=0.9955 p_target=0.9911 updated=encoder+router_compat frozen=hawkes+node_emb+semantics+memory
+
+[Init] Cache:   0%|                                                                 | 0/1700 [00:00<?, ?seq/s]
+[Init] Cache: 100%|#########################| 1700/1700 [00:01<00:00, 1099.87seq/s, built=1700, events=136000]
+[Cache] sequences=1700 events=136000 built=1700 device=cuda time=1.546s
+
 [Epoch 001] Wake: 100%|#########| 1700/1700 [02:09<00:00, 13.13seq/s, events=136000, loss=2.8606, writes=5758]
 [Epoch 001] Global: 100%|#################| 1700/1700 [00:40<00:00, 41.95seq-pass/s, batch=27/27, phase=train]
 [Epoch 001] Sleep: 100%|#############| 21/21 [00:05<00:00,  3.59step/s, actions=6, phase=deep, pressure=0.149]
