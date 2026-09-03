@@ -174,6 +174,223 @@ class PrototypeMemoryTests(unittest.TestCase):
         self.assertEqual(second["match_type"], "new_dynamics")
         self.assertEqual(len(bank), 2)
         self.assertNotEqual(second["mode_id"], first["mode_id"])
+        # A confirmed new dynamics must not feed its queued outlier distance
+        # back into the old mode's adaptive radius.
+        self.assertEqual(bank._mode_distances.get(0, []), [])
+        self.assertEqual(bank._mode_pending_distances, {})
+
+    def test_pending_confirmation_tracks_law_identity_per_mode(self):
+        """Distinct outliers nearest one mode must not share a counter."""
+        bank = MemoryBank(device="cpu", key_dim=3, param_dim=2, capacity=8)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.98,
+            mode_threshold=0.90,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=2,
+        )
+        basis = torch.eye(3)
+        bank.add(
+            basis[0], torch.zeros(2), law_key=basis[0], prediction_gain=0.2
+        )
+        candidate_x = torch.tensor([0.8, 0.6, 0.0])
+        candidate_y = torch.tensor([0.8, 0.0, 0.6])
+
+        first_x = bank.add(
+            candidate_x,
+            torch.ones(2),
+            law_key=candidate_x,
+            prediction_gain=0.9,
+        )
+        first_y = bank.add(
+            candidate_y,
+            torch.ones(2),
+            law_key=candidate_y,
+            prediction_gain=0.9,
+        )
+        self.assertEqual(first_x["action"], "queue")
+        self.assertEqual(first_y["action"], "queue")
+        self.assertEqual(first_y["confirmation_count"], 1)
+        self.assertEqual(first_y["pending_candidate_count"], 2)
+        self.assertEqual(len(bank), 1)
+
+        # X recurs and confirms only X.  Y remains a separate temporary law
+        # candidate under the original nearest mode.
+        confirmed_x = bank.add(
+            candidate_x,
+            torch.ones(2),
+            law_key=candidate_x,
+            prediction_gain=0.9,
+        )
+        self.assertEqual(confirmed_x["match_type"], "new_dynamics")
+        self.assertEqual(len(bank), 2)
+        pending = bank._mode_pending_candidates[0]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["count"], 1)
+        self.assertTrue(torch.allclose(pending[0]["law_key"], candidate_y))
+
+        # Y then confirms independently and creates its own mode.
+        confirmed_y = bank.add(
+            candidate_y,
+            torch.ones(2),
+            law_key=candidate_y,
+            prediction_gain=0.9,
+        )
+        self.assertEqual(confirmed_y["match_type"], "new_dynamics")
+        self.assertEqual(len(bank), 3)
+        self.assertEqual(bank._mode_pending_candidates, {})
+
+    def test_queued_outlier_is_retrospectively_admitted_to_current_mode(self):
+        bank = MemoryBank(device="cpu", key_dim=3, param_dim=2, capacity=8)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.98,
+            mode_threshold=0.90,
+            adaptive_min_samples=1,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=2,
+        )
+        basis = torch.eye(3)
+        bank.add(
+            basis[0], torch.zeros(2), law_key=basis[0], prediction_gain=0.2
+        )
+        candidate = torch.tensor([0.8, 0.6, 0.0])
+
+        first = bank.add(
+            candidate,
+            torch.ones(2),
+            law_key=candidate,
+            prediction_gain=0.0,
+        )
+        self.assertEqual(first["action"], "queue")
+        self.assertEqual(first["pending_distance_count"], 1)
+        self.assertEqual(len(bank), 1)
+
+        second = bank.add(
+            candidate,
+            torch.ones(2),
+            law_key=candidate,
+            prediction_gain=0.0,
+        )
+        self.assertEqual(second["action"], "append")
+        self.assertEqual(second["match_type"], "local_variation")
+        self.assertEqual(second["mode_id"], 0)
+        self.assertEqual(bank._mode_pending_distances, {})
+        self.assertEqual(len(bank._mode_distances[0]), 2)
+        # The accepted recurrence and the earlier queued observation both
+        # calibrate the mode radius, allowing it to expand beyond the cold
+        # start prior of 1 - mode_threshold.
+        self.assertGreater(
+            bank.adaptive_radii(0)[1], 1.0 - bank.mode_threshold
+        )
+
+    def test_local_variation_queues_when_mode_capacity_is_full(self):
+        """A full mode must not overwrite a distinct law prototype row."""
+        bank = MemoryBank(device="cpu", key_dim=3, param_dim=2, capacity=8)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.98,
+            mode_threshold=0.90,
+            mode_capacity=1,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=2,
+        )
+        base = torch.tensor([1.0, 0.0, 0.0])
+        candidate = torch.tensor([0.95, (1.0 - 0.95**2) ** 0.5, 0.0])
+        original_delta = torch.tensor([1.0, -2.0])
+        bank.add(
+            base,
+            original_delta,
+            law_key=base,
+            prediction_gain=0.2,
+        )
+        original_key = bank.keys[0].clone()
+        original_law_key = bank.law_keys[0].clone()
+        original_delta = bank.deltas[0].clone()
+        original_context = bank.context_keys[0].clone()
+        original_support = bank.support[0].clone()
+
+        result = bank.add(
+            candidate,
+            torch.tensor([3.0, 4.0]),
+            law_key=candidate,
+            prediction_gain=0.0,
+        )
+
+        self.assertEqual(result["action"], "queue")
+        self.assertEqual(result["match_type"], "local_variation_capacity")
+        self.assertAlmostEqual(result["distance"], 0.05, places=6)
+        self.assertEqual(len(bank), 1)
+        torch.testing.assert_close(bank.keys[0], original_key)
+        torch.testing.assert_close(bank.law_keys[0], original_law_key)
+        torch.testing.assert_close(bank.deltas[0], original_delta)
+        torch.testing.assert_close(bank.context_keys[0], original_context)
+        torch.testing.assert_close(bank.support[0], original_support)
+        self.assertEqual(bank._mode_distances, {})
+        self.assertEqual(bank._mode_pending_candidates, {})
+
+    def test_local_variation_queues_when_hard_bank_capacity_has_no_victim(self):
+        """Hard-cap fallback must preserve law identity just like mode cap."""
+        bank = MemoryBank(device="cpu", key_dim=3, param_dim=2, capacity=1)
+        bank.configure_prototype_policy(
+            duplicate_threshold=0.98,
+            mode_threshold=0.90,
+            mode_capacity=2,
+        )
+        base = torch.tensor([1.0, 0.0, 0.0])
+        candidate = torch.tensor([0.95, (1.0 - 0.95**2) ** 0.5, 0.0])
+        bank.add(base, torch.zeros(2), law_key=base)
+        original_law_key = bank.law_keys[0].clone()
+
+        result = bank.add(
+            candidate,
+            torch.ones(2),
+            law_key=candidate,
+        )
+
+        self.assertEqual(result["action"], "queue")
+        self.assertEqual(result["match_type"], "bank_capacity")
+        self.assertEqual(len(bank), 1)
+        torch.testing.assert_close(bank.law_keys[0], original_law_key)
+
+    def test_pending_outlier_distances_survive_tree_checkpoint(self):
+        memory = TreeEpisodicMemory(
+            key_dim=3,
+            num_event_types=1,
+            num_basis=1,
+            capacity_per_node=8,
+            device="cpu",
+        )
+        memory.configure_prototype_memory(
+            adaptive_min_samples=1,
+            gain_ema_decay=0.0,
+            gain_confirmation_min_count=2,
+        )
+        basis = torch.eye(3)
+        memory.add_memory(
+            "root", basis[0], torch.zeros(2), law_key=basis[0], prediction_gain=0.2
+        )
+        candidate = torch.tensor([0.8, 0.6, 0.0])
+        memory.add_memory(
+            "root", candidate, torch.ones(2), law_key=candidate, prediction_gain=0.0
+        )
+
+        restored = TreeEpisodicMemory(
+            key_dim=3,
+            num_event_types=1,
+            num_basis=1,
+            capacity_per_node=8,
+            device="cpu",
+        )
+        restored.set_extra_state(memory.get_extra_state())
+        restored_bank = restored.get_bank("root")
+        self.assertEqual(len(restored_bank._mode_pending_distances[0]), 1)
+        self.assertAlmostEqual(restored_bank._mode_pending_distances[0][0], 0.2, places=6)
+        self.assertEqual(len(restored_bank._mode_pending_candidates[0]), 1)
+        self.assertEqual(restored_bank._mode_pending_candidates[0][0]["count"], 1)
+
+        result = restored.add_memory(
+            "root", candidate, torch.ones(2), law_key=candidate, prediction_gain=0.0
+        )
+        self.assertEqual(result["match_type"], "local_variation")
+        self.assertEqual(restored_bank._mode_pending_distances, {})
 
     def test_batched_admission_uses_the_same_causal_confirmation(self):
         bank = MemoryBank(device="cpu", key_dim=3, param_dim=2, capacity=8)

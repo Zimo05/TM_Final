@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass, replace
 from numbers import Real
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -1019,8 +1019,21 @@ class MemoryBank:
         self._mode_duplicate_distances: Dict[int, List[float]] = {}
         self._mode_distances: Dict[int, List[float]] = {}
         self._mode_normal_gains: Dict[int, List[float]] = {}
+        # Law distances for outliers that are temporarily queued while a
+        # signed prediction-gain confirmation is collected.  These samples
+        # are deliberately kept out of the adaptive radius until a later
+        # recurrence confirms that they belong to the current mode.
+        self._mode_pending_distances: Dict[int, List[float]] = {}
         self._mode_pending_gain_ema: Dict[int, float] = {}
         self._mode_pending_gain_count: Dict[int, int] = {}
+        # Pending new-dynamics confirmation is keyed by both the nearest
+        # existing mode and the incoming law identity.  A single mode can
+        # therefore hold several unrelated temporary candidates (for example
+        # two different outliers that happen to be nearest to the same mode).
+        # ``_mode_pending_distances`` and the aggregate gain maps above remain
+        # as compatibility summaries for older checkpoints/callers; candidate
+        # records are the source of truth for new admissions.
+        self._mode_pending_candidates: Dict[int, List[Dict[str, Any]]] = {}
 
         self.windows: List[Optional[EventWindow]] = []
         self.usage = torch.empty(0, device=self.device)
@@ -1099,6 +1112,11 @@ class MemoryBank:
     def __setstate__(self, state) -> None:
         self.__dict__.update(state)
         self._ensure_storage_metadata()
+        # Directly pickled banks bypass ``TreeEpisodicMemory.set_extra_state``.
+        # Migrate those legacy ``keys``-only payloads at load time as well, so
+        # callers can inspect/use context aliases immediately after
+        # ``torch.load`` instead of relying on a later lazy retrieval path.
+        self._ensure_prototype_state()
 
     def _invalidate_fixed_storage(self) -> None:
         """Drop the append backing store after an external tensor replacement."""
@@ -1454,8 +1472,10 @@ class MemoryBank:
             "_mode_duplicate_distances": {},
             "_mode_distances": {},
             "_mode_normal_gains": {},
+            "_mode_pending_distances": {},
             "_mode_pending_gain_ema": {},
             "_mode_pending_gain_count": {},
+            "_mode_pending_candidates": {},
         }
         for name, default in defaults.items():
             if not hasattr(self, name):
@@ -1639,15 +1659,65 @@ class MemoryBank:
     def _trim_adaptive_histories(self) -> None:
         if not hasattr(self, "_mode_duplicate_distances"):
             return
+        if not hasattr(self, "_mode_pending_distances"):
+            self._mode_pending_distances = {}
+        if not hasattr(self, "_mode_pending_candidates"):
+            self._mode_pending_candidates = {}
         for values_by_mode in (
             self._mode_duplicate_distances,
             self._mode_distances,
             self._mode_normal_gains,
+            self._mode_pending_distances,
         ):
             for mode_id, values in list(values_by_mode.items()):
                 values_by_mode[int(mode_id)] = list(values)[
                     -self.adaptive_history_size:
                 ]
+        # Candidate histories and the number of candidates are bounded by the
+        # rolling policy window (with at least one slot per possible mode
+        # row).  The candidate law key is kept detached so it cannot retain an
+        # autograd graph across queue/checkpoint boundaries.
+        for mode_id, candidates in list(self._mode_pending_candidates.items()):
+            trimmed_candidates: List[Dict[str, Any]] = []
+            for candidate in list(candidates)[
+                -self._pending_candidate_capacity() :
+            ]:
+                if not isinstance(candidate, dict):
+                    continue
+                law_key = candidate.get("law_key")
+                if torch.is_tensor(law_key):
+                    law_key = law_key.detach().reshape(-1).clone()
+                else:
+                    # Legacy candidate records without a law identity cannot
+                    # participate in identity matching and are dropped rather
+                    # than silently reintroducing mode-level aggregation.
+                    continue
+                history = []
+                for value in candidate.get("distance_history", []):
+                    value = float(value)
+                    if math.isfinite(value):
+                        history.append(value)
+                candidate = {
+                    "law_key": law_key,
+                    "gain_ema": float(candidate.get("gain_ema", 0.0)),
+                    "count": int(candidate.get("count", 0)),
+                    "distance_history": history[-self.adaptive_history_size :],
+                }
+                trimmed_candidates.append(candidate)
+            if trimmed_candidates:
+                self._mode_pending_candidates[int(mode_id)] = trimmed_candidates
+                self._sync_legacy_pending_state(int(mode_id))
+            else:
+                self._mode_pending_candidates.pop(int(mode_id), None)
+
+    def _pending_candidate_capacity(self) -> int:
+        """Bound temporary candidates without losing multi-outlier identity."""
+        return max(
+            1,
+            int(getattr(self, "adaptive_history_size", 1)),
+            int(getattr(self, "mode_capacity", 1)),
+            int(getattr(self, "gain_confirmation_min_count", 1)),
+        )
 
     @staticmethod
     def _rolling_quantile(values: Sequence[float], quantile: float) -> float:
@@ -1669,8 +1739,238 @@ class MemoryBank:
         if len(history) > self.adaptive_history_size:
             del history[:-self.adaptive_history_size]
 
+    def _sync_legacy_pending_state(self, mode_id: int) -> None:
+        """Mirror candidate records into the pre-candidate checkpoint fields.
+
+        Older checkpoints represented pending confirmation with one distance
+        list and one gain/count pair per mode.  Keep those fields populated as
+        a flattened/representative view so old inspection code continues to
+        work, while all new matching decisions use the law-keyed candidates.
+        """
+        mode_id = int(mode_id)
+        candidates = self._mode_pending_candidates.get(mode_id, [])
+        if not candidates:
+            self._mode_pending_distances.pop(mode_id, None)
+            self._mode_pending_gain_ema.pop(mode_id, None)
+            self._mode_pending_gain_count.pop(mode_id, None)
+            return
+
+        flattened: List[float] = []
+        for candidate in candidates:
+            flattened.extend(
+                float(value)
+                for value in candidate.get("distance_history", [])
+                if math.isfinite(float(value))
+            )
+        if flattened:
+            self._mode_pending_distances[mode_id] = flattened[
+                -self.adaptive_history_size :
+            ]
+        else:
+            self._mode_pending_distances.pop(mode_id, None)
+
+        # The aggregate maps have no exact representation when several
+        # candidates coexist.  Expose the most persistent one as a stable
+        # compatibility summary; candidate records remain authoritative.
+        representative = max(
+            enumerate(candidates),
+            key=lambda item: (int(item[1].get("count", 0)), item[0]),
+        )[1]
+        self._mode_pending_gain_ema[mode_id] = float(
+            representative.get("gain_ema", 0.0)
+        )
+        self._mode_pending_gain_count[mode_id] = int(
+            representative.get("count", 0)
+        )
+
+    def _find_pending_candidate(
+        self,
+        mode_id: int,
+        law_key: Tensor,
+    ) -> Optional[int]:
+        """Return the matching pending law candidate, if identity is clear.
+
+        Pending candidates use the duplicate-law similarity as their identity
+        gate.  Nearest-candidate matching without this gate would make two
+        unrelated outliers share a confirmation counter merely because they
+        are both nearest to the same old mode.
+        """
+        candidates = self._mode_pending_candidates.get(int(mode_id), [])
+        if not candidates:
+            return None
+        query = F.normalize(
+            law_key.detach().reshape(1, -1).to(
+                device=self.device, dtype=self.keys.dtype
+            ),
+            dim=-1,
+        ).reshape(-1)
+        best_index: Optional[int] = None
+        best_similarity = -1.0
+        for index, candidate in enumerate(candidates):
+            candidate_key = candidate.get("law_key")
+            if not torch.is_tensor(candidate_key):
+                continue
+            candidate_key = candidate_key.detach().reshape(-1).to(query)
+            if candidate_key.numel() != query.numel():
+                continue
+            candidate_key = F.normalize(candidate_key.reshape(1, -1), dim=-1).reshape(-1)
+            similarity = float(torch.dot(candidate_key, query).item())
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_index = index
+        if best_index is None or best_similarity < self.duplicate_threshold:
+            return None
+        return best_index
+
+    def _new_pending_candidate(
+        self,
+        mode_id: int,
+        law_key: Tensor,
+        prediction_gain: float,
+    ) -> int:
+        """Create a law-keyed temporary candidate and return its list index."""
+        mode_id = int(mode_id)
+        candidates = self._mode_pending_candidates.setdefault(mode_id, [])
+        if not candidates:
+            # A legacy checkpoint may have aggregate pending state but no law
+            # identity.  It cannot be safely attributed to this new candidate.
+            self._mode_pending_distances.pop(mode_id, None)
+            self._mode_pending_gain_ema.pop(mode_id, None)
+            self._mode_pending_gain_count.pop(mode_id, None)
+        normalized_law_key = F.normalize(
+            law_key.detach().reshape(1, -1).to(
+                device=self.device, dtype=self.keys.dtype
+            ),
+            dim=-1,
+        ).reshape(-1).clone()
+        candidates.append(
+            {
+                "law_key": normalized_law_key,
+                "gain_ema": float(prediction_gain),
+                "count": 1,
+                "distance_history": [],
+            }
+        )
+        candidate_capacity = self._pending_candidate_capacity()
+        if len(candidates) > candidate_capacity:
+            del candidates[:-candidate_capacity]
+        self._sync_legacy_pending_state(mode_id)
+        return len(candidates) - 1
+
+    def _update_pending_candidate_gain(
+        self,
+        mode_id: int,
+        candidate_index: int,
+        prediction_gain: float,
+    ) -> Tuple[float, int]:
+        """Apply one gain observation to an existing law candidate."""
+        mode_id = int(mode_id)
+        candidate = self._mode_pending_candidates[mode_id][candidate_index]
+        previous = candidate.get("gain_ema")
+        gain_ema = (
+            float(prediction_gain)
+            if previous is None
+            else self.gain_ema_decay * float(previous)
+            + (1.0 - self.gain_ema_decay) * float(prediction_gain)
+        )
+        count = int(candidate.get("count", 0)) + 1
+        candidate["gain_ema"] = gain_ema
+        candidate["count"] = count
+        self._sync_legacy_pending_state(mode_id)
+        return gain_ema, count
+
+    def _append_pending_candidate_distance(
+        self,
+        mode_id: int,
+        candidate_index: int,
+        distance: float,
+    ) -> None:
+        mode_id = int(mode_id)
+        candidate = self._mode_pending_candidates[mode_id][candidate_index]
+        history = candidate.setdefault("distance_history", [])
+        history.append(float(distance))
+        if len(history) > self.adaptive_history_size:
+            del history[:-self.adaptive_history_size]
+        self._sync_legacy_pending_state(mode_id)
+
+    def _promote_pending_candidate(
+        self,
+        mode_id: int,
+        *,
+        law_key: Optional[Tensor] = None,
+        candidate_index: Optional[int] = None,
+    ) -> bool:
+        """Promote one confirmed candidate's queued distances to its mode."""
+        mode_id = int(mode_id)
+        candidates = self._mode_pending_candidates.get(mode_id, [])
+        if candidate_index is None:
+            if law_key is None:
+                return False
+            candidate_index = self._find_pending_candidate(mode_id, law_key)
+        if candidate_index is None or not 0 <= int(candidate_index) < len(candidates):
+            return False
+        candidate = candidates.pop(int(candidate_index))
+        for distance in candidate.get("distance_history", []):
+            self._append_adaptive_value(
+                self._mode_distances, mode_id, float(distance)
+            )
+        if candidates:
+            self._mode_pending_candidates[mode_id] = candidates
+        else:
+            self._mode_pending_candidates.pop(mode_id, None)
+        self._sync_legacy_pending_state(mode_id)
+        return True
+
+    def _discard_pending_candidate(
+        self,
+        mode_id: int,
+        *,
+        law_key: Optional[Tensor] = None,
+        candidate_index: Optional[int] = None,
+    ) -> bool:
+        """Discard one candidate without affecting unrelated candidates."""
+        mode_id = int(mode_id)
+        candidates = self._mode_pending_candidates.get(mode_id, [])
+        if candidate_index is None:
+            if law_key is None:
+                return False
+            candidate_index = self._find_pending_candidate(mode_id, law_key)
+        if candidate_index is None or not 0 <= int(candidate_index) < len(candidates):
+            return False
+        candidates.pop(int(candidate_index))
+        if candidates:
+            self._mode_pending_candidates[mode_id] = candidates
+        else:
+            self._mode_pending_candidates.pop(mode_id, None)
+        self._sync_legacy_pending_state(mode_id)
+        return True
+
+    def _promote_pending_mode_distances(self, mode_id: int) -> None:
+        """Move queued outlier distances into a mode's accepted history.
+
+        A law outlier is not allowed to calibrate ``mode_radius`` merely
+        because it was observed once.  Once another observation confirms the
+        current mode, however, every queued law distance is evidence of that
+        mode's natural variation and should be included retrospectively.
+        """
+        mode_id = int(mode_id)
+        pending = self._mode_pending_distances.pop(mode_id, [])
+        for distance in pending:
+            self._append_adaptive_value(self._mode_distances, mode_id, distance)
+        if not self._mode_pending_candidates.get(mode_id):
+            self._mode_pending_gain_ema.pop(mode_id, None)
+            self._mode_pending_gain_count.pop(mode_id, None)
+
+    def _discard_pending_mode_distances(self, mode_id: int) -> None:
+        """Drop queued law distances when an outlier becomes a new mode."""
+        mode_id = int(mode_id)
+        self._mode_pending_distances.pop(mode_id, None)
+        self._mode_pending_candidates.pop(mode_id, None)
+        self._mode_pending_gain_ema.pop(mode_id, None)
+        self._mode_pending_gain_count.pop(mode_id, None)
+
     def adaptive_radii(self, mode_id: int) -> Tuple[float, float]:
-        """Return data-calibrated duplicate and local-variation radii."""
+        """Return radii from accepted plus retrospectively confirmed samples."""
         self._ensure_prototype_state()
         duplicate_prior = max(0.0, 1.0 - self.duplicate_threshold)
         mode_prior = max(duplicate_prior + self.radius_margin, 1.0 - self.mode_threshold)
@@ -1711,7 +2011,19 @@ class MemoryBank:
         distance: float,
         prediction_gain: float,
         duplicate: bool,
+        law_key: Optional[Tensor] = None,
     ) -> None:
+        # A duplicate/local observation after a queued outlier is a
+        # retrospective confirmation of the current mode.  Promote only the
+        # pending candidate with the same law identity; unrelated outliers
+        # waiting under this mode must remain quarantined.
+        mode_id = int(mode_id)
+        if self._mode_pending_candidates.get(mode_id):
+            self._promote_pending_candidate(mode_id, law_key=law_key)
+        elif mode_id in self._mode_pending_distances:
+            # Checkpoints written before law-keyed candidates have no identity
+            # to match.  Preserve their historical behavior on first use.
+            self._promote_pending_mode_distances(mode_id)
         distances = (
             self._mode_duplicate_distances
             if duplicate
@@ -1721,8 +2033,9 @@ class MemoryBank:
         self._append_adaptive_value(
             self._mode_normal_gains, mode_id, prediction_gain
         )
-        self._mode_pending_gain_ema.pop(int(mode_id), None)
-        self._mode_pending_gain_count.pop(int(mode_id), None)
+        if not self._mode_pending_candidates.get(mode_id):
+            self._mode_pending_gain_ema.pop(mode_id, None)
+            self._mode_pending_gain_count.pop(mode_id, None)
 
     def _confirm_new_mode(
         self,
@@ -1740,6 +2053,24 @@ class MemoryBank:
         count = self._mode_pending_gain_count.get(mode_id, 0) + 1
         self._mode_pending_gain_ema[mode_id] = gain_ema
         self._mode_pending_gain_count[mode_id] = count
+        threshold = self._gain_threshold(mode_id)
+        confirmed = (
+            count >= self.gain_confirmation_min_count
+            and gain_ema > threshold
+        )
+        return confirmed, gain_ema, threshold, count
+
+    def _confirm_pending_candidate(
+        self,
+        mode_id: int,
+        candidate_index: int,
+        prediction_gain: float,
+    ) -> Tuple[bool, float, float, int]:
+        """Update one law candidate and evaluate the mode confirmation gate."""
+        mode_id = int(mode_id)
+        gain_ema, count = self._update_pending_candidate_gain(
+            mode_id, candidate_index, prediction_gain
+        )
         threshold = self._gain_threshold(mode_id)
         confirmed = (
             count >= self.gain_confirmation_min_count
@@ -2317,73 +2648,62 @@ class MemoryBank:
                     distance=best_distance,
                     prediction_gain=gain_value,
                     duplicate=True,
+                    law_key=law_key,
                 )
                 result.update(decision)
                 result["match_type"] = "duplicate"
                 return result
+            # Every non-duplicate write is either a local variation of the
+            # nearest mode or a genuinely new mode.  A queued law outlier can
+            # be retrospectively admitted to the current mode once repeated
+            # low-gain evidence says that it is not a new dynamics; this is
+            # what lets the mode radius expand instead of being permanently
+            # censored by its cold-start threshold.
+            mode_id = best_mode
             if best_distance <= mode_radius:
                 append_is_duplicate_seed = False
                 match_type = "local_variation"
-                mode_rows = torch.nonzero(
-                    self.mode_ids == best_mode, as_tuple=False
-                ).flatten()
-                if bool(self.mode_compressed[mode_rows].any()):
-                    self.mode_compressed[mode_rows] = False
-                    self.stale_cycles[mode_rows] = 0.0
-                if mode_rows.numel() >= self.mode_capacity:
-                    result = self._refresh_prototype(
-                        best_index,
-                        key=key,
-                        delta_theta=delta_theta,
-                        law_key=law_key,
-                        window=window,
-                        quality=quality,
-                        queue=queue,
-                        law_key_builder=law_key_builder,
-                    )
-                    self._record_in_mode_observation(
-                        best_mode,
-                        distance=best_distance,
-                        prediction_gain=gain_value,
-                        duplicate=False,
-                    )
-                    result.update(decision)
-                    result["match_type"] = match_type
-                    return result
-                mode_id = best_mode
-                if len(self) >= self.capacity and not self._make_space(
-                    law_key_builder, protected_mode=best_mode
-                ):
-                    result = self._refresh_prototype(
-                        best_index,
-                        key=key,
-                        delta_theta=delta_theta,
-                        law_key=law_key,
-                        window=window,
-                        quality=quality,
-                        queue=queue,
-                        law_key_builder=law_key_builder,
-                    )
-                    self._record_in_mode_observation(
-                        best_mode,
-                        distance=best_distance,
-                        prediction_gain=gain_value,
-                        duplicate=False,
-                    )
-                    result.update(decision)
-                    result["match_type"] = match_type
-                    return result
-                self.mode_compressed[self.mode_ids == best_mode] = False
             else:
+                pending_candidate_index: Optional[int] = None
                 if gain_provided:
-                    confirmed, gain_ema, gain_threshold, pending_count = (
-                        self._confirm_new_mode(best_mode, gain_value)
+                    pending_candidate_index = self._find_pending_candidate(
+                        best_mode, law_key
                     )
+                    if pending_candidate_index is None:
+                        pending_candidate_index = self._new_pending_candidate(
+                            best_mode, law_key, gain_value
+                        )
+                        pending_candidate = self._mode_pending_candidates[
+                            best_mode
+                        ][pending_candidate_index]
+                        gain_ema = float(pending_candidate["gain_ema"])
+                        pending_count = int(pending_candidate["count"])
+                        gain_threshold = self._gain_threshold(best_mode)
+                        confirmed = (
+                            pending_count >= self.gain_confirmation_min_count
+                            and gain_ema > gain_threshold
+                        )
+                    else:
+                        confirmed, gain_ema, gain_threshold, pending_count = (
+                            self._confirm_pending_candidate(
+                                best_mode,
+                                pending_candidate_index,
+                                gain_value,
+                            )
+                        )
                     decision.update({
                         "gain_ema": gain_ema,
                         "gain_threshold": gain_threshold,
                         "confirmation_count": pending_count,
+                        "pending_candidate_count": len(
+                            self._mode_pending_candidates.get(best_mode, [])
+                        ),
                     })
+                    current_mode_confirmed = (
+                        not confirmed
+                        and not force_new_mode_confirmation
+                        and pending_count >= self.gain_confirmation_min_count
+                    )
                 else:
                     # Legacy callers do not have the signed local-adaptation
                     # gain needed by the confirmation gate.  Preserve their
@@ -2391,20 +2711,103 @@ class MemoryBank:
                     # wake/inference paths pass ``prediction_gain`` and use
                     # the persistent queue/confirmation policy above.
                     confirmed = True
-                if not (confirmed or force_new_mode_confirmation):
+                    current_mode_confirmed = False
+
+                if current_mode_confirmed:
+                    # This candidate is now confirmed as natural variation
+                    # of ``best_mode``.  Leave promotion until the common
+                    # local-variation path below has passed its capacity
+                    # checks.  If the mode is full, this observation is
+                    # queued and its pending distances must not calibrate the
+                    # persistent mode radius before a physical row exists.
+                    # Other unrelated candidates waiting under this mode stay
+                    # quarantined as well.
+                    decision["pending_candidate_count"] = len(
+                        self._mode_pending_candidates.get(best_mode, [])
+                    )
+                    append_is_duplicate_seed = False
+                    match_type = "local_variation"
+                else:
+                    if not (confirmed or force_new_mode_confirmation):
+                        # Queue the law distance on this candidate only.  A
+                        # different outlier nearest to the same mode receives
+                        # its own gain/count/history record.
+                        self._append_pending_candidate_distance(
+                            best_mode,
+                            int(pending_candidate_index),
+                            best_distance,
+                        )
+                        pending_candidate = self._mode_pending_candidates[
+                            best_mode
+                        ][int(pending_candidate_index)]
+                        decision["pending_distance_count"] = len(
+                            pending_candidate.get("distance_history", [])
+                        )
+                        decision["pending_candidate_count"] = len(
+                            self._mode_pending_candidates.get(best_mode, [])
+                        )
+                        return {
+                            "action": "queue",
+                            "index": -1,
+                            "mode_id": best_mode,
+                            "support": 0.0,
+                            "match_type": "pending_new_dynamics",
+                            **decision,
+                        }
+                    # A positive confirmation (or an explicit force) creates
+                    # a new mode.  Remove only the matching candidate so
+                    # unrelated pending laws can continue to be confirmed
+                    # against the old mode later.
+                    if pending_candidate_index is not None:
+                        self._discard_pending_candidate(
+                            best_mode,
+                            candidate_index=pending_candidate_index,
+                        )
+                        decision["pending_candidate_count"] = len(
+                            self._mode_pending_candidates.get(best_mode, [])
+                        )
+                    mode_id = self._next_mode_id
+                    self._next_mode_id += 1
+                    self._make_space(law_key_builder)
+
+            if not append_is_duplicate_seed:
+                mode_rows = torch.nonzero(
+                    self.mode_ids == best_mode, as_tuple=False
+                ).flatten()
+                if mode_rows.numel() >= self.mode_capacity:
+                    # A local variation is a distinct law-level prototype.
+                    # Never refresh an existing row just because its mode has
+                    # reached the row budget: doing so would overwrite the
+                    # law identity and incorrectly turn law variation into a
+                    # context-alias update.  Keep the candidate out of the
+                    # persistent bank until a row becomes available.
                     return {
                         "action": "queue",
                         "index": -1,
                         "mode_id": best_mode,
                         "support": 0.0,
-                        "match_type": "pending_new_dynamics",
+                        "match_type": "local_variation_capacity",
                         **decision,
                     }
-                self._mode_pending_gain_ema.pop(best_mode, None)
-                self._mode_pending_gain_count.pop(best_mode, None)
-                mode_id = self._next_mode_id
-                self._next_mode_id += 1
-                self._make_space(law_key_builder)
+                if bool(self.mode_compressed[mode_rows].any()):
+                    self.mode_compressed[mode_rows] = False
+                    self.stale_cycles[mode_rows] = 0.0
+                if len(self) >= self.capacity and not self._make_space(
+                    law_key_builder, protected_mode=best_mode
+                ):
+                    # The hard bank cap can leave no legal victim even when
+                    # this mode itself has spare row capacity (for example a
+                    # single-mode bank).  The same identity rule applies:
+                    # queue rather than refresh/overwrite an existing law.
+                    return {
+                        "action": "queue",
+                        "index": -1,
+                        "mode_id": best_mode,
+                        "support": 0.0,
+                        "match_type": "bank_capacity",
+                        **decision,
+                    }
+                self.mode_compressed[self.mode_ids == best_mode] = False
         else:
             mode_id = self._next_mode_id
             self._next_mode_id += 1
@@ -2431,7 +2834,17 @@ class MemoryBank:
                 distance=float(decision["distance"]),
                 prediction_gain=gain_value,
                 duplicate=False,
+                law_key=law_key,
             )
+            if "pending_candidate_count" in decision:
+                # A confirmed pending candidate is promoted by the common
+                # observation recorder only after capacity checks succeed.
+                # Reflect the post-promotion state in the returned decision;
+                # a queued capacity result above intentionally retains the
+                # candidate count for a later retry.
+                decision["pending_candidate_count"] = len(
+                    self._mode_pending_candidates.get(int(mode_id), [])
+                )
         result = {
             "action": "append",
             "match_type": match_type,
@@ -2562,12 +2975,18 @@ class MemoryBank:
             self._mode_duplicate_distances,
             self._mode_distances,
             self._mode_normal_gains,
+            self._mode_pending_distances,
             self._mode_pending_gain_ema,
             self._mode_pending_gain_count,
         ):
             for mode_id in list(values_by_mode):
                 if int(mode_id) not in remaining_modes:
                     values_by_mode.pop(mode_id, None)
+        for mode_id in list(self._mode_pending_candidates):
+            if int(mode_id) not in remaining_modes:
+                self._mode_pending_candidates.pop(mode_id, None)
+            else:
+                self._sync_legacy_pending_state(int(mode_id))
         self._sync_fixed_storage()
 
     @torch.no_grad()
@@ -2659,6 +3078,7 @@ class MemoryBank:
                 (source._mode_duplicate_distances, self._mode_duplicate_distances),
                 (source._mode_distances, self._mode_distances),
                 (source._mode_normal_gains, self._mode_normal_gains),
+                (source._mode_pending_distances, self._mode_pending_distances),
             ):
                 if int(source_mode) in source_values:
                     target_values[int(target_mode)] = list(
@@ -2671,6 +3091,33 @@ class MemoryBank:
                 self._mode_pending_gain_count[int(target_mode)] = int(
                     source._mode_pending_gain_count.get(int(source_mode), 0)
                 )
+            source_candidates = source._mode_pending_candidates.get(
+                int(source_mode), []
+            )
+            if source_candidates:
+                copied_candidates: List[Dict[str, Any]] = []
+                for candidate in source_candidates[
+                    -source._pending_candidate_capacity() :
+                ]:
+                    law_key = candidate.get("law_key")
+                    if not torch.is_tensor(law_key):
+                        continue
+                    copied_candidates.append(
+                        {
+                            "law_key": law_key.detach().to(self.device).reshape(-1).clone(),
+                            "gain_ema": float(candidate.get("gain_ema", 0.0)),
+                            "count": int(candidate.get("count", 0)),
+                            "distance_history": [
+                                float(value)
+                                for value in candidate.get("distance_history", [])
+                            ][-self.adaptive_history_size :],
+                        }
+                    )
+                if copied_candidates:
+                    self._mode_pending_candidates[int(target_mode)] = (
+                        copied_candidates
+                    )
+                    self._sync_legacy_pending_state(int(target_mode))
         self.mode_compressed = torch.cat(
             [self.mode_compressed, source.mode_compressed[indices].to(self.device)], dim=0
         )
@@ -2692,6 +3139,7 @@ class MemoryBank:
     @torch.no_grad()
     def clear(self) -> None:
         """Remove every entry while preserving device, dtype, and dimensions."""
+        self._ensure_prototype_state()
         self.keys = self.keys[:0]
         self.context_keys = self.context_keys[:0]
         self.context_valid = self.context_valid[:0]
@@ -2713,8 +3161,10 @@ class MemoryBank:
         self._mode_duplicate_distances.clear()
         self._mode_distances.clear()
         self._mode_normal_gains.clear()
+        self._mode_pending_distances.clear()
         self._mode_pending_gain_ema.clear()
         self._mode_pending_gain_count.clear()
+        self._mode_pending_candidates.clear()
         self._bind_fixed_storage_views(0)
     
     @torch.no_grad()

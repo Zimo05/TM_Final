@@ -288,7 +288,14 @@ def branch_support_and_gain(
     exclude_index: Optional[int] = None,
     max_references: Optional[int] = None,
 ) -> tuple[Tensor, Tensor]:
-    """Measure a residual candidate's soft coverage and utility on one branch."""
+    """Measure a residual candidate's soft coverage and utility on one branch.
+
+    ``candidate_key`` may contain one key ``[D]`` or every valid context
+    alias for a prototype ``[A, D]``.  Promotion is a context-retrieval
+    decision, so branch coverage uses the best candidate-alias/branch-alias
+    pair instead of silently falling back to the prototype's legacy first
+    alias.
+    """
     if temperature <= 0.0:
         raise ValueError("temperature must be positive")
     if branch_theta.ndim != 1:
@@ -298,8 +305,21 @@ def branch_support_and_gain(
         raise ValueError(f"branch_theta must contain {expected_dim} values")
     if candidate_delta.numel() != expected_dim:
         raise ValueError(f"candidate_delta must contain {expected_dim} values")
-    if candidate_key.numel() != branch_bank.key_dim:
-        raise ValueError("candidate key dimension does not match branch bank")
+    if candidate_key.ndim == 1:
+        if candidate_key.numel() != branch_bank.key_dim:
+            raise ValueError("candidate key dimension does not match branch bank")
+        candidate_keys = candidate_key.reshape(1, -1)
+    elif candidate_key.ndim == 2:
+        if (
+            candidate_key.size(0) == 0
+            or candidate_key.size(1) != branch_bank.key_dim
+        ):
+            raise ValueError(
+                "candidate keys must have shape [A, key_dim] with A > 0"
+            )
+        candidate_keys = candidate_key
+    else:
+        raise ValueError("candidate_key must have shape [key_dim] or [A, key_dim]")
 
     device = branch_theta.device
     dtype = branch_theta.dtype
@@ -320,8 +340,8 @@ def branch_support_and_gain(
     elif hawkes_ll.num_types != num_types or hawkes_ll.num_basis != num_basis:
         raise ValueError("hawkes_ll dimensions do not match promotion parameters")
 
-    candidate_key = torch.nn.functional.normalize(
-        candidate_key.to(device=device, dtype=dtype).reshape(-1), dim=0
+    candidate_keys = torch.nn.functional.normalize(
+        candidate_keys.to(device=device, dtype=dtype), dim=-1
     )
     corrected_theta = branch_theta + candidate_delta.to(
         device=device, dtype=dtype
@@ -343,12 +363,16 @@ def branch_support_and_gain(
     replay_context_valid = branch_bank.context_valid.index_select(
         0, index_tensor
     ).to(device=device)
+    # Keep the two identity spaces separate but compare all aliases on both
+    # sides.  For each branch row this is max_{i,j} cos(k^ctx_candidate_i,
+    # k^ctx_branch_j), exactly the reusable-context criterion used by sleep
+    # promotion.  Invalid padded branch aliases never participate.
     alias_similarities = torch.einsum(
-        "nkd,d->nk", replay_context_keys, candidate_key
+        "nkd,ad->nka", replay_context_keys, candidate_keys
     )
     similarities = alias_similarities.masked_fill(
-        ~replay_context_valid, -torch.inf
-    ).max(dim=-1).values
+        ~replay_context_valid.unsqueeze(-1), -torch.inf
+    ).max(dim=1).values.max(dim=-1).values
     weights_tensor = torch.sigmoid(
         (similarities - sim_threshold) / temperature
     )
@@ -412,12 +436,26 @@ def find_shared_memory_promotions(
     records: list[PromotionRecord] = []
 
     for source_node, source_bank in ((node_a, bank_a), (node_b, bank_b)):
+        source_bank._ensure_prototype_state()
         candidate_indices = _ranked_bank_indices(
             source_bank,
             limit=max_candidates,
         )
         for source_index in candidate_indices:
-            candidate_key = source_bank.keys[source_index]
+            # ``keys`` is intentionally kept as a legacy first-alias view for
+            # old retrieval/checkpoint consumers.  Promotion must instead
+            # carry the complete source prototype context identity so a
+            # reusable sibling alias is not lost merely because it is not the
+            # first slot.
+            candidate_aliases = source_bank.context_keys[source_index][
+                source_bank.context_valid[source_index]
+            ]
+            if candidate_aliases.numel() == 0:
+                # ``_ensure_prototype_state`` normally guarantees one valid
+                # alias, but retain a safe legacy fallback for malformed
+                # intermediate checkpoints.
+                candidate_aliases = source_bank.keys[source_index].reshape(1, -1)
+            candidate_key = candidate_aliases
             candidate_delta = source_bank.deltas[source_index]
             support_a, gain_a = branch_support_and_gain(
                 candidate_key, candidate_delta, bank_a, theta_a, decays,

@@ -799,17 +799,23 @@ class MemoryTreeInference:
         self,
         sequence: Mapping[str, Tensor],
         request: Mapping[str, Any],
-    ) -> None:
-        self._commit_delayed_writes_batch(sequence, [request])
+    ) -> bool:
+        persistent = self._commit_delayed_writes_batch(sequence, [request])
+        return bool(persistent[0]) if persistent else False
 
     def _commit_delayed_writes_batch(
         self,
         sequence: Mapping[str, Tensor],
         requests: Sequence[Mapping[str, Any]],
-    ) -> None:
-        """Commit ready delayed writes grouped by their owner node."""
+    ) -> list[bool]:
+        """Commit ready delayed writes and report persistent admissions.
+
+        A ``queue`` result is a pending-law candidate, not a committed
+        physical row.  Returning one flag per request prevents the caller
+        from marking queued candidates as accepted writes.
+        """
         if not requests:
-            return
+            return []
         records = []
         for request in requests:
             evidence = request.get("window_evidence")
@@ -827,6 +833,7 @@ class MemoryTreeInference:
         grouped_items = {}
         for owner_id, item in records:
             grouped_items.setdefault(owner_id, []).append(item)
+        persistent_by_item: dict[int, bool] = {}
         for owner_id, owner_items in grouped_items.items():
             reference = owner_items[0].key
             admission = self.tree.episodic_memory.add_memory_batch(
@@ -861,8 +868,11 @@ class MemoryTreeInference:
                 decays=self.hawkes.decays.detach(),
             )
             for item, result in zip(owner_items, admission):
-                if result["action"] != "queue":
+                persistent = result["action"] != "queue"
+                persistent_by_item[id(item)] = persistent
+                if persistent:
                     self.controller.split_queues[owner_id] += item.queue_weight
+        return [persistent_by_item.get(id(item), False) for _, item in records]
 
     def _enqueue_probation_candidate(
         self,
@@ -1745,10 +1755,14 @@ class MemoryTreeInference:
                 selected = []
             selected_requests = [eligible[index] for index in selected]
             if self.config.allow_memory_writes:
-                self._commit_delayed_writes_batch(
+                persistent_flags = self._commit_delayed_writes_batch(
                     sequence, selected_requests
                 )
-                for request in selected_requests:
+                for request, persistent in zip(
+                    selected_requests, persistent_flags
+                ):
+                    if not persistent:
+                        continue
                     request["committed"] = True
                     accepted_write_requests.append(request)
                     outputs[request["event_index"]]["write_accepted"] = True
@@ -1767,7 +1781,7 @@ class MemoryTreeInference:
             "accepted_write_count": (
                 accepted_write_count
                 if int(self.controller.controller_version.detach().cpu()) >= 6
-                else len(selected)
+                else len(accepted_write_requests)
             ),
             "local_accepted_write_count": local_accepted_write_count,
             "probation_validation_count": sum(

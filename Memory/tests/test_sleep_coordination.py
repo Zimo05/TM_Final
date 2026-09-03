@@ -5,7 +5,7 @@ import torch
 
 from HawkesBackbone import HawkesFamily
 from LatentHawkesTree import HawkesTree
-from MemoryResiduals.MemoryBank import EventWindow
+from MemoryResiduals.MemoryBank import EventWindow, MemoryBank
 from MemoryResiduals.Replay import replay_log_likelihood
 from Sleep.Coordinator import run_sleep_cycle
 from Sleep.Collapse import collapse_leaf_pair, collapse_snapshot_signature
@@ -13,6 +13,7 @@ from Sleep.Merge import (
     branch_support_and_gain,
     commit_merge,
     compute_differentiable_merge_objective,
+    find_shared_memory_promotions,
     make_merge_decisions,
 )
 import Sleep.Prune as sleep_prune
@@ -266,6 +267,97 @@ class SleepCoordinationTests(unittest.TestCase):
             (weights * gains).sum() / (weights.sum() + 1e-8),
             atol=1e-6,
         ))
+
+    def test_promotion_similarity_uses_all_candidate_context_aliases(self):
+        """A reusable non-first candidate alias must affect branch support."""
+        bank = MemoryBank(
+            device="cpu", key_dim=3, param_dim=6, capacity=2
+        )
+        window = EventWindow(
+            torch.tensor([0.1, 0.4, 0.9]),
+            torch.tensor([0, 1, 0]),
+            "branch",
+            0,
+            3,
+            True,
+        )
+        branch_key = torch.tensor([1.0, 0.0, 0.0])
+        bank.add(
+            branch_key,
+            torch.zeros(6),
+            window=window,
+            law_key=branch_key,
+        )
+        hawkes = HawkesFamily(2, 1, decays=self.decays)
+        candidate_aliases = torch.tensor([
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ])
+        support, _ = branch_support_and_gain(
+            candidate_aliases,
+            torch.zeros(6),
+            bank,
+            torch.zeros(6),
+            self.decays,
+            2,
+            1,
+            hawkes_ll=hawkes,
+        )
+        expected = torch.sigmoid(torch.tensor((1.0 - 0.7) / 0.1))
+        self.assertAlmostEqual(float(support), float(expected), places=6)
+
+    def test_shared_promotion_keeps_all_source_context_aliases(self):
+        """Promotion candidates must not collapse to ``source_bank.keys``."""
+        tree = HawkesTree(3, 4, 2, 1, init_depth=1, memory_key_dim=3)
+        node_a, node_b = tree.leaf_ids
+        window_a = EventWindow(
+            torch.tensor([0.1]), torch.tensor([0]), node_a, 0, 1, True
+        )
+        window_b = EventWindow(
+            torch.tensor([0.2]), torch.tensor([1]), node_b, 0, 1, True
+        )
+        first_alias = torch.tensor([1.0, 0.0, 0.0])
+        second_alias = torch.tensor([0.0, 1.0, 0.0])
+        tree.episodic_memory.add_memory(
+            node_a,
+            first_alias,
+            torch.zeros(tree.param_dim),
+            window=window_a,
+            law_key=first_alias,
+        )
+        tree.episodic_memory.add_memory(
+            node_b,
+            first_alias,
+            torch.zeros(tree.param_dim),
+            window=window_b,
+            law_key=first_alias,
+        )
+        source_bank = tree.episodic_memory.get_bank(node_a)
+        source_bank.context_keys[0, 1] = second_alias
+        source_bank.context_valid[0, 1] = True
+        source_bank.context_support[0, 1] = 1.0
+
+        captured = []
+
+        def fake_branch_score(candidate_key, *args, **kwargs):
+            captured.append(candidate_key.detach().clone())
+            return torch.tensor(2.0), torch.tensor(1.0)
+
+        with patch("Sleep.Merge.branch_support_and_gain", side_effect=fake_branch_score):
+            records = find_shared_memory_promotions(
+                tree,
+                "root",
+                self.decays,
+                min_support=1.0,
+                min_gain=0.0,
+                max_candidates=1,
+            )
+
+        self.assertEqual(len(records), 2)
+        self.assertGreaterEqual(len(captured), 2)
+        torch.testing.assert_close(
+            captured[0], source_bank.context_keys[0, :2]
+        )
 
     def test_topology_prune_batched_terms_match_scalar_replay(self):
         if torch.cuda.is_available():

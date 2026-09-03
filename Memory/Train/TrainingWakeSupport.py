@@ -1401,6 +1401,7 @@ class TrainingWakeSupportMixin:
             finalize_write_groups()
             return {
                 "write_counts": [0] * batch_size,
+                "write_decision_counts": [0] * batch_size,
                 "write_probe_counts": [0] * batch_size,
                 "write_gate_pass_counts": [0] * batch_size,
                 "write_utility_pass_counts": [0] * batch_size,
@@ -1418,6 +1419,7 @@ class TrainingWakeSupportMixin:
             finalize_write_groups()
             return {
                 "write_counts": [0] * batch_size,
+                "write_decision_counts": [0] * batch_size,
                 "write_probe_counts": [0] * batch_size,
                 "write_gate_pass_counts": [0] * batch_size,
                 "write_utility_pass_counts": [0] * batch_size,
@@ -1591,6 +1593,15 @@ class TrainingWakeSupportMixin:
         grouped_items = {}
         for item, owner_id in zip(selected_items, owner_ids):
             grouped_items.setdefault(owner_id, []).append(item)
+        # Keep the admission result attached to the packed probe position.
+        # ``selected`` is a pre-admission decision mask; a queued law
+        # candidate is intentionally absent from persistent memory until a
+        # later confirmation recurrence.
+        probe_index_by_item = {
+            id(item): probe_index
+            for probe_index, item in zip(selected_cpu, selected_items)
+        }
+        persistent_selected = torch.zeros_like(selected)
         for owner_id, owner_items in grouped_items.items():
             reference = owner_items[0].key
             admission = self.tree.episodic_memory.add_memory_batch(
@@ -1625,7 +1636,9 @@ class TrainingWakeSupportMixin:
                 decays=self.hawkes.decays.detach(),
             )
             for item, result in zip(owner_items, admission):
-                if result["action"] != "queue":
+                persistent = result["action"] != "queue"
+                if persistent:
+                    persistent_selected[probe_index_by_item[id(item)]] = True
                     self.controller.split_queues[owner_id] += item.queue_weight
 
         def request_token(probe_index: int) -> tuple[int, int]:
@@ -1638,7 +1651,10 @@ class TrainingWakeSupportMixin:
                 int(packed["event_indices"][probe_index].detach().cpu()),
             )
 
-        accepted_tokens = [request_token(index) for index in selected_cpu]
+        persistent_indices = torch.nonzero(
+            persistent_selected, as_tuple=False
+        ).flatten().detach().cpu().tolist()
+        accepted_tokens = [request_token(index) for index in persistent_indices]
         shadow_records = []
         for probe_index, item, owner_id in zip(
             shadow_cpu, shadow_items, shadow_owner_ids
@@ -1676,7 +1692,7 @@ class TrainingWakeSupportMixin:
         write_probe_counts = torch.bincount(
             sequence_rows, minlength=batch_size
         ).detach().cpu().tolist()
-        accepted_counts = per_sequence_count(selected)
+        accepted_counts = per_sequence_count(persistent_selected)
         accepted_utility = torch.zeros(
             batch_size,
             device=evidence["write_utility"].device,
@@ -1685,13 +1701,15 @@ class TrainingWakeSupportMixin:
         accepted_utility.index_add_(
             0,
             sequence_rows,
-            evidence["write_utility"] * selected.to(evidence["write_utility"]),
+            evidence["write_utility"]
+            * persistent_selected.to(evidence["write_utility"]),
         )
         harmful = per_sequence_count(
-            selected & (evidence["write_utility"] <= 0.0)
+            persistent_selected & (evidence["write_utility"] <= 0.0)
         )
         return {
             "write_counts": accepted_counts,
+            "write_decision_counts": per_sequence_count(selected),
             "write_probe_counts": [int(value) for value in write_probe_counts],
             "write_gate_pass_counts": per_sequence_count(gate_pass),
             "write_utility_pass_counts": per_sequence_count(utility_pass),
@@ -2064,7 +2082,7 @@ class TrainingWakeSupportMixin:
         self,
         sequence: Mapping[str, Tensor],
         request: Mapping[str, Any],
-    ) -> None:
+    ) -> bool:
         """Commit a write only after its complete future horizon is observed."""
         evidence = request.get("window_evidence")
         if evidence is None:
@@ -2089,19 +2107,29 @@ class TrainingWakeSupportMixin:
             semantic_theta=self.tree.semantic_theta(owner_id).detach(),
             decays=self.hawkes.decays.detach(),
         )
-        if admission["action"] != "queue":
+        persistent = admission["action"] != "queue"
+        if persistent:
             self.controller.split_queues[
                 owner_id
             ] += item.queue_weight
+        return persistent
 
     def _commit_write_requests_batch(
         self,
         sequence: Mapping[str, Tensor],
         requests: Sequence[Mapping[str, Any]],
-    ) -> None:
-        """Commit selected writes with one residual-gradient evaluation."""
+    ) -> list[bool]:
+        """Commit selected writes and report which rows became persistent.
+
+        ``MemoryBank.add_memory_batch`` can deliberately return ``queue`` for
+        a law outlier while it collects confirmation evidence.  Such a row is
+        selected/probed, but it is not a physical prototype yet.  Returning a
+        flag for every input request keeps Wake's accepted-write metrics,
+        utility sums, and structural tokens aligned with the actual admission
+        result instead of the pre-admission selection mask.
+        """
         if not requests:
-            return
+            return []
         evidence_rows = []
         owner_ids = []
         for request in requests:
@@ -2130,6 +2158,7 @@ class TrainingWakeSupportMixin:
         grouped_items = {}
         for owner_id, item in zip(owner_ids, items):
             grouped_items.setdefault(owner_id, []).append(item)
+        persistent_by_item: dict[int, bool] = {}
         for owner_id, owner_items in grouped_items.items():
             reference = owner_items[0].key
             owner_keys = torch.stack([
@@ -2168,8 +2197,11 @@ class TrainingWakeSupportMixin:
                 decays=self.hawkes.decays.detach(),
             )
             for item, result in zip(owner_items, admission):
-                if result["action"] != "queue":
+                persistent = result["action"] != "queue"
+                persistent_by_item[id(item)] = persistent
+                if persistent:
                     self.controller.split_queues[owner_id] += item.queue_weight
+        return [persistent_by_item.get(id(item), False) for item in items]
 
     def _encode_memory_event(
         self,

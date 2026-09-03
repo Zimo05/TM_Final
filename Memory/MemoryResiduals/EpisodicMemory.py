@@ -1222,7 +1222,7 @@ class TreeEpisodicMemory(nn.Module):
         return result, info
 
     def get_extra_state(self):
-        """Save effective ages so checkpoints remain format-compatible."""
+        """Save effective ages and adaptive admission state."""
         for bank in self.banks.values():
             bank._ensure_prototype_state()
         return {
@@ -1254,8 +1254,31 @@ class TreeEpisodicMemory(nn.Module):
                         int(mode): list(values)
                         for mode, values in bank._mode_normal_gains.items()
                     },
+                    "pending_distances": {
+                        int(mode): list(values)
+                        for mode, values in bank._mode_pending_distances.items()
+                    },
                     "pending_gain_ema": dict(bank._mode_pending_gain_ema),
                     "pending_gain_count": dict(bank._mode_pending_gain_count),
+                    "pending_candidates": {
+                        int(mode): [
+                            {
+                                "law_key": candidate["law_key"].detach().cpu()
+                                if torch.is_tensor(candidate.get("law_key"))
+                                else None,
+                                "gain_ema": float(candidate.get("gain_ema", 0.0)),
+                                "count": int(candidate.get("count", 0)),
+                                "distance_history": [
+                                    float(value)
+                                    for value in candidate.get(
+                                        "distance_history", []
+                                    )
+                                ],
+                            }
+                            for candidate in candidates
+                        ]
+                        for mode, candidates in bank._mode_pending_candidates.items()
+                    },
                 },
                 "usage": bank.usage.detach().cpu(),
                 "cycle_usage": bank.cycle_usage.detach().cpu(),
@@ -1361,6 +1384,10 @@ class TreeEpisodicMemory(nn.Module):
                 int(mode): [float(value) for value in values]
                 for mode, values in adaptive_state.get("normal_gains", {}).items()
             }
+            bank._mode_pending_distances = {
+                int(mode): [float(value) for value in values]
+                for mode, values in adaptive_state.get("pending_distances", {}).items()
+            }
             bank._mode_pending_gain_ema = {
                 int(mode): float(value)
                 for mode, value in adaptive_state.get("pending_gain_ema", {}).items()
@@ -1369,6 +1396,33 @@ class TreeEpisodicMemory(nn.Module):
                 int(mode): int(value)
                 for mode, value in adaptive_state.get("pending_gain_count", {}).items()
             }
+            bank._mode_pending_candidates = {}
+            for mode, candidates in adaptive_state.get(
+                "pending_candidates", {}
+            ).items():
+                restored_candidates = []
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    law_key = candidate.get("law_key")
+                    if not torch.is_tensor(law_key):
+                        continue
+                    restored_candidates.append(
+                        {
+                            "law_key": law_key.to(self.device).reshape(-1).clone(),
+                            "gain_ema": float(candidate.get("gain_ema", 0.0)),
+                            "count": int(candidate.get("count", 0)),
+                            "distance_history": [
+                                float(value)
+                                for value in candidate.get(
+                                    "distance_history", []
+                                )
+                            ],
+                        }
+                    )
+                if restored_candidates:
+                    bank._mode_pending_candidates[int(mode)] = restored_candidates
+                    bank._sync_legacy_pending_state(int(mode))
             bank.usage = bank_state["usage"].to(self.device)
             # Backward-compatible defaults for checkpoints written before
             # cycle-level pruning state was introduced.

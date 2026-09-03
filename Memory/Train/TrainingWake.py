@@ -522,11 +522,21 @@ class TrainingWakeMixin:
         # Physical memory mutation follows causal sequence order.  Ranking
         # decides *which* rows survive the per-sequence budget; it does not
         # reorder the committed transaction.
+        persistent_writes = selected_writes
         selected_writes.sort(
             key=lambda request: int(request["event_index"])
         )
         if not self.training_config.controller_only_finetune:
-            self._commit_write_requests_batch(sequence, selected_writes)
+            persistent_flags = self._commit_write_requests_batch(
+                sequence, selected_writes
+            )
+            persistent_writes = [
+                request
+                for request, persistent in zip(
+                    selected_writes, persistent_flags
+                )
+                if persistent
+            ]
             source_id = int(torch.as_tensor(
                 sequence.get(
                     "source_index",
@@ -535,7 +545,7 @@ class TrainingWakeMixin:
             ).detach().cpu())
             accepted_tokens = [
                 (source_id, int(request["event_index"]))
-                for request in selected_writes
+                for request in persistent_writes
             ]
             selected_ids = {id(request) for request in selected_writes}
             shadow_candidates = []
@@ -585,8 +595,10 @@ class TrainingWakeMixin:
             self.controller_utility_replay.finalize_write_group(
                 int(torch.as_tensor(sequence.get("source_index", -1)).detach().cpu())
             )
+        # Selection/probe counts remain diagnostic, while accepted/write
+        # counts describe rows that actually became persistent prototypes.
         write_decision_count = len(selected_writes)
-        write_count = len(selected_writes)
+        write_count = len(persistent_writes)
         pending_writes = incomplete_writes
         action_values = tuple(Action)
         action_index_values = (
@@ -656,7 +668,7 @@ class TrainingWakeMixin:
             "write_beneficial_count": max(
                 write_count - sum(
                     float(request["window_evidence"]["write_utility"].detach().cpu()) <= 0.0
-                    for request in selected_writes
+                    for request in persistent_writes
                 ),
                 0,
             ),
@@ -708,11 +720,11 @@ class TrainingWakeMixin:
             "write_utility_pass_count": write_utility_pass_count,
             "accepted_write_utility_sum": sum(
                 float(request["window_evidence"]["write_utility"].detach().cpu())
-                for request in selected_writes
+                for request in persistent_writes
             ),
             "harmful_write_count": sum(
                 float(request["window_evidence"]["write_utility"].detach().cpu()) <= 0.0
-                for request in selected_writes
+                for request in persistent_writes
             ),
             "mean_novelty": novelty_total_value / max(event_count, 1),
             "mean_weighted_similarity": (
@@ -1674,7 +1686,9 @@ class TrainingWakeMixin:
                 controller_version=controller_version,
             )
             write_counts = write_summary["write_counts"]
-            write_decision_counts = list(write_counts)
+            write_decision_counts = write_summary.get(
+                "write_decision_counts", list(write_counts)
+            )
             write_probe_counts = write_summary["write_probe_counts"]
             write_gate_pass_counts = write_summary[
                 "write_gate_pass_counts"
@@ -1767,14 +1781,22 @@ class TrainingWakeMixin:
                     ]
                 else:
                     selected = []
+                persistent_selected = selected
                 if not self.training_config.controller_only_finetune:
-                    self._commit_write_requests_batch(sequence, selected)
+                    persistent_flags = self._commit_write_requests_batch(
+                        sequence, selected
+                    )
+                    persistent_selected = [
+                        request
+                        for request, persistent in zip(selected, persistent_flags)
+                        if persistent
+                    ]
                     source_id = int(torch.as_tensor(
                         sequence.get("source_index", row)
                     ).detach().cpu())
                     accepted_tokens = [
                         (source_id, int(request["event_index"]))
-                        for request in selected
+                        for request in persistent_selected
                     ]
                     selected_ids = {id(request) for request in selected}
                     shadow_candidates = []
@@ -1829,7 +1851,11 @@ class TrainingWakeMixin:
                             .cpu()
                         )
                     )
-                write_counts[row] = len(selected)
+                # A selected row that the bank quarantines as ``queue`` is
+                # not a persistent write yet. Keep decision/probe/gate
+                # diagnostics on their pre-admission masks, but report
+                # accepted/write metrics from the actual admission result.
+                write_counts[row] = len(persistent_selected)
                 write_decision_counts[row] = len(selected)
                 accepted_write_utility_sums[row] = sum(
                     float(
@@ -1837,7 +1863,7 @@ class TrainingWakeMixin:
                         .detach()
                         .cpu()
                     )
-                    for request in selected
+                    for request in persistent_selected
                 )
                 harmful_write_counts[row] = sum(
                     float(
@@ -1846,7 +1872,7 @@ class TrainingWakeMixin:
                         .cpu()
                     )
                     <= 0.0
-                    for request in selected
+                    for request in persistent_selected
                 )
                 pending_counts[row] = len(incomplete)
 
