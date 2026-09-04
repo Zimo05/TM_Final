@@ -113,8 +113,9 @@ class TrainingSleepMixin:
         # persistent EpisodicMemory boundary.
         self.sleep_state["structural_evidence_buffer"] = {}
         # Split search domain must always be all currently active leaves.
-        # ``bank_mode_probes`` provides frozen Pre-Light hypotheses for
-        # selected leaves; it must never restrict which leaves are evaluated.
+        # ``bank_mode_probes`` provides frozen Pre-Light hypotheses only for
+        # leaves protected from Light; it must never restrict which leaves
+        # are evaluated.  Unprotected leaves rebuild from post-Light state.
         leaf_ids = list(self.tree.leaf_ids)
         for leaf_id in leaf_ids:
             if progress is not None:
@@ -1299,9 +1300,10 @@ class TrainingSleepMixin:
                         sleep_progress if show_progress else None
                     ),
                     max_evidence=self.sleep_config.deep_evidence_budget,
-                    # Every valid Pre-Light hypothesis is reused by Deep;
-                    # ``protected_probes`` remains only the Light veto set.
-                    bank_mode_probes=bank_mode_probes,
+                    # Only protected leaves skipped Light, so only they may
+                    # reuse the frozen Pre-Light H0/H1 object.  Unprotected
+                    # leaves must rebuild from their post-Light Bank/theta.
+                    bank_mode_probes=protected_probes,
                 )
                 split_proposal_count = len(split_proposals)
                 topology_log_lines.append(
