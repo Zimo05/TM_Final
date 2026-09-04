@@ -1484,6 +1484,18 @@ class TrainingLoopMixin:
                         "probability", 0.0
                     )
                 )
+                # ``Q`` in the compact wake-action summary is Bank structural
+                # evidence, not the event-level controller queue count.  The
+                # latter remains available above as ``queue_split``.
+                bank_structural_evidence = (
+                    0.0
+                    if sleep_result is None
+                    else float(
+                        sleep_result.get("deep_pressure", {}).get(
+                            "E_bank_struct", 0.0
+                        )
+                    )
+                )
                 unified_stats = (
                     {} if sleep_result is None
                     else sleep_result.get("unified_topology", {})
@@ -1502,7 +1514,7 @@ class TrainingLoopMixin:
                     f"A{wake_action_counts[Action.ASSIMILATE.value]}/"
                     f"R{wake_action_counts[Action.RETRIEVE.value]}/"
                     f"M{wake_action_counts[Action.MEMORIZE.value]}/"
-                    f"Q{wake_action_counts[Action.QUEUE_SPLIT.value]} "
+                    f"Q{bank_structural_evidence:.4f} "
                     f"novelty={novelty_total / max(event_count, 1):.4f} "
                     f"weighted_sim={max_similarity_total / max(event_count, 1):.4f} "
                     f"wm_grad_max={max_gradient_norm:.3e} "

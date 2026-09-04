@@ -764,6 +764,9 @@ def run_light_sleep(
     settings: Optional[LightSleepSettings] = None,
     state: Optional[Dict[str, object]] = None,
     protected_leaf_ids: Collection[str] = (),
+    # Deprecated compatibility hook for direct callers of the old Light-owned
+    # probe path.  TrainingSleep precomputes structural probes before calling
+    # this function and passes only protected_leaf_ids in production.
     structural_probe: Optional[
         Callable[
             [str, MemoryBank, LightAbsorptionProposal],
@@ -771,7 +774,13 @@ def run_light_sleep(
         ]
     ] = None,
 ) -> Dict[str, object]:
-    """Run one fixed-topology, globally budgeted consolidation cycle."""
+    """Run one fixed-topology, globally budgeted consolidation cycle.
+
+    Structural Split protection is supplied through ``protected_leaf_ids``
+    before this cycle starts.  ``structural_probe`` remains only as a backward
+    compatible escape hatch for older direct callers; the training state
+    machine no longer uses it.
+    """
     settings = LightSleepSettings() if settings is None else settings
     settings.validate()
     state = {} if state is None else state

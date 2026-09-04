@@ -45,7 +45,7 @@ class SleepOrchestrator:
                 result["deep_gate"]["hard_gate"],
             )
         )
-        # Light owns the frozen snapshot and the Bank-mode probe.  Keep the
+        # TrainingSleep owns the frozen pre-Light Bank probe.  Keep the
         # diagnostic order aligned with the actual lifecycle rather than
         # reporting the gate before the work it gates.
         control_flow = [

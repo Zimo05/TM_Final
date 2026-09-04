@@ -79,8 +79,12 @@ def format_split_candidate_log(
         return None
 
     diagnostics = candidate.diagnostics
+    # ``N_L_eff``/``N_R_eff`` are child ESS diagnostics.  Keep the old
+    # ``child_effective_mass`` key as a compatibility fallback for logs
+    # written before the two quantities were separated.
     child_effective_mass = diagnostics.get(
-        "child_effective_mass", (float("nan"), float("nan"))
+        "child_ess",
+        diagnostics.get("child_effective_mass", (float("nan"), float("nan"))),
     )
     if not isinstance(child_effective_mass, Sequence):
         child_effective_mass = (float("nan"), float("nan"))
@@ -109,24 +113,41 @@ def format_split_candidate_log(
 
     reason = str(diagnostics.get("reason", "unknown"))
     target = candidate.target if candidate.target is not None else "<unknown>"
+    route_kl = scalar(
+        diagnostics.get("route_KL", diagnostics.get("route_kl", 0.0))
+    )
+    route_accuracy = scalar(
+        diagnostics.get(
+            "route_acc", diagnostics.get("route_accuracy", 0.0)
+        )
+    )
+    structural_gain = scalar(
+        diagnostics.get("G_struct", diagnostics.get("prediction_gain"))
+    )
     return (
         f"{target} "
         f"Q_decision={scalar(diagnostics.get('Q_decision', 0.0)):.6g} "
         f"E_bank_struct={scalar(diagnostics.get('E_bank_struct', 0.0)):.6g} "
         f"N_persistent={scalar(diagnostics.get('N_persistent', 0.0)):.6g} "
+        f"K_mode={integer(diagnostics.get('K_mode', diagnostics.get('K_law_mode', 0)))} "
         f"K_law_mode={integer(diagnostics.get('K_law_mode', 0))} "
+        f"K_effective_mode={integer(diagnostics.get('K_effective_mode', 0))} "
         f"N_bank={integer(diagnostics.get('N_bank', candidate.replay_size))} "
         f"N_shadow={integer(diagnostics.get('N_shadow', 0))} "
         f"N_replay={integer(diagnostics.get('N_replay', candidate.replay_size))} "
         f"A_probe={scalar(diagnostics.get('probe_advantage', 0.0)):+.6g} "
+        f"route_KL={route_kl:.6g} "
+        f"route_acc={route_accuracy:.6g} "
         f"N_eff={scalar(candidate.effective_sample_size):.6g} "
         f"N_L_eff={scalar(child_left):.6g} "
         f"N_R_eff={scalar(child_right):.6g} "
         f"S_structural={scalar(diagnostics.get('structural_strength')):.6g} "
+        f"G_struct={structural_gain:+.6g} "
         f"G_pred={scalar(diagnostics.get('prediction_gain')):+.6g} "
         f"G_sigma={scalar(candidate.uncertainty):.6g} "
         f"G_raw={scalar(candidate.raw_gain):+.6g} "
         f"G_conservative={scalar(candidate.conservative_gain):+.6g} "
+        f"split={str(diagnostics.get('split_status', 'candidate'))} "
         f"eligible={bool(candidate.eligible)} "
         f"ready={bool(candidate.ready)} "
         f"reason={reason}"
@@ -255,14 +276,27 @@ def build_split_candidate(
     min_effective_sample_size: float,
     eps: float = 1e-8,
 ) -> UnifiedTopologyCandidate:
-    """Re-evaluate the fitted hard child mixture against the parent."""
+    """Re-evaluate the Bank-conditioned structural H1 against the parent.
+
+    Router likelihood is retained in the diagnostics only.  It is trained by
+    Split's separate distillation term and never contributes to ``G_pred``.
+    """
     action_id = f"split:{topology_revision}:{leaf_id}"
     payload = (split_module, output)
     if lambda_T < 0.0 or uncertainty_kappa < 0.0:
         raise ValueError("split topology price and uncertainty must be non-negative")
     try:
         parent = torch.as_tensor(output["logp0"])
-        children = torch.as_tensor(output["logp_child_mix"]).to(parent)
+        # New Split outputs distinguish the persistent Bank H1 from the
+        # implementation router.  The old key is accepted only for payloads
+        # written before that distinction existed.
+        child_likelihood = output.get(
+            "logp_child_bank",
+            output.get("logp_child_mix"),
+        )
+        if child_likelihood is None:
+            raise KeyError("logp_child_bank")
+        children = torch.as_tensor(child_likelihood).to(parent)
         weights = torch.as_tensor(
             output.get("replay_weights", torch.ones_like(parent))
         ).to(parent)
@@ -337,6 +371,26 @@ def build_split_candidate(
         device=parent.device,
         dtype=parent.dtype,
     ).detach().reshape(())
+    two_sided_tensor = torch.as_tensor(
+        output.get("two_sided_support", True),
+        device=parent.device,
+    ).detach()
+    two_sided_valid = (
+        two_sided_tensor.numel() == 1
+        and bool(torch.isfinite(two_sided_tensor).all())
+        and bool(two_sided_tensor.bool().all())
+    )
+    invalid_tensor = torch.as_tensor(
+        output.get("invalid_proposal", False),
+        device=parent.device,
+    ).detach()
+    invalid_flag_is_valid = (
+        invalid_tensor.numel() == 1
+        and bool(torch.isfinite(invalid_tensor).all())
+    )
+    invalid_proposal = bool(
+        invalid_flag_is_valid and bool(invalid_tensor.bool().item())
+    )
     if child_ess.shape == (2,):
         child_ess_values = child_ess
         child_metrics_finite = torch.isfinite(child_ess).all()
@@ -345,6 +399,15 @@ def build_split_candidate(
         child_metrics_finite = torch.zeros(
             (), device=parent.device, dtype=torch.bool
         )
+    child_mass = torch.as_tensor(
+        output.get("N_mass", output.get("N", ())),
+        device=parent.device,
+        dtype=parent.dtype,
+    ).detach().reshape(-1)
+    if child_mass.shape != (2,):
+        child_mass_values = [float("nan"), float("nan")]
+    else:
+        child_mass_values = child_mass.cpu().tolist()
     eligible_tensor = (
         child_metrics_finite
         & torch.isfinite(bank_structural_mass_tensor)
@@ -352,6 +415,9 @@ def build_split_candidate(
         & torch.isfinite(proposal_ess_tensor)
         & torch.isfinite(raw_gain)
         & torch.isfinite(uncertainty)
+        & torch.as_tensor(two_sided_valid, device=parent.device)
+        & torch.as_tensor(invalid_flag_is_valid, device=parent.device)
+        & torch.as_tensor(not invalid_proposal, device=parent.device)
     )
     relaxed_gate = torch.as_tensor(
         output.get("g_split", 0.0),
@@ -397,7 +463,13 @@ def build_split_candidate(
         output.get("N_persistent", 0.0)
     ).detach().cpu())
     k_law_mode = int(torch.as_tensor(
-        output.get("K_law_mode", 0)
+        output.get("K_mode", output.get("K_law_mode", 0))
+    ).detach().cpu())
+    k_effective_mode = int(torch.as_tensor(
+        output.get(
+            "K_effective_mode",
+            output.get("K_law_effective_mode", 0),
+        )
     ).detach().cpu())
     return UnifiedTopologyCandidate(
         action_id=action_id,
@@ -420,7 +492,11 @@ def build_split_candidate(
             "Q_decision": q_decision,
             "E_bank_struct": e_bank_struct,
             "N_persistent": n_persistent,
+            "K_mode": k_law_mode,
             "K_law_mode": k_law_mode,
+            "K_effective_mode": k_effective_mode,
+            "two_sided_support": bool(two_sided_valid),
+            "invalid_proposal": bool(invalid_proposal),
             "probe_advantage": float(torch.as_tensor(
                 output.get("probe_advantage", 0.0)
             ).detach().cpu()),
@@ -430,10 +506,26 @@ def build_split_candidate(
             "probe_loss_h1": float(torch.as_tensor(
                 output.get("probe_loss_h1", 0.0)
             ).detach().cpu()),
+            "route_kl": float(torch.as_tensor(
+                output.get("route_kl", 0.0)
+            ).detach().cpu()),
+            "route_KL": float(torch.as_tensor(
+                output.get("route_KL", output.get("route_kl", 0.0))
+            ).detach().cpu()),
+            "route_accuracy": float(torch.as_tensor(
+                output.get("route_accuracy", 0.0)
+            ).detach().cpu()),
+            "route_acc": float(torch.as_tensor(
+                output.get("route_acc", output.get("route_accuracy", 0.0))
+            ).detach().cpu()),
+            "G_struct": float(mean_gain_value),
             "prediction_gain": float(mean_gain_value),
             "complexity_delta": 1.0,
             "lambda_T": float(lambda_T),
-            "child_effective_mass": [child_ess_left, child_ess_right],
+            # New diagnostics keep physical child mass and child ESS
+            # distinct.  The formatter uses child_ess for N_L_eff/N_R_eff.
+            "child_effective_mass": child_mass_values,
+            "child_ess": [child_ess_left, child_ess_right],
             "structural_strength": float(structural_strength),
             "proposal_effective_sample_size": float(proposal_ess),
             "relaxed_gate": float(relaxed_gate_value),

@@ -317,11 +317,15 @@ class SleepConfig:
     action_selector_grad_clip: float = 5.0
     # Smooth local topology trust region.  A recently edited region pays a
     # decaying gain penalty instead of entering a global/hard cooldown.
-    topology_inertia_strength: float = 0.10
+    topology_inertia_strength: float = 0.01
     topology_inertia_tau: float = 3.0
     # Deprecated checkpoint/CLI compatibility field.  Hard Merge cooldown is
     # no longer applied; ``topology_inertia_*`` owns edit hysteresis.
     merge_cooldown_cycles: int = 3
+    # Weight for the standalone q_bank -> router distillation objective used
+    # while fitting Split. It is deliberately excluded from structural gain.
+    # Appended to preserve positional construction of older SleepConfig data.
+    split_route_loss_weight: float = 1.0
 
 
 @dataclass
@@ -332,8 +336,9 @@ class StructureConfig:
     # Complete-refinement topology collapse is delayed until routing has had
     # time to stabilize. No low-mass leaf deletion exists in Sleep.
     prune_warmup_epochs: int = 10
-    # Parent replay is retained after split only when its normalized
-    # log-likelihood beats the best child by more than this hard margin.
+    # Deprecated Split-commit compatibility margin. Bank-backed Split commits
+    # partition the complete source Bank from its persistent mode identity;
+    # direct legacy payloads may still use this parent-retention fallback.
     split_memory_hard_threshold: float = 0.0
     # Deprecated compatibility field. Merge topology commits preserve every
     # replay row after rebasing it to the fused parent semantic reference.

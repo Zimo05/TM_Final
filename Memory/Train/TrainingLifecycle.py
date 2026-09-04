@@ -189,6 +189,18 @@ class TrainingLifecycleMixin:
             raise ValueError(
                 "split_min_replay_per_group must be non-negative"
             )
+        split_route_loss_weight = getattr(
+            self.sleep_config,
+            "split_route_loss_weight",
+            1.0,
+        )
+        if (
+            not math.isfinite(float(split_route_loss_weight))
+            or split_route_loss_weight < 0.0
+        ):
+            raise ValueError(
+                "split_route_loss_weight must be finite and non-negative"
+            )
         if self.sleep_config.deep_availability_tau <= 0.0:
             raise ValueError("deep_availability_tau must be positive")
         if not 0.0 <= self.sleep_config.deep_accumulator_decay < 1.0:

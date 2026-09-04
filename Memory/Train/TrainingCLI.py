@@ -477,6 +477,15 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--split-route-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the standalone Bank-to-router distillation loss during "
+            "Split fitting; it is excluded from structural gain."
+        ),
+    )
+    parser.add_argument(
         "--deep-availability-tau",
         "--deep-cooldown-tau",
         "--deep-min-interval",
@@ -527,7 +536,7 @@ def _parse_args():
     parser.add_argument(
         "--topology-inertia-strength",
         type=float,
-        default=0.10,
+        default=0.01,
         help=(
             "Maximum local gain penalty immediately after a topology edit."
         ),
@@ -809,6 +818,13 @@ def main() -> None:
         raise ValueError("--route-teacher-temperature must be positive")
     if args.route_probe_weight < 0.0:
         raise ValueError("--route-probe-weight must be non-negative")
+    if (
+        not math.isfinite(args.split_route_loss_weight)
+        or args.split_route_loss_weight < 0.0
+    ):
+        raise ValueError(
+            "--split-route-loss-weight must be finite and non-negative"
+        )
     if not 0.0 <= args.route_probe_leaf_smoothing < 1.0:
         raise ValueError(
             "--route-probe-leaf-smoothing must lie in [0, 1)"
@@ -1496,6 +1512,7 @@ def main() -> None:
             split_min_effective_sample_size=(
                 args.split_min_effective_sample_size
             ),
+            split_route_loss_weight=args.split_route_loss_weight,
         ),
         structure=StructureConfig(
             prune_warmup_epochs=args.prune_warmup_epochs,

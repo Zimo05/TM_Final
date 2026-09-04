@@ -480,6 +480,7 @@ class LightDeepSleepTests(unittest.TestCase):
             windows[0],
             law_key=law_a,
             prediction_gain=1.0,
+            queue_weight=1.0,
             force_new_mode_confirmation=True,
         )
         bank.add(
@@ -488,6 +489,7 @@ class LightDeepSleepTests(unittest.TestCase):
             windows[0],
             law_key=law_b,
             prediction_gain=1.0,
+            queue_weight=1.0,
             force_new_mode_confirmation=True,
         )
         module = SplitModule(tree.param_dim, 3, nll_fn=hawkes)
