@@ -326,6 +326,9 @@ class SleepConfig:
     # while fitting Split. It is deliberately excluded from structural gain.
     # Appended to preserve positional construction of older SleepConfig data.
     split_route_loss_weight: float = 1.0
+    # Anchor for Deep's local refinement around the frozen Bank child laws.
+    # This is a fitting regularizer, not a topology-selection price.
+    split_anchor_weight: float = 1e-2
 
 
 @dataclass

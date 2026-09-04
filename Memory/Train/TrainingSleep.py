@@ -73,20 +73,21 @@ class TrainingSleepMixin:
             law_mode_count = int(
                 torch.unique(bank.mode_ids[:count].detach()).numel()
             )
-            row_evidence = SplitModule.compute_bank_row_evidence(bank)[
-                "evidence_weights"
-            ]
+            # K_effective_mode is a structural Bank quantity.  Count modes
+            # from persistent support rather than from the current bounded
+            # replay mask; replay coverage is reported separately by Split's
+            # h1_defined evaluability invariant.
             _, mode_inverse = torch.unique(
                 bank.mode_ids[:count].detach().to(dtype=torch.long),
                 sorted=True,
                 return_inverse=True,
             )
-            mode_evidence = row_evidence.new_zeros(
+            mode_support = bank.support[:count].new_zeros(
                 int(mode_inverse.max().item()) + 1
             )
-            mode_evidence.index_add_(0, mode_inverse, row_evidence)
+            mode_support.index_add_(0, mode_inverse, bank.support[:count])
             effective_mode_count = int(
-                (mode_evidence > 1e-8).sum().item()
+                (mode_support > 1e-8).sum().item()
             )
         return {
             "Q_decision": float(
@@ -112,8 +113,8 @@ class TrainingSleepMixin:
         # persistent EpisodicMemory boundary.
         self.sleep_state["structural_evidence_buffer"] = {}
         # Split search domain must always be all currently active leaves.
-        # ``bank_mode_probes`` only provides a frozen evidence override for
-        # protected leaves; it must never restrict which leaves are evaluated.
+        # ``bank_mode_probes`` provides frozen Pre-Light hypotheses for
+        # selected leaves; it must never restrict which leaves are evaluated.
         leaf_ids = list(self.tree.leaf_ids)
         for leaf_id in leaf_ids:
             if progress is not None:
@@ -133,6 +134,7 @@ class TrainingSleepMixin:
                 if bank_mode_probes is None
                 else bank_mode_probes.get(leaf_id)
             )
+            hypothesis = None
             if probe is None:
                 # Keep checkpoints/config objects created before this option
                 # was added runnable; the historical replay coverage default
@@ -149,21 +151,27 @@ class TrainingSleepMixin:
                 )
                 theta_snapshot = self.tree.semantic_theta(leaf_id)
             else:
-                # Deep reuses the exact frozen physical rows and Bank-mode
-                # assignments from the probe.  Bank admission already owns
-                # structural persistence, so the predictive fit uses the
-                # probe's frozen Bank replay weights rather than applying a
-                # second, independently sampled evidence rule.
-                batch = replace(
-                    probe["batch"],
-                    weights=probe["replay_weights"],
-                    effective_sample_size=torch.as_tensor(
-                        probe["replay_ess"],
-                        device=probe["replay_weights"].device,
-                        dtype=probe["replay_weights"].dtype,
-                    ),
-                )
-                theta_snapshot = probe["theta_sem_snapshot"]
+                # Deep reuses the exact frozen hypothesis produced by
+                # Pre-Light: rows, q_bank, delta_bar, H0, and Bank child
+                # initialization are all the same object.  There is no
+                # second batch normalization or child-law reconstruction.
+                hypothesis = probe.get("hypothesis")
+                if hypothesis is None:
+                    # Compatibility for probes written before the frozen
+                    # hypothesis object was introduced.
+                    batch = replace(
+                        probe["batch"],
+                        weights=probe["replay_weights"],
+                        effective_sample_size=torch.as_tensor(
+                            probe["replay_ess"],
+                            device=probe["replay_weights"].device,
+                            dtype=probe["replay_weights"].dtype,
+                        ),
+                    )
+                    theta_snapshot = probe["theta_sem_snapshot"]
+                else:
+                    batch = hypothesis.batch
+                    theta_snapshot = hypothesis.theta_h0
             if batch is None:
                 if progress is not None:
                     progress.update(1)
@@ -182,21 +190,37 @@ class TrainingSleepMixin:
                 delta_complexity=1.0,
                 # Router learning is a separate distillation objective; it
                 # does not contribute to the Bank-based structural gain.
+                lambda_anchor=getattr(
+                    self.sleep_config,
+                    "split_anchor_weight",
+                    1e-2,
+                ),
                 lambda_route=getattr(
                     self.sleep_config,
                     "split_route_loss_weight",
                     1.0,
                 ),
+                hypothesis=hypothesis,
             )
-            output["replay_weights"] = batch.weights.detach()
+            output["replay_weights"] = (
+                hypothesis.replay_weights.detach()
+                if hypothesis is not None
+                else batch.weights.detach()
+            )
             if probe is not None:
                 output["replay_weights"] = probe["replay_weights"].detach()
                 output["probe_advantage"] = float(probe["advantage"])
                 output["probe_loss_h0"] = float(probe["loss_h0"])
                 output["probe_loss_h1"] = float(probe["loss_h1"])
-                output["probe_mode_ids"] = probe["mode_ids"].detach()
+                output["probe_mode_ids"] = (
+                    hypothesis.mode_ids.detach()
+                    if hypothesis is not None
+                    else probe["mode_ids"].detach()
+                )
                 output["probe_mode_group_ids"] = (
-                    probe["mode_group_ids"].detach()
+                    hypothesis.mode_group_ids.detach()
+                    if hypothesis is not None
+                    else probe["mode_group_ids"].detach()
                 )
             # Preserve evidence-size provenance for the diagnostic logger.
             # The current production path has no shadow buffer, so make that
@@ -1275,7 +1299,9 @@ class TrainingSleepMixin:
                         sleep_progress if show_progress else None
                     ),
                     max_evidence=self.sleep_config.deep_evidence_budget,
-                    bank_mode_probes=protected_probes,
+                    # Every valid Pre-Light hypothesis is reused by Deep;
+                    # ``protected_probes`` remains only the Light veto set.
+                    bank_mode_probes=bank_mode_probes,
                 )
                 split_proposal_count = len(split_proposals)
                 topology_log_lines.append(
@@ -1550,6 +1576,7 @@ class TrainingSleepMixin:
                             key: value
                             for key, value in probe.items()
                             if key not in {
+                                "hypothesis",
                                 "batch",
                                 "theta_sem_snapshot",
                                 "bank_group_weights",

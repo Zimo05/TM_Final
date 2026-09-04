@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from HawkesBackbone import HawkesFamily
 from MemoryResiduals.EpisodicMemory import TreeEpisodicMemory
 from MemoryResiduals.MemoryBank import (
     EventWindow,
@@ -723,6 +724,178 @@ class PrototypeMemoryTests(unittest.TestCase):
             structure["delta_bar"],
             residuals,
         )
+
+    def test_bank_structure_is_canonical_and_ignores_legacy_rebase_controls(self):
+        module = SplitModule(P=2, z_dim=1)
+        residuals = torch.tensor([
+            [2.0, 0.0],
+            [0.0, 4.0],
+        ])
+        theta = torch.tensor([10.0, 20.0])
+        q_bank = torch.eye(2)
+
+        with torch.no_grad():
+            module.alpha_logit.fill_(100.0)
+            module.rho_raw.fill_(-100.0)
+            structure = module.compute_soft_residual_structure(
+                residuals=residuals,
+                weights=torch.ones(2),
+                theta_sem=theta,
+                bank_group_weights=q_bank,
+            )
+
+        torch.testing.assert_close(structure["theta_plus"], theta)
+        torch.testing.assert_close(
+            structure["theta_cand"], theta[None, :] + residuals
+        )
+        torch.testing.assert_close(structure["delta_shared"], torch.zeros(2))
+        torch.testing.assert_close(structure["delta_child"], residuals)
+        self.assertTrue(structure["canonical_bank_hypothesis"])
+
+    def test_frozen_bank_hypothesis_is_the_single_deep_fit_input(self):
+        hawkes = HawkesFamily(2, 1, decays=torch.tensor([1.0]))
+        windows = [
+            EventWindow(
+                torch.tensor([0.1]), torch.tensor([0]), "root", 0, 1, True
+            ),
+            EventWindow(
+                torch.tensor([0.2]), torch.tensor([1]), "root", 0, 1, True
+            ),
+        ]
+        batch = SplitBatch(
+            residuals=torch.tensor([
+                [0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.3, 0.0, 0.0, 0.0, 0.0],
+            ]),
+            contexts=torch.zeros(2, 1),
+            weights=torch.ones(2),
+            windows=windows,
+            mode_ids=torch.tensor([10, 20]),
+            bank_group_weights=torch.eye(2),
+        )
+        module = SplitModule(6, 1, nll_fn=hawkes)
+        hypothesis = module.build_bank_split_hypothesis(
+            batch, torch.zeros(6)
+        )
+
+        torch.testing.assert_close(
+            hypothesis.theta_child_init,
+            hypothesis.theta_h0[None, :] + hypothesis.delta_bar,
+        )
+        torch.testing.assert_close(hypothesis.q_bank, torch.eye(2))
+        output = module.fit_bank_split(
+            hypothesis,
+            hawkes_ll=hawkes,
+            num_steps=2,
+            lambda_anchor=1e-2,
+            lambda_route=1.0,
+        )
+        self.assertIs(output["hypothesis"], hypothesis)
+        self.assertNotIn("g_split", output)
+        self.assertTrue(bool(output["deep_fit_rolled_back"]) or
+                        float(output["bank_h1_loss_optimized"]) <=
+                        float(output["bank_h1_loss_init"]))
+        torch.testing.assert_close(
+            output["theta_bank"], hypothesis.theta_child_init
+        )
+
+    def test_single_persistent_bank_mode_is_explicitly_one_sided(self):
+        q_bank, summary = SplitModule._build_bank_mode_groups(
+            mode_ids=torch.tensor([7, 7]),
+            law_keys=torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            deltas=torch.zeros(2, 2),
+            support=torch.ones(2),
+            split_mass=torch.zeros(2),
+        )
+
+        torch.testing.assert_close(q_bank, torch.tensor([[1.0, 0.0]] * 2))
+        self.assertEqual(int(summary["effective_mode_count"]), 1)
+
+    def test_h1_defined_requires_windows_but_not_positive_child_mass(self):
+        window = EventWindow(
+            times=torch.tensor([0.1]),
+            types=torch.tensor([0]),
+            node_id="root",
+            start_idx=0,
+            end_idx=1,
+            has_full_history=True,
+        )
+        summary = {
+            "mode_ids": torch.tensor([10, 20]),
+            "group_ids": torch.tensor([0, 1]),
+        }
+        batch = SplitBatch(
+            residuals=torch.zeros(2, 2),
+            contexts=torch.zeros(2, 1),
+            weights=torch.tensor([1.0, 0.0]),
+            windows=[window, window],
+            mode_ids=torch.tensor([10, 20]),
+            bank_group_weights=torch.eye(2),
+            mode_summary=summary,
+        )
+
+        diagnostics = SplitModule._bank_h1_evaluability(batch)
+
+        self.assertTrue(diagnostics["h1_defined"])
+        torch.testing.assert_close(
+            diagnostics["h1_representative_counts"],
+            torch.tensor([1, 1]),
+        )
+
+        batch.windows[1] = None
+        diagnostics = SplitModule._bank_h1_evaluability(batch)
+        self.assertFalse(diagnostics["h1_defined"])
+
+    def test_replay_windows_fallback_when_confidence_evidence_is_zero(self):
+        normalized, structural_strength, effective_sample_size = (
+            SplitModule.normalize_split_evidence(
+                base_weights=torch.zeros(2),
+                structural_weights=torch.zeros(2),
+                sample_support=torch.ones(2),
+                replay_support=torch.ones(2),
+            )
+        )
+
+        torch.testing.assert_close(normalized, torch.ones(2))
+        self.assertEqual(float(structural_strength), 0.0)
+        self.assertAlmostEqual(float(effective_sample_size), 2.0, places=5)
+
+    def test_persistent_mode_identity_survives_missing_replay_window(self):
+        bank = MemoryBank(
+            device="cpu",
+            key_dim=2,
+            param_dim=2,
+            capacity=8,
+            law_dim=2,
+        )
+        window = EventWindow(
+            times=torch.tensor([0.1]),
+            types=torch.tensor([0]),
+            node_id="root",
+            start_idx=0,
+            end_idx=1,
+            has_full_history=True,
+        )
+        bank.add(
+            torch.tensor([1.0, 0.0]),
+            torch.tensor([1.0, 0.0]),
+            window,
+            law_key=torch.tensor([1.0, 0.0]),
+            force_new_mode_confirmation=True,
+        )
+        bank.add(
+            torch.tensor([0.0, 1.0]),
+            torch.tensor([0.0, 1.0]),
+            None,
+            law_key=torch.tensor([0.0, 1.0]),
+            force_new_mode_confirmation=True,
+        )
+
+        batch = SplitModule.build_split_batch_from_memory_bank(bank)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(int(batch.mode_summary["effective_mode_count"]), 2)
+        self.assertFalse(SplitModule._bank_h1_evaluability(batch)["h1_defined"])
 
     def test_bank_mode_support_invariant_rejects_inconsistent_q_bank(self):
         batch = SplitBatch(

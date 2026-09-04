@@ -163,6 +163,32 @@ class SleepCoordinationTests(unittest.TestCase):
         self.assertTrue(candidate.eligible)
         self.assertTrue(candidate.ready)
 
+    def test_bank_split_candidate_uses_h1_defined_not_two_sided_mass(self):
+        candidate = build_split_candidate(
+            "root",
+            torch.nn.Identity(),
+            {
+                "logp0": torch.tensor([-2.0]),
+                "logp_child_bank": torch.tensor([-1.0]),
+                "replay_weights": torch.ones(1),
+                "has_bank_prior": True,
+                "h1_defined": True,
+                "two_sided_support": False,
+                "invalid_proposal": False,
+            },
+            topology_revision=0,
+            lambda_T=0.0,
+            uncertainty_kappa=0.0,
+            min_child_effective_mass=10.0,
+            min_structural_strength=0.05,
+            min_effective_sample_size=2.0,
+        )
+
+        self.assertTrue(candidate.eligible)
+        self.assertTrue(candidate.ready)
+        self.assertTrue(candidate.diagnostics["h1_defined"])
+        self.assertFalse(candidate.diagnostics["two_sided_support"])
+
     def test_prune_persistence_is_eligibility_not_preference(self):
         proposal = TopologyPruneProposal(
             parent_id="root",

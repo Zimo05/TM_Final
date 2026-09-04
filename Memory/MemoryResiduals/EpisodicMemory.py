@@ -723,48 +723,56 @@ class TreeEpisodicMemory(nn.Module):
             flat_query.size(0), dtype=torch.long, device=device
         )
         null_alpha = query.new_zeros(flat_query.size(0))
-        # Gather large key/delta rows only after removing inactive visits.
-        # The former gather-then-mask flow held two expanded [R, M, P] delta
-        # tensors at the same time.  Indexing by active node once preserves
-        # the zero-row, synchronization-free path while halving that peak.
-        retrieved, retrieval_info = self.retriever.forward_batched(
-            query=flat_query.index_select(0, active_rows),
-            keys=context_keys.index_select(0, active_nodes),
-            # Keep the large [node, capacity, param] residual mirror shared.
-            # ``active_nodes`` tells the retriever which bank each visit uses,
-            # avoiding a multi-GiB [visit, capacity, param] materialization.
-            deltas=deltas,
-            row_bank_indices=active_nodes,
-            usage=usage.index_select(0, active_nodes),
-            age=age.index_select(0, active_nodes),
-            valid_mask=active_valid,
-            write_quality=quality.index_select(0, active_nodes),
-            keep_gate=(
-                None
-                if keep_gate is None
-                else keep_gate.index_select(0, active_nodes)
-            ),
-            null_logit=null_logit,
-            context_valid=active_context_valid,
+        # Gather large key/context rows in bounded chunks.  A single
+        # ``context_keys.index_select(0, active_nodes)`` still materializes
+        # [active_visits, capacity, aliases, key_dim], which is the 5 GiB
+        # allocation seen in frontier training.  Chunking keeps peak memory
+        # independent of the number of visited frontier rows while preserving
+        # exactly the same per-row retriever calculation.
+        retrieval_chunk_size = 64
+        credit = (
+            query.new_zeros(node_count, capacity)
+            if update_state
+            else None
         )
-        flat_delta = flat_delta.index_copy(0, active_rows, retrieved)
-        alpha.index_copy_(0, active_rows, retrieval_info["alpha"])
-        similarity.index_copy_(0, active_rows, retrieval_info["sim"])
-        effective_k.index_copy_(
-            0, active_rows, retrieval_info["effective_k"]
-        )
-        null_alpha.index_copy_(
-            0, active_rows, retrieval_info["null_alpha"]
-        )
+        for start in range(0, int(active_rows.numel()), retrieval_chunk_size):
+            stop = min(start + retrieval_chunk_size, int(active_rows.numel()))
+            row_chunk = active_rows[start:stop]
+            node_chunk = active_nodes[start:stop]
+            retrieved, retrieval_info = self.retriever.forward_batched(
+                query=flat_query.index_select(0, row_chunk),
+                keys=context_keys.index_select(0, node_chunk),
+                # Keep the large [node, capacity, param] residual mirror
+                # shared.  ``node_chunk`` selects the source bank without
+                # expanding deltas to one copy per frontier visit.
+                deltas=deltas,
+                row_bank_indices=node_chunk,
+                usage=usage.index_select(0, node_chunk),
+                age=age.index_select(0, node_chunk),
+                valid_mask=active_valid[start:stop],
+                write_quality=quality.index_select(0, node_chunk),
+                keep_gate=(
+                    None
+                    if keep_gate is None
+                    else keep_gate.index_select(0, node_chunk)
+                ),
+                null_logit=null_logit,
+                context_valid=active_context_valid[start:stop],
+            )
+            flat_delta = flat_delta.index_copy(0, row_chunk, retrieved)
+            alpha.index_copy_(0, row_chunk, retrieval_info["alpha"])
+            similarity.index_copy_(0, row_chunk, retrieval_info["sim"])
+            effective_k.index_copy_(
+                0, row_chunk, retrieval_info["effective_k"]
+            )
+            null_alpha.index_copy_(
+                0, row_chunk, retrieval_info["null_alpha"]
+            )
+            if credit is not None:
+                credit.index_add_(0, node_chunk, retrieval_info["alpha"])
 
         if update_state:
             with torch.no_grad():
-                credit = query.new_zeros(node_count, capacity)
-                credit.index_add_(
-                    0,
-                    active_nodes,
-                    retrieval_info["alpha"],
-                )
                 for node_index, node_id in enumerate(node_ids):
                     bank = self.banks.get(node_id)
                     if bank is not None and len(bank):

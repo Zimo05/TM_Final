@@ -188,6 +188,48 @@ class MaskedEntmaxTests(unittest.TestCase):
                 0.0,
             )
 
+    def test_packed_read_chunks_large_active_frontier(self):
+        torch.manual_seed(99)
+        memory = TreeEpisodicMemory(
+            key_dim=3,
+            num_event_types=2,
+            num_basis=1,
+            capacity_per_node=5,
+            device="cpu",
+        )
+        for _ in range(3):
+            memory.add_memory(
+                "root",
+                torch.randn(3),
+                torch.randn(memory.param_dim),
+            )
+
+        query = torch.randn(129, 3)
+        indices = torch.zeros(129, 1, dtype=torch.long)
+        mask = torch.ones_like(indices, dtype=torch.bool)
+        packed, _ = memory.read_packed(
+            query,
+            indices,
+            mask,
+            ("root",),
+            update_state=False,
+        )
+        reference = torch.stack([
+            memory.read_nodes(
+                query[row],
+                ["root"],
+                update_state=False,
+            )[0]["root"]
+            for row in range(query.size(0))
+        ])
+
+        torch.testing.assert_close(
+            packed[:, 0],
+            reference,
+            atol=1e-6,
+            rtol=1e-5,
+        )
+
     def test_padded_rows_match_independent_entmax_forward_and_backward(self):
         torch.manual_seed(101)
         lengths = (1, 3, 6, 4)

@@ -3,7 +3,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from HawkesBackbone import HawkesFamily
 from MemoryResiduals.MemoryBank import EventWindow, MemoryBank, MemoryItem
@@ -62,6 +62,34 @@ class SplitBatch:
     # structural Split likelihood and counterfactual H1 consume
     # bank_group_weights, while the router is trained separately toward it.
     mode_summary: Optional[Dict[str, torch.Tensor]] = None
+
+
+@dataclass(frozen=True)
+class FrozenBankSplitHypothesis:
+    """One immutable Bank-backed Split hypothesis shared by Light and Deep.
+
+    The tensors are detached snapshots.  ``batch`` contains the exact replay
+    rows used to form the hypothesis; Deep fitting may refine child
+    parameters, but it must not reconstruct ``q_bank`` or the initial child
+    laws from a second evidence pass.
+    """
+
+    theta_h0: torch.Tensor
+    theta_child_init: torch.Tensor
+    q_bank: torch.Tensor
+    delta_bar: torch.Tensor
+    replay_weights: torch.Tensor
+    windows: List[EventWindow]
+    mode_ids: torch.Tensor
+    mode_group_ids: torch.Tensor
+    mode_summary: Dict[str, torch.Tensor]
+    # The batch is an internal convenience for the shared Pre-Light → Deep
+    # path.  Keep it optional so the public nine-field hypothesis record can
+    # also be constructed by older callers that already hold the fields
+    # separately.
+    batch: Optional[SplitBatch] = None
+    h1_defined: bool = False
+    h1_representative_counts: Optional[torch.Tensor] = None
 
 
 class SplitCommitState:
@@ -130,13 +158,14 @@ class SplitModule(nn.Module):
         # Dormant residual centers c_{ell,1}, c_{ell,2}
         self.centers = nn.Parameter(0.01 * torch.randn(2, P))
 
-        # Split gate logit zeta_ell. Start negative so the split is initially closed.
+        # Legacy residual-clustering gate. Bank-backed fitting never reads or
+        # optimizes this parameter; retain it only for old checkpoints/API.
         self.gate_logit = nn.Parameter(torch.tensor(-2.0))
 
-        # Parent shared-residual absorption ratio alpha_ell in (0, 1).
+        # Legacy residual-clustering controls; Bank-backed fitting retains
+        # them for checkpoint compatibility but does not read them.
         self.alpha_logit = nn.Parameter(torch.tensor(0.0))
 
-        # Child separation scale rho_ell^sp > 0.
         self.rho_raw = nn.Parameter(torch.tensor(0.0))
 
         # Learned residual distance d_phi.
@@ -283,17 +312,37 @@ class SplitModule(nn.Module):
         pi_bar = child_evidence["pi_bar"]
         delta_bar = child_evidence["delta_bar"]
 
-        # Eq. (22): parent-shared residual and child-specific deviations.
-        delta_shared = (pi_bar[:, None] * delta_bar).sum(dim=0) # [P]
-        delta_child = delta_bar - delta_shared[None, :]         # [2, P]
+        if bank_group_weights is not None:
+            # Canonical Bank hypothesis.  Persistent Bank modes already are
+            # the law identity, so Split must not rebase the parent or
+            # rescale the mode contrast with the legacy alpha/rho controls:
+            #
+            #   H0 = theta_sem
+            #   H1_j = theta_sem + delta_bar_j
+            #
+            # Keep the retired fields in the output for old checkpoints and
+            # diagnostics, but do not read their learned parameters on this
+            # path.  The Bank prior and its mode-conditioned residual means
+            # are the sole source of the child laws.
+            delta_shared = torch.zeros_like(theta_sem)
+            delta_child = delta_bar
+            alpha = theta_sem.new_ones(())
+            rho_sp = theta_sem.new_ones(())
+            theta_plus = theta_sem
+            theta_cand = theta_sem[None, :] + delta_bar
+        else:
+            # Legacy residual-clustering path.  This remains available for
+            # directly constructed SplitBatch objects and old callers.
+            delta_shared = (pi_bar[:, None] * delta_bar).sum(dim=0) # [P]
+            delta_child = delta_bar - delta_shared[None, :]         # [2, P]
 
-        # Eq. (23): parent absorbs shared residual.
-        alpha = torch.sigmoid(self.alpha_logit)
-        theta_plus = theta_sem + alpha * delta_shared          # [P]
+            # Eq. (23): parent absorbs shared residual.
+            alpha = torch.sigmoid(self.alpha_logit)
+            theta_plus = theta_sem + alpha * delta_shared          # [P]
 
-        # Eq. (23): dormant candidates inherit only residual contrast.
-        rho_sp = F.softplus(self.rho_raw) + eps
-        theta_cand = theta_plus[None, :] + rho_sp * delta_child # [2, P]
+            # Eq. (23): dormant candidates inherit only residual contrast.
+            rho_sp = F.softplus(self.rho_raw) + eps
+            theta_cand = theta_plus[None, :] + rho_sp * delta_child # [2, P]
 
         return {
             "dist": dist,
@@ -307,16 +356,17 @@ class SplitModule(nn.Module):
             "child_effective_mass": N_mass,
             "child_ess": N_eff,
             "two_sided_support": child_evidence["two_sided_support"],
-            "invalid_proposal": bool(
-                bank_group_weights is not None
-                and not child_evidence["two_sided_support"]
-            ),
+            # One-sided row mass is a diagnostic.  Bank H1 evaluability is
+            # determined later from persistent groups plus representative
+            # windows, so it must not be encoded as an invalid proposal here.
+            "invalid_proposal": False,
             "pi_bar": pi_bar,
             "delta_bar": delta_bar,
             "delta_shared": delta_shared,
             "delta_child": delta_child,
             "alpha": alpha,
             "rho_sp": rho_sp,
+            "canonical_bank_hypothesis": bank_group_weights is not None,
             "theta_plus": theta_plus,
             "theta_cand": theta_cand,
         }
@@ -333,6 +383,82 @@ class SplitModule(nn.Module):
         if value.numel() != 1 or not bool(torch.isfinite(value).all()):
             return None
         return int(value.item())
+
+    @staticmethod
+    def _bank_row_group_ids(batch: SplitBatch) -> Optional[torch.Tensor]:
+        """Resolve each replay row to its persistent Bank child group.
+
+        ``q_bank=[.5,.5]`` is intentionally neutral for an unresolved mode.
+        Taking ``argmax(q_bank)`` alone would incorrectly turn that neutral
+        row into a left-child representative, so production batches use the
+        full mode summary and preserve its ``-1`` unresolved state here.
+        """
+        if batch.bank_group_weights is None:
+            return None
+        q_bank = batch.bank_group_weights
+        if batch.mode_ids is None or batch.mode_summary is None:
+            return q_bank.argmax(dim=-1)
+        summary_mode_ids = batch.mode_summary.get("mode_ids")
+        summary_group_ids = batch.mode_summary.get("group_ids")
+        if summary_mode_ids is None or summary_group_ids is None:
+            return q_bank.argmax(dim=-1)
+        summary_mode_ids = torch.as_tensor(summary_mode_ids).reshape(-1)
+        summary_group_ids = torch.as_tensor(summary_group_ids).reshape(-1)
+        if summary_mode_ids.numel() != summary_group_ids.numel():
+            return q_bank.argmax(dim=-1)
+        mode_to_group = {
+            int(mode): int(group)
+            for mode, group in zip(
+                summary_mode_ids.detach().cpu().tolist(),
+                summary_group_ids.detach().cpu().tolist(),
+            )
+        }
+        return torch.tensor(
+            [
+                mode_to_group.get(int(mode), -1)
+                for mode in batch.mode_ids.detach().cpu().tolist()
+            ],
+            device=q_bank.device,
+            dtype=torch.long,
+        )
+
+    @staticmethod
+    def _bank_h1_evaluability(batch: SplitBatch) -> Dict[str, Any]:
+        """Check only whether the Bank H1 can be numerically evaluated.
+
+        Structural existence is decided by persistent Bank modes.  The only
+        replay-side prerequisite is one retained representative window for
+        each of the two persistent groups; ESS, mass, and current replay
+        weight thresholds are deliberately not used here.
+        """
+        if batch.bank_group_weights is None:
+            return {
+                "h1_defined": True,
+                "h1_representative_counts": torch.zeros(
+                    2, dtype=torch.long, device=batch.residuals.device
+                ),
+            }
+        group_ids = SplitModule._bank_row_group_ids(batch)
+        if group_ids is None:
+            return {
+                "h1_defined": False,
+                "h1_representative_counts": torch.zeros(
+                    2, dtype=torch.long, device=batch.residuals.device
+                ),
+            }
+        replay_present = torch.tensor(
+            [window is not None for window in batch.windows],
+            device=group_ids.device,
+            dtype=torch.bool,
+        )
+        counts = torch.stack([
+            ((group_ids == group) & replay_present).sum()
+            for group in range(2)
+        ]).to(dtype=torch.long)
+        return {
+            "h1_defined": bool((counts > 0).all()),
+            "h1_representative_counts": counts,
+        }
 
     @staticmethod
     def _assert_bank_mode_support_invariant(
@@ -352,6 +478,102 @@ class SplitModule(nn.Module):
                 "but two_sided_support=True"
             )
         return effective_mode_count
+
+    def build_bank_split_hypothesis(
+        self,
+        batch: SplitBatch,
+        theta_h0: torch.Tensor | HawkesParams | Any,
+    ) -> FrozenBankSplitHypothesis:
+        """Freeze the canonical Bank H0/H1 construction for Light and Deep.
+
+        ``q_bank`` and ``delta_bar`` are computed exactly once at this
+        boundary.  Consumers may evaluate or locally refine the child laws,
+        but they must not derive a different assignment from replay coverage,
+        router probabilities, or a second residual decomposition.
+        """
+        if not isinstance(batch, SplitBatch):
+            raise TypeError("batch must be a SplitBatch")
+        self.validate_batch(batch)
+        if batch.bank_group_weights is None:
+            raise ValueError(
+                "Bank Split hypotheses require batch.bank_group_weights"
+            )
+        reference = self._module_reference(batch.residuals)
+        theta = self._theta_sem_to_flat(theta_h0, reference).detach().clone()
+        frozen_batch = self._batch_to_device(batch, theta)
+        self.validate_batch(frozen_batch)
+
+        q_bank = frozen_batch.bank_group_weights.detach().clone()
+        q_bank = q_bank / q_bank.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        replay_weights = frozen_batch.weights.detach().clamp_min(0.0)
+        child_evidence = self.compute_child_evidence(
+            weights=replay_weights,
+            bank_group_weights=q_bank,
+            residuals=frozen_batch.residuals,
+            eps=self.eps,
+        )
+        q_bank = child_evidence["q"].detach().clone()
+        frozen_batch = replace(
+            frozen_batch,
+            bank_group_weights=q_bank,
+        )
+        h1_diagnostics = self._bank_h1_evaluability(frozen_batch)
+
+        summary = {
+            key: value.detach().clone()
+            for key, value in (frozen_batch.mode_summary or {}).items()
+            if torch.is_tensor(value)
+        }
+        summary_mode_ids = summary.get("mode_ids")
+        summary_group_ids = summary.get("group_ids")
+        if (
+            torch.is_tensor(summary_mode_ids)
+            and torch.is_tensor(summary_group_ids)
+            and summary_mode_ids.ndim == 1
+            and summary_group_ids.shape == summary_mode_ids.shape
+        ):
+            mode_ids = summary_mode_ids.detach().clone().to(dtype=torch.long)
+            mode_group_ids = summary_group_ids.detach().clone().to(dtype=torch.long)
+        elif frozen_batch.mode_ids is not None:
+            mode_ids = torch.unique(
+                frozen_batch.mode_ids.detach().to(dtype=torch.long),
+                sorted=True,
+            )
+            row_groups = q_bank.argmax(dim=-1)
+            mode_group_ids = torch.stack([
+                row_groups[frozen_batch.mode_ids == mode].reshape(-1)[0]
+                for mode in mode_ids
+            ]).to(dtype=torch.long)
+        else:
+            mode_ids = torch.arange(
+                frozen_batch.residuals.size(0),
+                device=frozen_batch.residuals.device,
+                dtype=torch.long,
+            )
+            mode_group_ids = q_bank.argmax(dim=-1).to(dtype=torch.long)
+
+        delta_bar = child_evidence["delta_bar"].detach().clone()
+        theta_child_init = theta[None, :] + delta_bar
+        return FrozenBankSplitHypothesis(
+            theta_h0=theta,
+            theta_child_init=theta_child_init.detach().clone(),
+            q_bank=q_bank.detach().clone(),
+            delta_bar=delta_bar,
+            replay_weights=replay_weights.detach().clone(),
+            windows=list(frozen_batch.windows),
+            mode_ids=mode_ids.detach().clone(),
+            mode_group_ids=mode_group_ids.detach().clone(),
+            mode_summary=summary,
+            batch=frozen_batch,
+            h1_defined=bool(h1_diagnostics["h1_defined"]),
+            h1_representative_counts=(
+                h1_diagnostics["h1_representative_counts"].detach().clone()
+            ),
+        )
+
+    # Explicit alias for callers that use the terminology from the design
+    # doc; both names return the same canonical frozen object shape.
+    freeze_bank_split_hypothesis = build_bank_split_hypothesis
 
     def compute_split_training_objective(
         self,
@@ -441,6 +663,91 @@ class SplitModule(nn.Module):
             ),
         }
 
+    def compute_bank_split_training_objective(
+        self,
+        *,
+        weights: torch.Tensor,
+        ell_h1: torch.Tensor,
+        anchor_loss: Optional[torch.Tensor] = None,
+        lambda_anchor: float | torch.Tensor = 0.0,
+        route_loss: Optional[torch.Tensor] = None,
+        lambda_route: float | torch.Tensor = 0.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Fit the frozen Bank H1 directly.
+
+        Bank mode grouping is structural identity, not a differentiable
+        split gate.  Consequently this objective contains only the H1 replay
+        likelihood, an optional child-initialization anchor, and an optional
+        q_bank-to-router distillation term.  It deliberately has no
+        ``g_split``, complexity relaxation, or mass threshold term.
+        """
+        reference = ell_h1
+        anchor_lambda = torch.as_tensor(
+            lambda_anchor,
+            device=reference.device,
+            dtype=reference.dtype,
+        ).reshape(())
+        route_lambda = torch.as_tensor(
+            lambda_route,
+            device=reference.device,
+            dtype=reference.dtype,
+        ).reshape(())
+        if not bool(torch.isfinite(anchor_lambda)):
+            raise FloatingPointError("lambda_anchor must be finite")
+        if not bool(torch.isfinite(route_lambda)):
+            raise FloatingPointError("lambda_route must be finite")
+        if bool(anchor_lambda < 0.0):
+            raise ValueError("lambda_anchor must be non-negative")
+        if bool(route_lambda < 0.0):
+            raise ValueError("lambda_route must be non-negative")
+
+        prediction_loss = -(
+            weights * ell_h1
+        ).sum() / (weights.sum() + self.eps)
+        if anchor_loss is None:
+            anchor_loss_tensor = reference.new_zeros(())
+        else:
+            anchor_loss_tensor = torch.as_tensor(
+                anchor_loss,
+                device=reference.device,
+                dtype=reference.dtype,
+            ).reshape(())
+        if not bool(torch.isfinite(anchor_loss_tensor)):
+            raise FloatingPointError("anchor_loss must be finite")
+        if route_loss is None:
+            route_loss_tensor = reference.new_zeros(())
+        else:
+            route_loss_tensor = torch.as_tensor(
+                route_loss,
+                device=reference.device,
+                dtype=reference.dtype,
+            ).reshape(())
+        if not bool(torch.isfinite(route_loss_tensor)):
+            raise FloatingPointError("route_loss must be finite")
+
+        anchor_penalty = anchor_lambda * anchor_loss_tensor
+        route_penalty = route_lambda * route_loss_tensor
+        structural_loss = prediction_loss + anchor_penalty
+        loss = structural_loss + route_penalty
+        zero = reference.new_zeros(())
+        return {
+            "loss": loss,
+            "structural_loss": structural_loss,
+            "prediction_loss": prediction_loss,
+            "h1_loss": prediction_loss,
+            "anchor_loss": anchor_loss_tensor,
+            "anchor_penalty": anchor_penalty,
+            "complexity_penalty": zero,
+            "mass_penalty": zero,
+            "route_loss": route_loss_tensor,
+            "route_penalty": route_penalty,
+            "lambda_anchor": anchor_lambda,
+            "lambda_route": route_lambda,
+            "lambda_T": zero,
+            "delta_tree_complexity": zero,
+            "expected_delta_tree_complexity": zero,
+        }
+
     @staticmethod
     def evaluate_bank_h1(
         q_bank: torch.Tensor,
@@ -515,13 +822,14 @@ class SplitModule(nn.Module):
             logp_child_each: [R, 2]
             route_prob: [R, 2]
             q_bank: [R, 2]
-            g_split: scalar
+
+        Bank-backed batches return the direct H1 likelihood in both
+        ``ell_struct`` and ``ell_split``.  ``g_split`` is emitted only for
+        the legacy residual-clustering fallback.
         """
         hawkes_ll = self._resolve_hawkes_ll(hawkes_ll)
         eps = self.eps
-
-        # Eq. (24): differentiable split gate.
-        g_split = torch.sigmoid(self.gate_logit / self.tau_g)
+        has_bank_prior = batch.bank_group_weights is not None
 
         # Eq. (25): context-conditioned child routing.
         route_logits = self.router(batch.contexts) / self.tau_route    # [R, 2]
@@ -555,7 +863,6 @@ class SplitModule(nn.Module):
         # Directly constructed legacy batches have no Bank prior; retaining
         # the router as their fallback preserves the old standalone API while
         # all production MemoryBank batches use q_bank here.
-        has_bank_prior = batch.bank_group_weights is not None
         q_prior = (
             batch.bank_group_weights
             if has_bank_prior
@@ -596,9 +903,13 @@ class SplitModule(nn.Module):
             q_bank.argmax(dim=-1) == route_prob.argmax(dim=-1)
         ).to(log_route_prob.dtype)
         if has_bank_prior:
+            # Keep the router term in the strategy's evidence currency:
+            # L_route = -sum_r e_r sum_j q_bank[r,j] log pi_j(z_r).
+            # H1 is normalized by total replay evidence; this auxiliary
+            # distillation term is intentionally retained as a weighted sum.
             route_loss = (
                 replay_weights * route_loss_per_row
-            ).sum() / total_replay_weight
+            ).sum()
             route_kl = (
                 replay_weights * route_kl_per_row
             ).sum() / total_replay_weight
@@ -612,19 +923,22 @@ class SplitModule(nn.Module):
             route_kl = log_route_prob.new_zeros(())
             route_accuracy = route_match.mean()
 
-        # Structural relaxed likelihood: only Bank H1 is allowed to affect
-        # the topology test.  The compatibility name ``ell_split`` is kept
-        # as an alias for callers that still consume the old output key.
-        log_g = torch.log(g_split + eps)
-        log_1_minus_g = torch.log(1.0 - g_split + eps)
+        # Bank law identity is already established by persistent mode
+        # grouping.  Deep/Pre-Light therefore evaluate H1 directly; no
+        # differentiable gate or H0/H1 log-mixture is allowed on this path.
+        if has_bank_prior:
+            ell_struct = logp_child_bank
+        else:
+            # Compatibility path for directly constructed legacy batches.
+            g_split = torch.sigmoid(self.gate_logit / self.tau_g)
+            log_g = torch.log(g_split + eps)
+            log_1_minus_g = torch.log(1.0 - g_split + eps)
+            ell_struct = torch.logaddexp(
+                log_1_minus_g + logp0,
+                log_g + logp_child_bank,
+            )                                                     # [R]
 
-        ell_struct = torch.logaddexp(
-            log_1_minus_g + logp0,
-            log_g + logp_child_bank,
-        )                                                             # [R]
-
-        return {
-            "g_split": g_split,
+        replay_output = {
             "route_prob": route_prob,
             "has_bank_prior": has_bank_prior,
             "logp0": logp0,
@@ -644,6 +958,9 @@ class SplitModule(nn.Module):
             "ell_struct": ell_struct,
             "ell_split": ell_struct,
         }
+        if not has_bank_prior:
+            replay_output["g_split"] = g_split
+        return replay_output
 
     def _resolve_hawkes_ll(
         self,
@@ -885,6 +1202,7 @@ class SplitModule(nn.Module):
         *,
         lambda_T: Optional[float | torch.Tensor] = None,
         delta_complexity: float | torch.Tensor = 1.0,
+        lambda_anchor: float | torch.Tensor = 0.0,
         lambda_route: float | torch.Tensor = 0.0,
         replay_cache: Optional[ReplayBatchCache] = None,
     ):
@@ -923,6 +1241,7 @@ class SplitModule(nn.Module):
             bool(struct["two_sided_support"]),
             stage="forward",
         )
+        h1_diagnostics = self._bank_h1_evaluability(batch)
 
         replay = self.compute_replay_loglikelihood(
             batch=batch,
@@ -932,32 +1251,57 @@ class SplitModule(nn.Module):
             replay_cache=replay_cache,
         )
 
-        objective = self.compute_split_training_objective(
-            # ``weights`` already is the normalized row-evidence measure used
-            # for child mass, prototypes, and ESS.  Multiplying replay support
-            # here would create a second, inconsistent evidence definition.
-            weights=weights,
-            ell_split=replay["ell_split"],
-            g_split=replay["g_split"],
-            N_eff=struct["N_eff"],
-            lambda_T=(
-                self.lambda_tree if lambda_T is None else lambda_T
-            ),
-            delta_complexity=delta_complexity,
-            route_loss=replay["route_loss"],
-            lambda_route=lambda_route,
-        )
+        if batch.bank_group_weights is not None:
+            # ``theta_cand`` is the frozen Bank initialization in the normal
+            # forward path, so its anchor is exactly zero.  The separate
+            # ``fit_bank_split`` path supplies a refined child tensor and a
+            # non-zero anchor when Deep fitting is requested.
+            objective = self.compute_bank_split_training_objective(
+                # ``weights`` already is the normalized row-evidence measure
+                # used for H1; replay support is never multiplied a second
+                # time here.
+                weights=weights,
+                ell_h1=replay["logp_child_bank"],
+                anchor_loss=theta_sem.new_zeros(()),
+                lambda_anchor=lambda_anchor,
+                route_loss=replay["route_loss"],
+                lambda_route=lambda_route,
+            )
+        else:
+            objective = self.compute_split_training_objective(
+                # Legacy directly-constructed batches retain the historical
+                # relaxed gate objective for checkpoint/API compatibility.
+                weights=weights,
+                ell_split=replay["ell_split"],
+                g_split=replay["g_split"],
+                N_eff=struct["N_eff"],
+                lambda_T=(
+                    self.lambda_tree if lambda_T is None else lambda_T
+                ),
+                delta_complexity=delta_complexity,
+                route_loss=replay["route_loss"],
+                lambda_route=lambda_route,
+            )
 
         out = {}
         out.update(struct)
         out.update(replay)
         out.update(objective)
         out["has_bank_prior"] = batch.bank_group_weights is not None
+        out["h1_defined"] = bool(h1_diagnostics["h1_defined"])
+        out["h1_representative_counts"] = h1_diagnostics[
+            "h1_representative_counts"
+        ].detach().clone()
         if batch.bank_group_weights is not None:
             q_bank_mass = struct["N_mass"].detach().clone()
             out["q_bank_mass"] = q_bank_mass
             out["q_bank_mass_L"] = q_bank_mass[0]
             out["q_bank_mass_R"] = q_bank_mass[1]
+            # ``two_sided_support`` remains a row-evidence diagnostic.  The
+            # Bank-backed structural gate is only the independent H1
+            # evaluability invariant, and must not be reintroduced through
+            # ``invalid_proposal``.
+            out["invalid_proposal"] = not bool(h1_diagnostics["h1_defined"])
             if effective_mode_count is not None:
                 out["K_effective_mode"] = torch.as_tensor(
                     effective_mode_count,
@@ -1195,8 +1539,20 @@ class SplitModule(nn.Module):
         evidence = support * base
         evidence_sum = evidence.sum()
         replay_count = replay.sum()
+        # A retained replay window is sufficient for numerical evaluation.
+        # If all optional confidence factors happen to be zero, do not turn
+        # that diagnostic into another structural/mass gate: use the replay
+        # observation measure itself as a finite fallback.  Bank H1 existence
+        # is decided separately by persistent groups plus representative
+        # windows.
+        replay_evidence = torch.where(
+            evidence_sum > eps,
+            evidence,
+            replay,
+        )
+        replay_evidence_sum = replay_evidence.sum()
         normalized = (
-            replay_count * evidence / (evidence_sum + eps)
+            replay_count * replay_evidence / (replay_evidence_sum + eps)
         )
         structural_strength = evidence_sum / ((support * base).sum() + eps)
         # ``normalized`` is the same row-evidence currency consumed by Split
@@ -1224,12 +1580,12 @@ class SplitModule(nn.Module):
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Turn persistent Bank modes into one binary Split proposal.
 
-        ``mode_ids``/``split_mass`` describe persistent Bank discovery.  When
-        ``effective_evidence`` is supplied, it is the current replay evidence
-        used for the binary grouping: modes with zero effective evidence are
-        masked from clustering and ``omega_m^split = E_m``.  The optional
-        argument is kept for old direct callers, which retain the historical
-        structural-weight fallback.
+        ``mode_ids``/``support`` describe persistent Bank discovery.  When
+        ``effective_evidence`` is supplied, it is the mode-identity evidence
+        used for binary grouping.  Production passes persistent support here,
+        not bounded replay coverage, so a mode cannot disappear from H1 merely
+        because its current replay window was not selected.  The optional
+        argument remains for direct legacy callers.
         """
         if mode_ids.ndim != 1:
             raise ValueError("mode_ids must have shape [R]")
@@ -1288,12 +1644,10 @@ class SplitModule(nn.Module):
             mode_support.to(deltas)[:, None] + eps
         )
 
-        # Historical fallback for direct callers without an explicit replay
-        # evidence vector.  Production Bank batches replace this with E_m
-        # below, while retaining ``split_mass`` as a structural prior.
-        structural_mode_weights = mode_support * mode_split_mass / (
-            mode_support + eps
-        )
+        # Direct callers without an explicit identity-evidence vector use
+        # persistent support.  ``split_mass`` is retained as provenance and
+        # demand telemetry, but never controls Split mode existence.
+        structural_mode_weights = mode_support
 
         if effective_evidence is None:
             mode_evidence = structural_mode_weights
@@ -1312,9 +1666,8 @@ class SplitModule(nn.Module):
             )
         effective_mode_mask = mode_evidence > eps
         effective_mode_count = effective_mode_mask.sum().to(dtype=torch.long)
-        # The split-specific mode weight is current replay evidence.  The
-        # persistent ``split_mass`` remains available in the summary as a
-        # prior, but does not rescue a mode with no physical evidence.
+        # Mode weights are persistent identity evidence.  Current replay
+        # coverage is checked separately by ``_bank_h1_evaluability``.
         mode_weights = mode_evidence
 
         # Weighted two-center clustering runs only on mode-level law identities
@@ -1332,7 +1685,12 @@ class SplitModule(nn.Module):
             device=law_keys.device,
             dtype=torch.long,
         )
-        if active_count == 2:
+        if active_count == 1:
+            # A single persistent mode has a valid one-sided q_bank row
+            # ``[1, 0]``.  It must not become ``[.5, .5]`` and fabricate a
+            # second law in diagnostics or replay likelihoods.
+            mode_group_ids[active_modes[0]] = 0
+        elif active_count == 2:
             mode_group_ids[active_modes[0]] = 0
             mode_group_ids[active_modes[1]] = 1
         elif active_count > 2:
@@ -1423,14 +1781,15 @@ class SplitModule(nn.Module):
         max_items: int,
         min_per_group: int = 2,
         eps: float = 1e-8,
+        row_group_ids: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """Reserve positive-evidence rows on both candidate sides, then Top-K.
+        """Reserve replay representatives from both Bank groups, then Top-K.
 
-        Persistent support affects ``scores`` but never creates extra replay
-        rows.  For a binary Bank proposal, a row merely assigned to a group is
-        not enough: each side must contain at least one row with ``score >
-        eps``.  ``None`` means the bounded replay cannot define a two-sided
-        hypothesis.
+        Persistent mode identity decides whether both groups exist.  A
+        representative row does not need positive/large structural weight:
+        weight and ESS are numerical diagnostics, not a second structural
+        gate.  ``None`` means the bounded replay cannot retain one row for
+        each group.
         """
         if scores.ndim != 1:
             raise ValueError("scores must be one-dimensional")
@@ -1454,12 +1813,24 @@ class SplitModule(nn.Module):
         if bool((bank_group_weights < 0.0).any()):
             raise ValueError("bank_group_weights must be non-negative")
 
-        assignments = bank_group_weights.argmax(dim=-1)
-        positive = scores > eps
-        positive_by_group = [
-            (assignments == group) & positive for group in range(2)
+        if row_group_ids is None:
+            # This fallback is retained for direct callers.  Production Bank
+            # batches pass explicit tri-state mode assignments below so a
+            # neutral unresolved q row cannot masquerade as group 0.
+            assignments = bank_group_weights.argmax(dim=-1)
+        else:
+            if row_group_ids.shape != (count,):
+                raise ValueError("row_group_ids must have shape [R]")
+            assignments = row_group_ids.to(
+                device=scores.device,
+                dtype=torch.long,
+            )
+            if bool(((assignments < -1) | (assignments > 1)).any()):
+                raise ValueError("row_group_ids must contain only -1, 0, or 1")
+        rows_by_group = [
+            assignments == group for group in range(2)
         ]
-        if any(not bool(mask.any()) for mask in positive_by_group):
+        if any(not bool(mask.any()) for mask in rows_by_group):
             return None
         if count <= max_items:
             return torch.arange(count, device=scores.device)
@@ -1467,7 +1838,7 @@ class SplitModule(nn.Module):
         ranked_by_group = []
         for group in range(2):
             group_indices = torch.nonzero(
-                positive_by_group[group], as_tuple=False
+                rows_by_group[group], as_tuple=False
             ).flatten()
             order = torch.argsort(
                 scores.index_select(0, group_indices), descending=True
@@ -1478,8 +1849,8 @@ class SplitModule(nn.Module):
             return None
         reserved: list[int] = []
         # Round-robin reservation prevents the first side from consuming a
-        # small budget before the second side receives one positive-evidence
-        # replay.  At least one row per side is mandatory even when callers set
+        # small budget before the second side receives a representative.
+        # At least one row per side is mandatory even when callers set
         # min_per_group=0.
         reserve_per_group = max(1, min_per_group)
         for rank in range(reserve_per_group):
@@ -1511,15 +1882,9 @@ class SplitModule(nn.Module):
             fill = available.index_select(0, fill_order)
             selected_mask[fill] = True
         selected = torch.nonzero(selected_mask, as_tuple=False).flatten()
-        selected_positive = positive.index_select(0, selected)
         selected_assignments = assignments.index_select(0, selected)
         if any(
-            not bool(
-                (
-                    selected_positive
-                    & (selected_assignments == group)
-                ).any()
-            )
+            not bool((selected_assignments == group).any())
             for group in range(2)
         ):
             return None
@@ -1761,18 +2126,11 @@ class SplitModule(nn.Module):
         ]
         if not valid_indices:
             return None
-        if not bool(
-            evidence_weights_all.index_select(
-                0,
-                torch.tensor(
-                    valid_indices,
-                    device=bank.device,
-                    dtype=torch.long,
-                ),
-            ).sum()
-            > 1e-8
-        ):
-            return None
+        # Structural mode identity comes from persistent Bank support.  Do
+        # not pass ``evidence_weights_all`` here: that vector is masked by
+        # retained replay windows and would make a persistent law disappear
+        # from H1 when bounded replay happens not to cover it this cycle.
+        persistent_mode_evidence = bank.support[:count].clamp_min(0.0).detach()
         mode_group_weights_all, mode_summary = (
             SplitModule._build_bank_mode_groups(
                 mode_ids=bank.mode_ids[:count],
@@ -1780,7 +2138,7 @@ class SplitModule(nn.Module):
                 deltas=bank.deltas[:count],
                 support=bank.support[:count],
                 split_mass=bank.split_mass[:count],
-                effective_evidence=evidence_weights_all,
+                effective_evidence=persistent_mode_evidence,
             )
         )
         if indices is None:
@@ -1824,17 +2182,31 @@ class SplitModule(nn.Module):
         replay_support = bank_evidence["replay_support"].index_select(0, indices)
         evidence_weights = evidence_weights_all.index_select(0, indices)
         if max_items is not None and indices.numel() > max_items:
-            # A bounded binary proposal must reserve positive-evidence rows
-            # from both sides.  Passing q unconditionally is important: a
-            # persistent Bank may contain two law IDs while the current
-            # replay evidence supports only one of them.  Such a truncated
-            # batch is not a valid H1 and must be rejected here, rather than
-            # being materialized and discovered as invalid only after fitting.
+            # A bounded binary proposal must reserve a replay representative
+            # from both persistent sides.  This is the minimal numerical
+            # requirement for evaluating H1; row evidence magnitude is not a
+            # structural gate.
+            mode_to_group = {
+                int(mode): int(group)
+                for mode, group in zip(
+                    mode_summary["mode_ids"].detach().cpu().tolist(),
+                    mode_summary["group_ids"].detach().cpu().tolist(),
+                )
+            }
+            selected_row_groups = torch.tensor(
+                [
+                    mode_to_group.get(int(mode), -1)
+                    for mode in mode_ids.detach().cpu().tolist()
+                ],
+                device=mode_ids.device,
+                dtype=torch.long,
+            )
             selected = SplitModule._mode_stratified_topk(
                 evidence_weights,
                 bank_group_weights,
                 int(max_items),
                 min_per_group=min_replay_per_group,
+                row_group_ids=selected_row_groups,
             )
             if selected is None:
                 return None
@@ -1849,11 +2221,6 @@ class SplitModule(nn.Module):
             mode_ids = mode_ids.index_select(0, selected)
             law_keys = law_keys.index_select(0, selected)
             bank_group_weights = bank_group_weights.index_select(0, selected)
-        if not bool(evidence_weights.sum() > 1e-8):
-            # Exact replay selections are allowed to be arbitrary, but an
-            # all-zero selection cannot define either a likelihood or a
-            # structural hypothesis.
-            return None
         weights, structural_strength, effective_sample_size = (
             SplitModule.normalize_split_evidence(
                 base_weights,
@@ -1928,20 +2295,29 @@ class SplitModule(nn.Module):
         """
         if batch.bank_group_weights is None or batch.mode_summary is None:
             return None
-        if int(batch.mode_summary["mode_ids"].numel()) < 2:
+        persistent_mode_count = self._bank_effective_mode_count(batch)
+        if persistent_mode_count is not None and persistent_mode_count < 2:
+            return None
+        if persistent_mode_count is None and int(
+            batch.mode_summary["mode_ids"].numel()
+        ) < 2:
             return None
 
         hawkes_ll = self._resolve_hawkes_ll(hawkes_ll)
         self.validate_batch(batch)
         reference = self._module_reference(batch.residuals)
         theta = self._theta_sem_to_flat(theta_sem, reference).detach().clone()
-        frozen = self._batch_to_device(batch, theta)
-        q = frozen.bank_group_weights
-        if q is None:
+        hypothesis = self.build_bank_split_hypothesis(
+            batch=batch,
+            theta_h0=theta,
+        )
+        frozen = hypothesis.batch
+        q = hypothesis.q_bank
+        h1_diagnostics = self._bank_h1_evaluability(frozen)
+        if not h1_diagnostics["h1_defined"]:
             return None
-        q = q / q.sum(dim=-1, keepdim=True).clamp_min(self.eps)
 
-        replay_weights = frozen.weights.clamp_min(0.0)
+        replay_weights = hypothesis.replay_weights
         total_weight = replay_weights.sum()
         if not bool(torch.isfinite(total_weight)) or bool(
             total_weight <= self.eps
@@ -1965,14 +2341,12 @@ class SplitModule(nn.Module):
             bool(child_evidence["two_sided_support"]),
             stage="bank_structural_split_probe",
         )
-        q = child_evidence["q"]
+        # Reuse the exact prior stored in the hypothesis; child_evidence is
+        # used here only for mass/ESS diagnostics.
+        q = hypothesis.q_bank
         group_mass = child_evidence["child_mass"]
-        # The alternative is undefined if the bounded replay window contains
-        # no positive evidence for one of the Bank's two groups.
-        if not child_evidence["two_sided_support"]:
-            return None
-        group_delta = child_evidence["delta_bar"]
-        theta_h1 = theta[None, :] + group_delta
+        group_delta = hypothesis.delta_bar
+        theta_h1 = hypothesis.theta_child_init
 
         probe_models = torch.cat((theta[None, :], theta_h1), dim=0)
         probe_nll = batched_replay_log_likelihood(
@@ -1999,31 +2373,34 @@ class SplitModule(nn.Module):
         )
 
         return {
-            "theta_sem_snapshot": theta.detach().clone(),
-            "theta_h0": theta.detach().clone(),
+            "hypothesis": hypothesis,
+            "theta_sem_snapshot": hypothesis.theta_h0.detach().clone(),
+            "theta_h0": hypothesis.theta_h0.detach().clone(),
             "theta_h1": theta_h1.detach().clone(),
             "group_delta": group_delta.detach().clone(),
             "bank_group_weights": q.detach().clone(),
-            "q_bank": q.detach().clone(),
-            "batch": batch,
+            "q_bank": hypothesis.q_bank.detach().clone(),
+            "batch": hypothesis.batch,
             "replay_weights": replay_weights.detach().clone(),
             "replay_ess": float(replay_ess.item()),
             "replay_rows": int(frozen.residuals.size(0)),
             "child_effective_mass": group_mass.detach().clone(),
             "child_ess": child_evidence["child_ess"].detach().clone(),
-            "two_sided_support": True,
+            "two_sided_support": bool(child_evidence["two_sided_support"]),
+            "h1_defined": True,
+            "h1_representative_counts": h1_diagnostics[
+                "h1_representative_counts"
+            ].detach().clone(),
             "has_bank_prior": True,
             "q_bank_mass_L": group_mass[0].detach().clone(),
             "q_bank_mass_R": group_mass[1].detach().clone(),
             "invalid_proposal": False,
-            "K_effective_mode": batch.mode_summary.get(
+            "K_effective_mode": hypothesis.mode_summary.get(
                 "effective_mode_count",
                 torch.tensor(0, device=group_mass.device),
             ).detach().clone(),
-            "mode_ids": batch.mode_summary["mode_ids"].detach().clone(),
-            "mode_group_ids": batch.mode_summary[
-                "group_ids"
-            ].detach().clone(),
+            "mode_ids": hypothesis.mode_ids.detach().clone(),
+            "mode_group_ids": hypothesis.mode_group_ids.detach().clone(),
             "loss_h0": float(loss_h0.item()),
             "loss_h1": float(loss_h1.item()),
             "advantage": float(advantage.item()),
@@ -2049,7 +2426,12 @@ class SplitModule(nn.Module):
         """
         if batch.bank_group_weights is None or batch.mode_summary is None:
             return None
-        if int(batch.mode_summary["mode_ids"].numel()) < 2:
+        persistent_mode_count = self._bank_effective_mode_count(batch)
+        if persistent_mode_count is not None and persistent_mode_count < 2:
+            return None
+        if persistent_mode_count is None and int(
+            batch.mode_summary["mode_ids"].numel()
+        ) < 2:
             return None
         selected_direction = getattr(light_proposal, "selected_direction", None)
         if selected_direction is None:
@@ -2059,11 +2441,15 @@ class SplitModule(nn.Module):
         self.validate_batch(batch)
         reference = self._module_reference(batch.residuals)
         theta = self._theta_sem_to_flat(theta_sem, reference).detach().clone()
-        frozen = self._batch_to_device(batch, theta)
-        q = frozen.bank_group_weights
-        if q is None:
+        hypothesis = self.build_bank_split_hypothesis(
+            batch=batch,
+            theta_h0=theta,
+        )
+        frozen = hypothesis.batch
+        q = hypothesis.q_bank
+        h1_diagnostics = self._bank_h1_evaluability(frozen)
+        if not h1_diagnostics["h1_defined"]:
             return None
-        q = q / q.sum(dim=-1, keepdim=True).clamp_min(self.eps)
 
         light_replay_indices = getattr(light_proposal, "replay_indices", None)
         if light_replay_indices is None:
@@ -2099,7 +2485,7 @@ class SplitModule(nn.Module):
         # Compatibility path for callers that still compare against a Light
         # proposal.  Use the frozen Split row evidence directly; do not
         # reconstruct the retired residual-strength/reliability product.
-        reliability = frozen.weights.clamp_min(0.0)
+        reliability = hypothesis.replay_weights
         total_weight = reliability.sum()
         if not bool(torch.isfinite(total_weight)) or bool(total_weight <= self.eps):
             return None
@@ -2119,14 +2505,9 @@ class SplitModule(nn.Module):
             bool(child_evidence["two_sided_support"]),
             stage="bank_mode_counterfactual_probe",
         )
-        q = child_evidence["q"]
         group_mass = child_evidence["child_mass"]
-        # This is availability, not a persistence threshold: H1 is undefined
-        # when the frozen replay contains no physical window for one side.
-        if not child_evidence["two_sided_support"]:
-            return None
-        group_delta = child_evidence["delta_bar"]
-        theta_h1 = theta[None, :] + group_delta
+        group_delta = hypothesis.delta_bar
+        theta_h1 = hypothesis.theta_child_init
 
         probe_models = torch.cat((theta_h0[None, :], theta_h1), dim=0)
         probe_nll = batched_replay_log_likelihood(
@@ -2149,10 +2530,11 @@ class SplitModule(nn.Module):
         replay_ess = 1.0 / probability.square().sum().clamp_min(self.eps)
 
         return {
+            "hypothesis": hypothesis,
             "theta_sem_snapshot": theta.detach(),
-            "batch": batch,
-            "mode_ids": batch.mode_summary["mode_ids"].detach().clone(),
-            "mode_group_ids": batch.mode_summary["group_ids"].detach().clone(),
+            "batch": hypothesis.batch,
+            "mode_ids": hypothesis.mode_ids.detach().clone(),
+            "mode_group_ids": hypothesis.mode_group_ids.detach().clone(),
             "bank_group_weights": q.detach(),
             "shared_delta": shared_delta.detach(),
             "group_delta": group_delta.detach(),
@@ -2173,12 +2555,16 @@ class SplitModule(nn.Module):
             "replay_rows": int(frozen.residuals.size(0)),
             "child_effective_mass": group_mass.detach().clone(),
             "child_ess": child_evidence["child_ess"].detach().clone(),
-            "two_sided_support": True,
+            "two_sided_support": bool(child_evidence["two_sided_support"]),
+            "h1_defined": True,
+            "h1_representative_counts": h1_diagnostics[
+                "h1_representative_counts"
+            ].detach().clone(),
             "has_bank_prior": True,
             "q_bank_mass_L": group_mass[0].detach().clone(),
             "q_bank_mass_R": group_mass[1].detach().clone(),
             "invalid_proposal": False,
-            "K_effective_mode": batch.mode_summary.get(
+            "K_effective_mode": hypothesis.mode_summary.get(
                 "effective_mode_count",
                 torch.tensor(0, device=group_mass.device),
             ).detach().clone(),
@@ -2244,18 +2630,40 @@ class SplitModule(nn.Module):
             invalid_flag_is_valid and bool(invalid_tensor.bool().item())
         )
 
+        has_bank_prior = bool(
+            out.get("has_bank_prior", out.get("q_bank") is not None)
+        )
+        h1_default = two_sided_support
+        h1_tensor = torch.as_tensor(
+            out.get("h1_defined", h1_default)
+        ).detach()
+        h1_flag_is_valid = bool(
+            h1_tensor.numel() == 1
+            and bool(torch.isfinite(h1_tensor).all())
+        )
+        h1_defined = bool(
+            h1_flag_is_valid and bool(h1_tensor.bool().item())
+        )
+
         # m_min, structural strength and proposal ESS are retained only as
         # diagnostics/backward-compatible arguments.  Bank admission owns
         # persistence; the predictive objective owns the decision boundary.
-        # A Bank-backed binary H1 additionally requires positive evidence on
-        # both sides; otherwise the second child is synthetic and the
-        # hypothesis is undefined.
+        # Bank persistence decides whether the two laws exist.  The only
+        # structural/evaluation gate here is ``h1_defined`` (one retained
+        # representative replay window per persistent group).  ESS and mass
+        # remain finite-value diagnostics, not admission thresholds.
+        child_ess_finite = (
+            True
+            if has_bank_prior
+            else bool(torch.isfinite(N_eff).all())
+        )
         eligible = bool(
             bool(torch.isfinite(N_mass).all())
-            and bool(torch.isfinite(N_eff).all())
+            and child_ess_finite
             and math.isfinite(structural_strength)
             and math.isfinite(effective_sample_size)
-            and two_sided_support
+            and h1_flag_is_valid
+            and h1_defined
             and invalid_flag_is_valid
             and not invalid_proposal
         )
@@ -2296,7 +2704,49 @@ class SplitModule(nn.Module):
         lambda_T: Optional[float | torch.Tensor] = None,
         delta_complexity: float | torch.Tensor = 1.0,
         lambda_route: float | torch.Tensor = 0.0,
+        hypothesis: Optional[FrozenBankSplitHypothesis] = None,
+        lambda_anchor: float | torch.Tensor = 0.0,
     ) -> Dict[str, Any]:
+        if hypothesis is not None:
+            if batch.bank_group_weights is None:
+                raise ValueError(
+                    "a frozen Bank hypothesis requires a Bank-backed batch"
+                )
+            return self.fit_bank_split(
+                hypothesis=hypothesis,
+                hawkes_ll=hawkes_ll,
+                num_steps=num_steps,
+                lr=lr,
+                commit_state=commit_state,
+                m_min=m_min,
+                min_structural_strength=min_structural_strength,
+                min_effective_sample_size=min_effective_sample_size,
+                lambda_T=lambda_T,
+                delta_complexity=delta_complexity,
+                lambda_anchor=lambda_anchor,
+                lambda_route=lambda_route,
+            )
+        if batch.bank_group_weights is not None:
+            # Fallback callers that have a Bank batch but did not run the
+            # explicit Pre-Light probe still use the same canonical path.
+            hypothesis = self.build_bank_split_hypothesis(
+                batch=batch,
+                theta_h0=theta_sem,
+            )
+            return self.fit_bank_split(
+                hypothesis=hypothesis,
+                hawkes_ll=hawkes_ll,
+                num_steps=num_steps,
+                lr=lr,
+                commit_state=commit_state,
+                m_min=m_min,
+                min_structural_strength=min_structural_strength,
+                min_effective_sample_size=min_effective_sample_size,
+                lambda_T=lambda_T,
+                delta_complexity=delta_complexity,
+                lambda_anchor=lambda_anchor,
+                lambda_route=lambda_route,
+            )
         if num_steps <= 0:
             raise ValueError("num_steps must be positive")
         if lr <= 0:
@@ -2371,6 +2821,308 @@ class SplitModule(nn.Module):
         final_out["last_train_loss"] = last_loss
         return final_out
 
+    def fit_bank_split(
+        self,
+        hypothesis: FrozenBankSplitHypothesis,
+        hawkes_ll: Optional[HawkesFamily] = None,
+        num_steps: int = 200,
+        lr: float = 1e-3,
+        commit_state: Optional[SplitCommitState] = None,
+        m_min: Optional[float] = None,
+        min_structural_strength: float = 0.0,
+        min_effective_sample_size: float = 0.0,
+        lambda_T: Optional[float | torch.Tensor] = None,
+        delta_complexity: float | torch.Tensor = 1.0,
+        lambda_anchor: float | torch.Tensor = 1e-2,
+        lambda_route: float | torch.Tensor = 0.0,
+    ) -> Dict[str, Any]:
+        """Refine one frozen Bank hypothesis without changing its identity.
+
+        The only fitted law parameters are
+
+        ``theta_child = theta_child_init + epsilon``.
+
+        ``theta_h0``, ``q_bank``, ``delta_bar`` and the replay windows all come
+        from the frozen hypothesis.  ``lambda_T`` and ``delta_complexity`` are
+        accepted for the shared Split API but intentionally do not enter this
+        differentiable Bank fit; topology pricing belongs to the unified
+        selector after H1 evaluation.
+        """
+        del lambda_T, delta_complexity, m_min
+        if not isinstance(hypothesis, FrozenBankSplitHypothesis):
+            raise TypeError(
+                "hypothesis must be a FrozenBankSplitHypothesis"
+            )
+        if hypothesis.batch is None:
+            raise ValueError(
+                "hypothesis.batch is required for Deep Bank fitting"
+            )
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        if lr <= 0:
+            raise ValueError("lr must be positive")
+
+        hawkes_ll = self._resolve_hawkes_ll(hawkes_ll)
+        module_reference = self._module_reference(hypothesis.batch.residuals)
+        theta_h0 = hypothesis.theta_h0.detach().to(
+            device=module_reference.device,
+            dtype=module_reference.dtype,
+        ).clone()
+        theta_child_init = hypothesis.theta_child_init.detach().to(
+            device=module_reference.device,
+            dtype=module_reference.dtype,
+        ).clone()
+        if theta_h0.shape != (self.P,):
+            raise ValueError("hypothesis.theta_h0 has the wrong shape")
+        if theta_child_init.shape != (2, self.P):
+            raise ValueError(
+                "hypothesis.theta_child_init must have shape [2, P]"
+            )
+        if hypothesis.q_bank.shape != (
+            hypothesis.batch.residuals.size(0),
+            2,
+        ):
+            raise ValueError("hypothesis.q_bank must align with hypothesis.batch")
+        if len(hypothesis.windows) != len(hypothesis.batch.windows):
+            raise ValueError(
+                "hypothesis.windows must align with hypothesis.batch.windows"
+            )
+
+        batch = self._batch_to_device(hypothesis.batch, theta_h0)
+        q_bank = hypothesis.q_bank.to(
+            device=theta_h0.device,
+            dtype=theta_h0.dtype,
+        ).detach().clone()
+        q_bank = q_bank / q_bank.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        replay_weights = hypothesis.replay_weights.to(
+            device=theta_h0.device,
+            dtype=theta_h0.dtype,
+        ).detach().clamp_min(0.0)
+        if replay_weights.shape != batch.weights.shape:
+            raise ValueError(
+                "hypothesis.replay_weights must align with hypothesis.batch"
+            )
+        # The frozen object, rather than a fresh batch normalization, owns
+        # both the q_bank identity and the replay measure used by fitting.
+        batch = replace(
+            batch,
+            weights=replay_weights,
+            bank_group_weights=q_bank,
+        )
+        self.validate_batch(batch)
+
+        child_theta = nn.Parameter(theta_child_init.clone())
+        route_lambda_value = float(
+            torch.as_tensor(lambda_route).detach().cpu().item()
+        )
+        if route_lambda_value < 0.0 or not math.isfinite(route_lambda_value):
+            raise ValueError("lambda_route must be finite and non-negative")
+        trainables: list[nn.Parameter] = [child_theta]
+        if route_lambda_value > 0.0:
+            trainables.extend(list(self.router.parameters()))
+        optimizer = torch.optim.Adam(trainables, lr=lr)
+        replay_cache = build_replay_batch_cache(
+            hypothesis.windows,
+            hawkes_ll,
+            theta_h0,
+        )
+
+        was_training = self.training
+        self.train()
+        last_loss = None
+        try:
+            for _ in range(num_steps):
+                optimizer.zero_grad(set_to_none=True)
+                replay = self.compute_replay_loglikelihood(
+                    batch=batch,
+                    theta_plus=theta_h0,
+                    theta_cand=child_theta,
+                    hawkes_ll=hawkes_ll,
+                    replay_cache=replay_cache,
+                )
+                anchor_loss = (
+                    child_theta - theta_child_init
+                ).square().sum()
+                objective = self.compute_bank_split_training_objective(
+                    weights=replay_weights,
+                    ell_h1=replay["logp_child_bank"],
+                    anchor_loss=anchor_loss,
+                    lambda_anchor=lambda_anchor,
+                    route_loss=replay["route_loss"],
+                    lambda_route=lambda_route,
+                )
+                loss = objective["loss"]
+                if not bool(torch.isfinite(loss)):
+                    raise FloatingPointError(
+                        "Bank Split optimization produced a non-finite loss"
+                    )
+                loss.backward()
+                optimizer.step()
+                last_loss = loss.detach()
+
+            with torch.no_grad():
+                optimized_replay = self.compute_replay_loglikelihood(
+                    batch=batch,
+                    theta_plus=theta_h0,
+                    theta_cand=child_theta,
+                    hawkes_ll=hawkes_ll,
+                    replay_cache=replay_cache,
+                )
+                init_replay = self.compute_replay_loglikelihood(
+                    batch=batch,
+                    theta_plus=theta_h0,
+                    theta_cand=theta_child_init,
+                    hawkes_ll=hawkes_ll,
+                    replay_cache=replay_cache,
+                )
+        finally:
+            if not was_training:
+                self.eval()
+
+        total_weight = replay_weights.sum().clamp_min(self.eps)
+        init_h1_loss = -(
+            replay_weights * init_replay["logp_child_bank"]
+        ).sum() / total_weight
+        optimized_h1_loss = -(
+            replay_weights * optimized_replay["logp_child_bank"]
+        ).sum() / total_weight
+        if not bool(torch.isfinite(init_h1_loss)):
+            raise FloatingPointError(
+                "frozen Bank H1 evaluation produced a non-finite loss"
+            )
+        use_bank_init = (
+            not bool(torch.isfinite(optimized_h1_loss))
+            or bool(optimized_h1_loss > init_h1_loss)
+        )
+        chosen_replay = init_replay if use_bank_init else optimized_replay
+        chosen_theta = (
+            theta_child_init if use_bank_init else child_theta.detach()
+        )
+        final_h1_loss = (
+            init_h1_loss if use_bank_init else optimized_h1_loss
+        )
+
+        child_evidence = self.compute_child_evidence(
+            weights=replay_weights,
+            bank_group_weights=q_bank,
+            residuals=batch.residuals,
+            eps=self.eps,
+        )
+        self._assert_bank_mode_support_invariant(
+            batch,
+            bool(child_evidence["two_sided_support"]),
+            stage="fit_bank_split",
+        )
+        h1_diagnostics = self._bank_h1_evaluability(batch)
+        delta_bar = hypothesis.delta_bar.to(
+            device=theta_h0.device,
+            dtype=theta_h0.dtype,
+        ).detach().clone()
+        zero = theta_h0.new_zeros(())
+        structural = {
+            "dist": theta_h0.new_zeros(batch.residuals.size(0), 2),
+            "q": q_bank,
+            "N_mass": child_evidence["child_mass"],
+            "N_eff": child_evidence["child_ess"],
+            "N": child_evidence["child_mass"],
+            "row_evidence": child_evidence["row_evidence"],
+            "child_evidence": child_evidence["child_evidence"],
+            "child_effective_mass": child_evidence["child_mass"],
+            "child_ess": child_evidence["child_ess"],
+            "two_sided_support": child_evidence["two_sided_support"],
+            "invalid_proposal": False,
+            "pi_bar": child_evidence["pi_bar"],
+            "delta_bar": delta_bar,
+            "delta_shared": zero.new_zeros(self.P),
+            "delta_child": delta_bar,
+            "alpha": zero + 1.0,
+            "rho_sp": zero + 1.0,
+            "canonical_bank_hypothesis": True,
+            "theta_plus": theta_h0,
+            "theta_cand": chosen_theta,
+        }
+        anchor_loss = (
+            chosen_theta - theta_child_init
+        ).square().sum()
+        objective = self.compute_bank_split_training_objective(
+            weights=replay_weights,
+            ell_h1=chosen_replay["logp_child_bank"],
+            anchor_loss=anchor_loss,
+            lambda_anchor=lambda_anchor,
+            route_loss=chosen_replay["route_loss"],
+            lambda_route=lambda_route,
+        )
+
+        out: Dict[str, Any] = {}
+        out.update(structural)
+        out.update(chosen_replay)
+        out.update(objective)
+        out.update({
+            "hypothesis": hypothesis,
+            "has_bank_prior": True,
+            "theta_bank": theta_child_init,
+            "theta_child_init": theta_child_init,
+            "h1_defined": bool(h1_diagnostics["h1_defined"]),
+            "h1_representative_counts": h1_diagnostics[
+                "h1_representative_counts"
+            ].detach().clone(),
+            "q_bank_mass": child_evidence["child_mass"].detach().clone(),
+            "q_bank_mass_L": child_evidence["child_mass"][0],
+            "q_bank_mass_R": child_evidence["child_mass"][1],
+            "invalid_proposal": not bool(h1_diagnostics["h1_defined"]),
+            "deep_fit_rolled_back": use_bank_init,
+            "bank_h1_loss_init": init_h1_loss.detach(),
+            "bank_h1_loss_optimized": optimized_h1_loss.detach(),
+            "bank_h1_loss_final": final_h1_loss.detach(),
+            "lambda_T": zero,
+            "delta_tree_complexity": zero,
+            "expected_delta_tree_complexity": zero,
+        })
+        effective_mode_count = self._bank_effective_mode_count(batch)
+        if effective_mode_count is not None:
+            out["K_effective_mode"] = torch.as_tensor(
+                effective_mode_count,
+                device=theta_h0.device,
+                dtype=theta_h0.dtype,
+            )
+        if batch.mode_summary is not None:
+            out["bank_mode_summary"] = {
+                key: value.detach().clone()
+                for key, value in batch.mode_summary.items()
+            }
+        out["weighted_nll"] = objective["prediction_loss"]
+        out["tree_penalty"] = objective["complexity_penalty"]
+        out["structural_strength"] = (
+            replay_weights.new_ones(())
+            if batch.structural_strength is None
+            else batch.structural_strength.reshape(())
+        )
+        out["effective_sample_size"] = (
+            replay_weights.sum().square()
+            / (replay_weights.square().sum() + self.eps)
+            if batch.effective_sample_size is None
+            else batch.effective_sample_size.reshape(())
+        )
+
+        final_out = self.detach_split_output(out)
+        commit_state = self.commit_state if commit_state is None else commit_state
+        eligible = self.evaluate_split_eligibility(
+            out=final_out,
+            commit_state=commit_state,
+            m_min=0.0,
+            min_structural_strength=min_structural_strength,
+            min_effective_sample_size=min_effective_sample_size,
+        )
+        final_out = self.attach_split_eligibility_output(
+            out=final_out,
+            eligible=eligible,
+            commit_state=commit_state,
+        )
+        final_out["num_steps"] = num_steps
+        final_out["lr"] = lr
+        final_out["last_train_loss"] = last_loss
+        return final_out
+
     @staticmethod
     def sleep_phase_split_update(
         leaves: Iterable[Any],
@@ -2389,6 +3141,7 @@ class SplitModule(nn.Module):
         tau_age: float = 20.0,
         residual_norm_ema: float = 1.0,
         lambda_route: float | torch.Tensor = 0.0,
+        lambda_anchor: float | torch.Tensor = 1e-2,
     ) -> Dict[Any, Dict[str, Any]]:
         split_outputs = {}
 
@@ -2430,6 +3183,7 @@ class SplitModule(nn.Module):
                 lambda_T=lambda_T,
                 delta_complexity=delta_complexity,
                 lambda_route=lambda_route,
+                lambda_anchor=lambda_anchor,
             )
 
         return split_outputs
@@ -2452,11 +3206,11 @@ def commit_split(
     The old leaf bank initially remains attached to the newly internal parent.
     For Bank-backed proposals, effective source-bank modes receive a child
     assignment.  Inactive/unresolved modes carry the explicit assignment
-    ``-1`` and remain in the parent Bank.  Active rows with a complete child
-    likelihood may refine their assignment with ``argmax_j [log
-    q^bank_{rj} + log p(w_r | theta_j)]``.  The context router is intentionally
-    not part of this topology write.  Payloads without a Bank prior retain a
-    conservative legacy fallback for old checkpoints and direct callers.
+    ``-1`` and remain in the parent Bank.  Replay likelihood and the context
+    router are intentionally not part of this topology write: Bank identity
+    is determined by persistent mode grouping.  Payloads without a Bank prior
+    retain a conservative legacy fallback for old checkpoints and direct
+    callers.
     """
     if leaf_id not in tree.nodes or not tree.nodes[leaf_id].is_leaf:
         raise KeyError(f"Unknown leaf: {leaf_id}")
@@ -2481,7 +3235,13 @@ def commit_split(
     source_mode_ids = source_bank.mode_ids[: len(source_bank)].detach().to(
         dtype=torch.long
     )
-    source_bank_evidence = SplitModule.compute_bank_row_evidence(source_bank)
+    # Reconstruct the structural partition from persistent support when a
+    # caller supplies an older payload without the frozen mode summary.  The
+    # current replay-window mask is for likelihood refinement only and must
+    # not decide whether a Bank law exists.
+    persistent_mode_evidence = source_bank.support[: len(source_bank)].clamp_min(
+        0.0
+    ).detach()
     bank_group_weights_all, bank_mode_summary = (
         SplitModule._build_bank_mode_groups(
             mode_ids=source_bank.mode_ids[: len(source_bank)],
@@ -2489,7 +3249,7 @@ def commit_split(
             deltas=source_bank.deltas[: len(source_bank)],
             support=source_bank.support[: len(source_bank)],
             split_mass=source_bank.split_mass[: len(source_bank)],
-            effective_evidence=source_bank_evidence["evidence_weights"],
+            effective_evidence=persistent_mode_evidence,
         )
         if len(source_bank) > 0
         else (
@@ -2620,13 +3380,13 @@ def commit_split(
                 child_assignments = bank_group_weights_all.argmax(dim=-1).to(
                     dtype=torch.long
                 ).clone()
-                effective_rows = source_bank_evidence["evidence_weights"] > 1e-8
+                effective_rows = persistent_mode_evidence > 1e-8
                 child_assignments[~effective_rows] = -1
         else:
             child_assignments = bank_group_weights_all.argmax(dim=-1).to(
                 dtype=torch.long
             ).clone()
-            effective_rows = source_bank_evidence["evidence_weights"] > 1e-8
+            effective_rows = persistent_mode_evidence > 1e-8
             child_assignments[~effective_rows] = -1
         parent_memory_mask = child_assignments < 0
     else:
@@ -2640,120 +3400,43 @@ def commit_split(
             len(source_bank), dtype=torch.bool, device=source_bank.device
         )
 
-    if valid_memory_indices:
+    if valid_memory_indices and not has_bank_prior:
         valid_count = len(valid_memory_indices)
+        # This branch is unreachable for Bank-backed assignments: their
+        # structural output is already fixed by persistent mode grouping.
         logp_children = None
-
-        if has_bank_prior:
-            # Production Split modules carry the cycle's Hawkes evaluator.
-            # Score the complete source Bank here, rather than reusing a
-            # bounded proposal batch that may have been mode-stratified or
-            # truncated.
-            try:
-                resolve_hawkes = getattr(split_module, "_resolve_hawkes_ll")
-                hawkes_ll = resolve_hawkes(None)
-            except (AttributeError, RuntimeError):
-                hawkes_ll = None
-            if hawkes_ll is not None:
-                reference = theta_plus.detach().to(
-                    device=source_bank.device,
-                    dtype=source_bank.deltas.dtype,
-                )
-                child_reference = theta_cand.detach().to(
-                    device=source_bank.device,
-                    dtype=source_bank.deltas.dtype,
-                )
-                valid_windows = [
-                    source_bank.windows[index] for index in valid_memory_indices
-                ]
-                replay_cache = build_replay_batch_cache(
-                    valid_windows,
-                    hawkes_ll,
-                    reference,
-                )
-                window_nll = batched_replay_log_likelihood(
-                    replay_cache,
-                    torch.cat((reference[None, :], child_reference), dim=0),
-                    hawkes_ll,
-                    normalize_by_events=True,
-                )
-                logp_children = -window_nll[:, 1:3]
-            else:
-                # Keep manually-constructed new payloads usable when no
-                # Hawkes evaluator is attached.  A bounded proposal payload
-                # is optional: the complete Bank-mode assignment above is the
-                # safe fallback when its rows do not cover the source Bank.
-                logp_children = split_output.get("logp_child_each")
-                if not torch.is_tensor(logp_children) or logp_children.shape != (
-                    valid_count,
-                    2,
-                ):
-                    logp_children = None
-
-            if logp_children is not None:
-                logp_children = logp_children.to(source_bank.device)
-                valid_indices = torch.tensor(
-                    valid_memory_indices,
-                    dtype=torch.long,
-                    device=source_bank.device,
-                )
-                q_valid = bank_group_weights_all.index_select(0, valid_indices).to(
-                    device=source_bank.device,
-                    dtype=logp_children.dtype,
-                )
-                bank_h1 = split_module.evaluate_bank_h1(
-                    q_valid,
-                    logp_children,
-                    eps=split_module.eps,
-                )
-                posterior_logit = bank_h1["log_q_bank"] + logp_children
-                finite_posterior = torch.isfinite(posterior_logit).any(dim=-1)
-                safe_posterior = torch.where(
-                    torch.isfinite(posterior_logit),
-                    posterior_logit,
-                    torch.full_like(posterior_logit, -torch.inf),
-                )
-                refined_child = safe_posterior.argmax(dim=-1)
-                effective_valid = child_assignments.index_select(
-                    0, valid_indices
-                ) >= 0
-                refine_assignment = finite_posterior & effective_valid
-                child_assignments[valid_indices[refine_assignment]] = (
-                    refined_child[refine_assignment]
-                )
-        else:
-            # Legacy payloads score only the rows that were explicitly
-            # supplied.  The router is deliberately not consulted here; a
-            # missing/truncated score leaves that row inherited by the parent.
-            logp_parent = split_output.get("logp0")
-            logp_children = split_output.get("logp_child_each")
-            if (
-                torch.is_tensor(logp_parent)
-                and torch.is_tensor(logp_children)
-                and logp_parent.shape == (valid_count,)
-                and logp_children.shape == (valid_count, 2)
-            ):
-                logp_parent = logp_parent.to(source_bank.device)
-                logp_children = logp_children.to(source_bank.device)
-                best_child = logp_children.argmax(dim=-1)
-                best_child_logp = logp_children.gather(
-                    1, best_child[:, None]
-                ).squeeze(1)
-                finite_scores = torch.isfinite(logp_parent) & torch.isfinite(
-                    logp_children
-                ).all(dim=-1)
-                parent_is_uniquely_better = (
-                    logp_parent - best_child_logp > memory_hard_threshold
-                )
-                move_to_child = finite_scores & ~parent_is_uniquely_better
-                valid_indices = torch.tensor(
-                    valid_memory_indices,
-                    dtype=torch.long,
-                    device=source_bank.device,
-                )
-                moving_indices = valid_indices[move_to_child]
-                parent_memory_mask[moving_indices] = False
-                child_assignments[moving_indices] = best_child[move_to_child]
+        # Legacy payloads score only the rows that were explicitly supplied.
+        # The router is deliberately not consulted here; a missing/truncated
+        # score leaves that row inherited by the parent.
+        logp_parent = split_output.get("logp0")
+        logp_children = split_output.get("logp_child_each")
+        if (
+            torch.is_tensor(logp_parent)
+            and torch.is_tensor(logp_children)
+            and logp_parent.shape == (valid_count,)
+            and logp_children.shape == (valid_count, 2)
+        ):
+            logp_parent = logp_parent.to(source_bank.device)
+            logp_children = logp_children.to(source_bank.device)
+            best_child = logp_children.argmax(dim=-1)
+            best_child_logp = logp_children.gather(
+                1, best_child[:, None]
+            ).squeeze(1)
+            finite_scores = torch.isfinite(logp_parent) & torch.isfinite(
+                logp_children
+            ).all(dim=-1)
+            parent_is_uniquely_better = (
+                logp_parent - best_child_logp > memory_hard_threshold
+            )
+            move_to_child = finite_scores & ~parent_is_uniquely_better
+            valid_indices = torch.tensor(
+                valid_memory_indices,
+                dtype=torch.long,
+                device=source_bank.device,
+            )
+            moving_indices = valid_indices[move_to_child]
+            parent_memory_mask[moving_indices] = False
+            child_assignments[moving_indices] = best_child[move_to_child]
 
     if isinstance(split_output, dict):
         split_output["bank_mode_summary"] = {

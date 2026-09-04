@@ -135,6 +135,7 @@ def format_split_candidate_log(
         f"has_bank_prior={bool(diagnostics.get('has_bank_prior', False))} "
         f"q_bank_mass_L={scalar(diagnostics.get('q_bank_mass_L')):.6g} "
         f"q_bank_mass_R={scalar(diagnostics.get('q_bank_mass_R')):.6g} "
+        f"h1_defined={bool(diagnostics.get('h1_defined', False))} "
         f"two_sided_support={bool(diagnostics.get('two_sided_support', False))} "
         f"invalid_proposal={bool(diagnostics.get('invalid_proposal', False))} "
         f"N_bank={integer(diagnostics.get('N_bank', candidate.replay_size))} "
@@ -396,13 +397,55 @@ def build_split_candidate(
     invalid_proposal = bool(
         invalid_flag_is_valid and bool(invalid_tensor.bool().item())
     )
+    has_bank_prior = bool(
+        output.get("has_bank_prior", output.get("q_bank") is not None)
+    )
+    # ``two_sided_support`` is retained as a row-evidence diagnostic.  For a
+    # Bank-backed proposal, structural identity plus one representative replay
+    # window per group is the only H1 definition gate.  Direct legacy outputs
+    # fall back to the historical diagnostic when they do not carry the new
+    # field.
+    h1_default = two_sided_valid
+    h1_tensor = torch.as_tensor(
+        output.get("h1_defined", h1_default),
+        device=parent.device,
+    ).detach()
+    h1_flag_is_valid = (
+        h1_tensor.numel() == 1
+        and bool(torch.isfinite(h1_tensor).all())
+    )
+    h1_defined = bool(
+        h1_flag_is_valid and bool(h1_tensor.bool().item())
+    )
+    h1_representative_counts = output.get(
+        "h1_representative_counts",
+        (),
+    )
+    if torch.is_tensor(h1_representative_counts):
+        h1_representative_counts = [
+            int(value)
+            for value in h1_representative_counts.detach().cpu().reshape(-1).tolist()
+        ]
+    elif isinstance(h1_representative_counts, Sequence):
+        h1_representative_counts = list(h1_representative_counts)
+    else:
+        h1_representative_counts = []
     if child_ess.shape == (2,):
         child_ess_values = child_ess
-        child_metrics_finite = torch.isfinite(child_ess).all()
+        child_metrics_finite = torch.as_tensor(
+            True if has_bank_prior else bool(torch.isfinite(child_ess).all()),
+            device=parent.device,
+            dtype=torch.bool,
+        )
     else:
         child_ess_values = parent.new_zeros(2)
-        child_metrics_finite = torch.zeros(
-            (), device=parent.device, dtype=torch.bool
+        # Child ESS is an optional diagnostic, never a structural gate for a
+        # canonical Bank H1.  Legacy standalone payloads still require the
+        # old shape for compatibility.
+        child_metrics_finite = torch.as_tensor(
+            has_bank_prior,
+            device=parent.device,
+            dtype=torch.bool,
         )
     child_mass = torch.as_tensor(
         output.get("N_mass", output.get("N", ())),
@@ -420,15 +463,24 @@ def build_split_candidate(
         & torch.isfinite(proposal_ess_tensor)
         & torch.isfinite(raw_gain)
         & torch.isfinite(uncertainty)
-        & torch.as_tensor(two_sided_valid, device=parent.device)
+        & torch.as_tensor(h1_flag_is_valid, device=parent.device)
+        & torch.as_tensor(h1_defined, device=parent.device)
         & torch.as_tensor(invalid_flag_is_valid, device=parent.device)
         & torch.as_tensor(not invalid_proposal, device=parent.device)
     )
-    relaxed_gate = torch.as_tensor(
-        output.get("g_split", 0.0),
-        device=parent.device,
-        dtype=parent.dtype,
-    ).detach().reshape(())
+    # A Bank-backed candidate is already an H1 hypothesis.  Keep the legacy
+    # summary slot populated with one for log/schema compatibility, but never
+    # read ``g_split`` on that path.  Only the legacy residual-clustering
+    # fallback has a relaxed gate.
+    relaxed_gate = (
+        parent.new_ones(())
+        if has_bank_prior
+        else torch.as_tensor(
+            output.get("g_split", 0.0),
+            device=parent.device,
+            dtype=parent.dtype,
+        ).detach().reshape(())
+    )
     summary = torch.cat((
         torch.stack((
             raw_gain,
@@ -466,7 +518,11 @@ def build_split_candidate(
         and bool(torch.isfinite(two_sided_tensor).all())
         and not bool(two_sided_tensor.bool().item())
     )
-    if two_sided_is_false:
+    if has_bank_prior and not h1_flag_is_valid:
+        reason = "invalid_h1_definition"
+    elif has_bank_prior and not h1_defined:
+        reason = "h1_undefined"
+    elif two_sided_is_false and not has_bank_prior:
         reason = "one_sided_effective_support"
     elif invalid_proposal:
         reason = "invalid_bank_h1"
@@ -501,9 +557,6 @@ def build_split_candidate(
         except (TypeError, ValueError, RuntimeError):
             return float(default)
 
-    has_bank_prior = bool(
-        output.get("has_bank_prior", output.get("q_bank") is not None)
-    )
     return UnifiedTopologyCandidate(
         action_id=action_id,
         kind=TopologyActionKind.SPLIT,
@@ -531,6 +584,8 @@ def build_split_candidate(
             "has_bank_prior": has_bank_prior,
             "q_bank_mass_L": diagnostic_scalar(output.get("q_bank_mass_L")),
             "q_bank_mass_R": diagnostic_scalar(output.get("q_bank_mass_R")),
+            "h1_defined": bool(h1_defined),
+            "h1_representative_counts": h1_representative_counts,
             "two_sided_support": bool(two_sided_valid),
             "invalid_proposal": bool(invalid_proposal),
             "probe_advantage": float(torch.as_tensor(

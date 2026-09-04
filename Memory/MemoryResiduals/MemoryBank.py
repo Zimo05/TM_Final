@@ -2417,8 +2417,24 @@ class MemoryBank:
             self.context_valid[target, :keep_count] = True
             self.context_support[target, :keep_count] = selected_support
         self._sync_legacy_key(target)
-        best_window = int(indices[torch.argmax(weights)].item())
-        self.windows[target] = self.windows[best_window]
+        # A compressed persistent mode must keep a replay representative when
+        # one exists.  The old argmax could select a higher-weight row whose
+        # window was already absent and thereby erase the only evaluable H1
+        # representative during mode compression.
+        valid_window = torch.tensor(
+            [self.windows[int(index)] is not None for index in indices.detach().cpu().tolist()],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        if bool(valid_window.any()):
+            valid_positions = torch.nonzero(valid_window, as_tuple=False).flatten()
+            best_position = valid_positions[
+                torch.argmax(weights.index_select(0, valid_positions))
+            ]
+            best_window = int(indices[best_position].item())
+            self.windows[target] = self.windows[best_window]
+        else:
+            self.windows[target] = None
         keep = torch.ones(len(self), device=self.device, dtype=torch.bool)
         keep[indices[1:]] = False
         self.keep(torch.nonzero(keep, as_tuple=False).flatten())

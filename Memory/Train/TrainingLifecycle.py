@@ -201,6 +201,18 @@ class TrainingLifecycleMixin:
             raise ValueError(
                 "split_route_loss_weight must be finite and non-negative"
             )
+        split_anchor_weight = getattr(
+            self.sleep_config,
+            "split_anchor_weight",
+            1e-2,
+        )
+        if (
+            not math.isfinite(float(split_anchor_weight))
+            or split_anchor_weight < 0.0
+        ):
+            raise ValueError(
+                "split_anchor_weight must be finite and non-negative"
+            )
         if self.sleep_config.deep_availability_tau <= 0.0:
             raise ValueError("deep_availability_tau must be positive")
         if not 0.0 <= self.sleep_config.deep_accumulator_decay < 1.0:

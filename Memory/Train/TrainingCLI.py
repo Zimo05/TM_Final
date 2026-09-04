@@ -486,6 +486,15 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--split-anchor-weight",
+        type=float,
+        default=1e-2,
+        help=(
+            "Anchor weight for Deep refinement around the frozen Bank child "
+            "initialization."
+        ),
+    )
+    parser.add_argument(
         "--deep-availability-tau",
         "--deep-cooldown-tau",
         "--deep-min-interval",
@@ -824,6 +833,14 @@ def main() -> None:
     ):
         raise ValueError(
             "--split-route-loss-weight must be finite and non-negative"
+        )
+    split_anchor_weight = getattr(args, "split_anchor_weight", 1e-2)
+    if (
+        not math.isfinite(split_anchor_weight)
+        or split_anchor_weight < 0.0
+    ):
+        raise ValueError(
+            "--split-anchor-weight must be finite and non-negative"
         )
     if not 0.0 <= args.route_probe_leaf_smoothing < 1.0:
         raise ValueError(
@@ -1513,6 +1530,7 @@ def main() -> None:
                 args.split_min_effective_sample_size
             ),
             split_route_loss_weight=args.split_route_loss_weight,
+            split_anchor_weight=split_anchor_weight,
         ),
         structure=StructureConfig(
             prune_warmup_epochs=args.prune_warmup_epochs,
