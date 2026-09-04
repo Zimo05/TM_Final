@@ -132,6 +132,11 @@ def format_split_candidate_log(
         f"K_mode={integer(diagnostics.get('K_mode', diagnostics.get('K_law_mode', 0)))} "
         f"K_law_mode={integer(diagnostics.get('K_law_mode', 0))} "
         f"K_effective_mode={integer(diagnostics.get('K_effective_mode', 0))} "
+        f"has_bank_prior={bool(diagnostics.get('has_bank_prior', False))} "
+        f"q_bank_mass_L={scalar(diagnostics.get('q_bank_mass_L')):.6g} "
+        f"q_bank_mass_R={scalar(diagnostics.get('q_bank_mass_R')):.6g} "
+        f"two_sided_support={bool(diagnostics.get('two_sided_support', False))} "
+        f"invalid_proposal={bool(diagnostics.get('invalid_proposal', False))} "
         f"N_bank={integer(diagnostics.get('N_bank', candidate.replay_size))} "
         f"N_shadow={integer(diagnostics.get('N_shadow', 0))} "
         f"N_replay={integer(diagnostics.get('N_replay', candidate.replay_size))} "
@@ -452,6 +457,23 @@ def build_split_candidate(
         child_ess_right,
     ) = summary
     eligible = bool(eligible_value)
+    # Keep structural rejection causes distinct from numerical failures.  A
+    # finite proposal with no effective replay support on one side is not a
+    # non-finite-metrics failure, and an explicitly invalid Bank H1 should be
+    # visible even when its scalar metrics happen to be finite.
+    two_sided_is_false = bool(
+        two_sided_tensor.numel() == 1
+        and bool(torch.isfinite(two_sided_tensor).all())
+        and not bool(two_sided_tensor.bool().item())
+    )
+    if two_sided_is_false:
+        reason = "one_sided_effective_support"
+    elif invalid_proposal:
+        reason = "invalid_bank_h1"
+    elif eligible:
+        reason = "objective_competition"
+    else:
+        reason = "nonfinite_split_metrics"
     n_bank = output.get("N_bank", parent.numel())
     n_shadow = output.get("N_shadow", 0)
     n_replay = output.get("N_replay", parent.numel())
@@ -471,6 +493,17 @@ def build_split_candidate(
             output.get("K_law_effective_mode", 0),
         )
     ).detach().cpu())
+    def diagnostic_scalar(value: Any, default: float = float("nan")) -> float:
+        if value is None:
+            return float(default)
+        try:
+            return float(torch.as_tensor(value).detach().cpu())
+        except (TypeError, ValueError, RuntimeError):
+            return float(default)
+
+    has_bank_prior = bool(
+        output.get("has_bank_prior", output.get("q_bank") is not None)
+    )
     return UnifiedTopologyCandidate(
         action_id=action_id,
         kind=TopologyActionKind.SPLIT,
@@ -485,7 +518,7 @@ def build_split_candidate(
         effective_sample_size=float(effective_sample_size_value),
         replay_size=int(parent.numel()),
         diagnostics={
-            "reason": "objective_competition" if eligible else "nonfinite_split_metrics",
+            "reason": reason,
             "N_bank": int(n_bank),
             "N_shadow": int(n_shadow),
             "N_replay": int(n_replay),
@@ -495,6 +528,9 @@ def build_split_candidate(
             "K_mode": k_law_mode,
             "K_law_mode": k_law_mode,
             "K_effective_mode": k_effective_mode,
+            "has_bank_prior": has_bank_prior,
+            "q_bank_mass_L": diagnostic_scalar(output.get("q_bank_mass_L")),
+            "q_bank_mass_R": diagnostic_scalar(output.get("q_bank_mass_R")),
             "two_sided_support": bool(two_sided_valid),
             "invalid_proposal": bool(invalid_proposal),
             "probe_advantage": float(torch.as_tensor(

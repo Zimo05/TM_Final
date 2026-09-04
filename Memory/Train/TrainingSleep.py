@@ -1415,6 +1415,10 @@ class TrainingSleepMixin:
                     split_init_lr=self.sleep_config.split_init_lr,
                     allow_topology_prune=allow_topology_prune,
                     promotion_kwargs=promotion_kwargs,
+                    # Keep Promotion implementation available for isolated
+                    # callers, but disable it in the current Bank-backed
+                    # training path so it cannot move Split evidence.
+                    promote_when_structure_unchanged=False,
                     statistics_prepared=True,
                     protected_leaf_ids=protected_probes,
                 )

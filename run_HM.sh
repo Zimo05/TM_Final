@@ -318,7 +318,7 @@ start_memory() {
       "${cli_output_args[@]}" \
       "${controller_args[@]}" \
       --epochs "$training_epochs" \
-      --cold-start-epochs 10 \
+      --cold-start-epochs 5 \
       --z-dim 50 \
       --node-dim 128 \
       --memory-key-dim 64 \
@@ -362,7 +362,7 @@ start_memory() {
       --route-encoder-grad-scale 0.08 \
       --route-encoder-reliability-decay 0.80 \
       --route-teacher-temperature 0.85 \
-      --route-balance-batch-size 64 \
+      --route-balance-batch-size 32 \
       --wake-wavefront-batch-size 64 \
       --light-replay-budget 128 \
       --deep-min-interval 3 \

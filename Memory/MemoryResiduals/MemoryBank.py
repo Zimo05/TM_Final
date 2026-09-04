@@ -1021,12 +1021,12 @@ class MemoryBank:
         # enough accepted observations, its own rolling distance statistics
         # determine both radii.
         self.adaptive_history_size = 64
-        self.adaptive_min_samples = 8
+        self.adaptive_min_samples = 18
         # Accepted-sample calibrated duplicate radius.  The lower quantile
         # keeps the duplicate gate from inheriting the upper-tail bias caused
         # by its own admission censoring.
         self.duplicate_quantile = 0.85
-        self.mode_quantile = 0.975
+        self.mode_quantile = 0.95
         self.radius_margin = 1e-3
         self.gain_quantile = 0.95
         self.gain_ema_decay = 0.8
@@ -1294,9 +1294,9 @@ class MemoryBank:
         retention_stale_weight: float = 1.0,
         retention_age_weight: float = 0.1,
         adaptive_history_size: int = 64,
-        adaptive_min_samples: int = 8,
+        adaptive_min_samples: int = 18,
         duplicate_quantile: float = 0.85,
-        mode_quantile: float = 0.975,
+        mode_quantile: float = 0.95,
         radius_margin: float = 1e-3,
         gain_quantile: float = 0.95,
         gain_ema_decay: float = 0.8,
@@ -1587,9 +1587,9 @@ class MemoryBank:
                 setattr(self, name, default)
         policy_defaults = {
             "adaptive_history_size": 64,
-            "adaptive_min_samples": 8,
+            "adaptive_min_samples": 18,
             "duplicate_quantile": 0.85,
-            "mode_quantile": 0.975,
+            "mode_quantile": 0.95,
             "radius_margin": 1e-3,
             "gain_quantile": 0.95,
             "gain_ema_decay": 0.8,

@@ -271,9 +271,10 @@ class LightDeepSleepTests(unittest.TestCase):
 
         self.assertIsNotNone(batch)
         self.assertAlmostEqual(float(batch.weights.sum()), 4.0, places=5)
-        expected_strength = (
-            batch.base_weights * batch.structural_weights
-        ).sum() / batch.base_weights.sum()
+        expected_weights = batch.base_weights * batch.sample_support
+        expected_weights = 4.0 * expected_weights / expected_weights.sum()
+        torch.testing.assert_close(batch.weights, expected_weights)
+        expected_strength = torch.ones_like(batch.structural_strength)
         self.assertTrue(torch.allclose(
             batch.structural_strength,
             expected_strength,

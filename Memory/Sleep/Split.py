@@ -37,8 +37,9 @@ class SplitBatch:
     windows: List[EventWindow]
     # ``weights`` are normalized to replay-count scale before Split uses
     # them.  Keep the unnormalized factors and their scale-free safeguards so
-    # normalization cannot manufacture structural evidence from tiny
-    # QUEUE_SPLIT probabilities or one dominant memory.
+    # normalization cannot manufacture structural evidence from one dominant
+    # memory.  ``structural_weights`` is retained for provenance/compatibility
+    # but is not applied to Split evidence.
     base_weights: Optional[torch.Tensor] = None
     structural_weights: Optional[torch.Tensor] = None
     structural_strength: Optional[torch.Tensor] = None
@@ -261,9 +262,9 @@ class SplitModule(nn.Module):
             dist = residuals.new_zeros(residuals.size(0), 2)
 
         # ``weights`` is already the row-level structural evidence e_r.  In
-        # particular, Bank batches include persistent support, queue weight,
-        # quality, recency, and usage before normalization.  Do not multiply
-        # it by residual magnitude or by ``sample_support`` a second time.
+        # particular, Bank batches include persistent support, quality,
+        # recency, and usage before normalization.  Do not multiply it by
+        # residual magnitude or by ``sample_support`` a second time.
         # ``replay_support`` remains an API/provenance field, but child mass,
         # prototypes, and ESS all use this one definition of u_{rj}=e_r q_{rj}.
         if sample_support is not None and sample_support.shape != weights.shape:
@@ -319,6 +320,38 @@ class SplitModule(nn.Module):
             "theta_plus": theta_plus,
             "theta_cand": theta_cand,
         }
+
+    @staticmethod
+    def _bank_effective_mode_count(batch: SplitBatch) -> Optional[int]:
+        """Read the effective Bank-mode count carried by a production batch."""
+        if batch.mode_summary is None:
+            return None
+        value = batch.mode_summary.get("effective_mode_count")
+        if value is None:
+            return None
+        value = torch.as_tensor(value).detach().reshape(-1)
+        if value.numel() != 1 or not bool(torch.isfinite(value).all()):
+            return None
+        return int(value.item())
+
+    @staticmethod
+    def _assert_bank_mode_support_invariant(
+        batch: SplitBatch,
+        two_sided_support: bool,
+        *,
+        stage: str,
+    ) -> Optional[int]:
+        """Ensure Bank mode provenance agrees with binary replay support."""
+        if batch.bank_group_weights is None:
+            return None
+        effective_mode_count = SplitModule._bank_effective_mode_count(batch)
+        if effective_mode_count is not None and effective_mode_count < 2:
+            assert not two_sided_support, (
+                "Bank q_bank provenance mismatch during "
+                f"{stage}: K_effective_mode={effective_mode_count} "
+                "but two_sided_support=True"
+            )
+        return effective_mode_count
 
     def compute_split_training_objective(
         self,
@@ -885,6 +918,11 @@ class SplitModule(nn.Module):
             replay_support=replay_support,
             bank_group_weights=batch.bank_group_weights,
         )
+        effective_mode_count = self._assert_bank_mode_support_invariant(
+            batch,
+            bool(struct["two_sided_support"]),
+            stage="forward",
+        )
 
         replay = self.compute_replay_loglikelihood(
             batch=batch,
@@ -914,6 +952,18 @@ class SplitModule(nn.Module):
         out.update(struct)
         out.update(replay)
         out.update(objective)
+        out["has_bank_prior"] = batch.bank_group_weights is not None
+        if batch.bank_group_weights is not None:
+            q_bank_mass = struct["N_mass"].detach().clone()
+            out["q_bank_mass"] = q_bank_mass
+            out["q_bank_mass_L"] = q_bank_mass[0]
+            out["q_bank_mass_R"] = q_bank_mass[1]
+            if effective_mode_count is not None:
+                out["K_effective_mode"] = torch.as_tensor(
+                    effective_mode_count,
+                    device=q_bank_mass.device,
+                    dtype=q_bank_mass.dtype,
+                )
         if batch.mode_summary is not None:
             out["bank_mode_summary"] = {
                 key: value.detach().clone()
@@ -979,7 +1029,9 @@ class SplitModule(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Return the single row-evidence definition used by Bank-backed Split.
 
-        ``e_r = recency_r * usage_r * quality_r * queue_weight_r * support_r``.
+        ``e_r = recency_r * usage_r * quality_r * support_r``.
+        ``queue_weight`` is retained as Bank provenance, but does not scale
+        current Split evidence.
         A retained replay window is the physical observation; ``support`` is
         only the persistent observation mass represented by that row.  Rows
         without a replay window remain in the Bank for persistence/commit, but
@@ -1019,7 +1071,6 @@ class SplitModule(nn.Module):
         )
         evidence_weights = (
             base_weights
-            * structural_weights
             * sample_support
             * valid_mask.to(dtype=base_weights.dtype)
         ).detach()
@@ -1125,7 +1176,6 @@ class SplitModule(nn.Module):
         if eps <= 0.0:
             raise ValueError("eps must be positive")
         base = base_weights.clamp_min(0.0)
-        structural = structural_weights.clamp(0.0, 1.0)
         support = (
             torch.ones_like(base)
             if sample_support is None
@@ -1140,7 +1190,9 @@ class SplitModule(nn.Module):
         )
         if replay.shape != base.shape:
             raise ValueError("replay_support and base_weights must be aligned vectors")
-        evidence = support * base * structural
+        # ``structural_weights`` is a compatibility/provenance field only.
+        # Controller queue confidence must not dilute Split evidence.
+        evidence = support * base
         evidence_sum = evidence.sum()
         replay_count = replay.sum()
         normalized = (
@@ -1271,10 +1323,17 @@ class SplitModule(nn.Module):
             effective_mode_mask, as_tuple=False
         ).flatten()
         active_count = int(active_modes.numel())
-        mode_group_ids = torch.zeros(
-            mode_count, device=law_keys.device, dtype=torch.long
+        # ``-1`` is a real third state: the mode is not supported by the
+        # current physical replay evidence and therefore has no justified
+        # child assignment.  Only effective modes are assigned to child 0/1.
+        mode_group_ids = torch.full(
+            (mode_count,),
+            -1,
+            device=law_keys.device,
+            dtype=torch.long,
         )
         if active_count == 2:
+            mode_group_ids[active_modes[0]] = 0
             mode_group_ids[active_modes[1]] = 1
         elif active_count > 2:
             points = F.normalize(mode_law_keys.index_select(0, active_modes), dim=-1)
@@ -1329,10 +1388,17 @@ class SplitModule(nn.Module):
                 centers = torch.stack(next_centers, dim=0)
             mode_group_ids[active_modes] = assignments
 
-        mode_group_weights = F.one_hot(
-            mode_group_ids,
-            num_classes=2,
-        ).to(dtype=law_keys.dtype)
+        # q_bank still needs a valid binary probability row for likelihood
+        # evaluation.  Inactive modes receive a neutral row, but their
+        # tri-state assignment remains -1 in ``group_ids`` and is respected
+        # by commit_split().
+        mode_group_weights = law_keys.new_full((mode_count, 2), 0.5)
+        active_group_ids = mode_group_ids >= 0
+        if bool(active_group_ids.any()):
+            mode_group_weights[active_group_ids] = F.one_hot(
+                mode_group_ids[active_group_ids],
+                num_classes=2,
+            ).to(dtype=law_keys.dtype)
 
         row_group_weights = mode_group_weights.index_select(0, inverse)
         summary = {
@@ -1542,7 +1608,6 @@ class SplitModule(nn.Module):
         if max_items is not None and residuals.size(0) > int(max_items):
             selected = SplitModule._mode_stratified_topk(
                 base_weights.clamp_min(0.0)
-                * structural_weights.clamp(0.0, 1.0)
                 * sample_support.clamp_min(0.0),
                 bank_group_weights,
                 int(max_items),
@@ -1895,6 +1960,11 @@ class SplitModule(nn.Module):
             residuals=frozen.residuals,
             eps=self.eps,
         )
+        self._assert_bank_mode_support_invariant(
+            frozen,
+            bool(child_evidence["two_sided_support"]),
+            stage="bank_structural_split_probe",
+        )
         q = child_evidence["q"]
         group_mass = child_evidence["child_mass"]
         # The alternative is undefined if the bounded replay window contains
@@ -1942,6 +2012,10 @@ class SplitModule(nn.Module):
             "child_effective_mass": group_mass.detach().clone(),
             "child_ess": child_evidence["child_ess"].detach().clone(),
             "two_sided_support": True,
+            "has_bank_prior": True,
+            "q_bank_mass_L": group_mass[0].detach().clone(),
+            "q_bank_mass_R": group_mass[1].detach().clone(),
+            "invalid_proposal": False,
             "K_effective_mode": batch.mode_summary.get(
                 "effective_mode_count",
                 torch.tensor(0, device=group_mass.device),
@@ -2040,6 +2114,11 @@ class SplitModule(nn.Module):
             residuals=frozen.residuals,
             eps=self.eps,
         )
+        self._assert_bank_mode_support_invariant(
+            frozen,
+            bool(child_evidence["two_sided_support"]),
+            stage="bank_mode_counterfactual_probe",
+        )
         q = child_evidence["q"]
         group_mass = child_evidence["child_mass"]
         # This is availability, not a persistence threshold: H1 is undefined
@@ -2095,6 +2174,10 @@ class SplitModule(nn.Module):
             "child_effective_mass": group_mass.detach().clone(),
             "child_ess": child_evidence["child_ess"].detach().clone(),
             "two_sided_support": True,
+            "has_bank_prior": True,
+            "q_bank_mass_L": group_mass[0].detach().clone(),
+            "q_bank_mass_R": group_mass[1].detach().clone(),
+            "invalid_proposal": False,
             "K_effective_mode": batch.mode_summary.get(
                 "effective_mode_count",
                 torch.tensor(0, device=group_mass.device),
@@ -2367,9 +2450,10 @@ def commit_split(
     """Commit an optimized split without discarding semantic or replay state.
 
     The old leaf bank initially remains attached to the newly internal parent.
-    For Bank-backed proposals, every source-bank row receives a complete
-    persistent mode assignment ``argmax_j q^bank_{rj}``.  Rows with a complete
-    child likelihood may refine that assignment with ``argmax_j [log
+    For Bank-backed proposals, effective source-bank modes receive a child
+    assignment.  Inactive/unresolved modes carry the explicit assignment
+    ``-1`` and remain in the parent Bank.  Active rows with a complete child
+    likelihood may refine their assignment with ``argmax_j [log
     q^bank_{rj} + log p(w_r | theta_j)]``.  The context router is intentionally
     not part of this topology write.  Payloads without a Bank prior retain a
     conservative legacy fallback for old checkpoints and direct callers.
@@ -2394,6 +2478,9 @@ def commit_split(
     old_theta = tree.semantic_theta(leaf_id).detach()
     source_bank = tree.episodic_memory.get_bank(leaf_id)
     source_bank._ensure_prototype_state()
+    source_mode_ids = source_bank.mode_ids[: len(source_bank)].detach().to(
+        dtype=torch.long
+    )
     source_bank_evidence = SplitModule.compute_bank_row_evidence(source_bank)
     bank_group_weights_all, bank_mode_summary = (
         SplitModule._build_bank_mode_groups(
@@ -2447,35 +2534,30 @@ def commit_split(
                 int(mode): int(group)
                 for mode, group in zip(summary_modes, summary_groups)
             }
-            source_modes = source_bank.mode_ids[: len(source_bank)]
-            source_mode_values = source_modes.detach().cpu().tolist()
+            source_mode_values = source_mode_ids.cpu().tolist()
             summary_is_complete = (
                 len(mode_to_group) == len(summary_modes)
-                and all(group in (0, 1) for group in mode_to_group.values())
+                and all(group in (-1, 0, 1) for group in mode_to_group.values())
                 and all(mode in mode_to_group for mode in source_mode_values)
             )
             if summary_is_complete:
-                if len(mode_to_group) == 1:
-                    bank_group_weights_all = source_bank.keys.new_full(
-                        (len(source_bank), 2),
-                        0.5,
-                    )
-                else:
-                    summary_assignments = torch.tensor(
-                        [mode_to_group[mode] for mode in source_mode_values],
-                        dtype=torch.long,
-                        device=source_bank.device,
-                    )
-                    bank_group_weights_all = torch.zeros(
-                        (len(source_bank), 2),
-                        dtype=source_bank.keys.dtype,
-                        device=source_bank.device,
-                    )
-                    bank_group_weights_all.scatter_(
-                        1,
-                        summary_assignments[:, None],
-                        1.0,
-                    )
+                summary_assignments = torch.tensor(
+                    [mode_to_group[mode] for mode in source_mode_values],
+                    dtype=torch.long,
+                    device=source_bank.device,
+                )
+                # Keep inactive modes neutral for q_bank likelihood shape,
+                # while preserving their explicit -1 assignment for commit.
+                bank_group_weights_all = source_bank.keys.new_full(
+                    (len(source_bank), 2),
+                    0.5,
+                )
+                active_summary = summary_assignments >= 0
+                if bool(active_summary.any()):
+                    bank_group_weights_all[active_summary] = F.one_hot(
+                        summary_assignments[active_summary],
+                        num_classes=2,
+                    ).to(dtype=source_bank.keys.dtype)
                 bank_mode_summary = {
                     key: value.detach().clone()
                     for key, value in stored_mode_summary.items()
@@ -2509,13 +2591,44 @@ def commit_split(
         # This assignment is formed from the complete source Bank before any
         # replay/proposal budget is applied.  It is therefore also available
         # for rows without windows and for proposal batches that were
-        # truncated.
-        child_assignments = bank_group_weights_all.argmax(dim=-1).to(
-            dtype=torch.long
-        ).clone()
-        parent_memory_mask = torch.zeros(
-            len(source_bank), dtype=torch.bool, device=source_bank.device
-        )
+        # truncated.  Unlike q_bank.argmax(), this preserves the third
+        # ``-1`` state for modes with no effective replay evidence.
+        summary_mode_ids = bank_mode_summary.get("mode_ids")
+        summary_group_ids = bank_mode_summary.get("group_ids")
+        if (
+            torch.is_tensor(summary_mode_ids)
+            and torch.is_tensor(summary_group_ids)
+            and summary_mode_ids.ndim == 1
+            and summary_group_ids.shape == summary_mode_ids.shape
+            and summary_mode_ids.numel() > 0
+        ):
+            mode_to_group = {
+                int(mode): int(group)
+                for mode, group in zip(
+                    summary_mode_ids.detach().cpu().tolist(),
+                    summary_group_ids.detach().cpu().tolist(),
+                )
+                if int(group) in (-1, 0, 1)
+            }
+            if all(int(mode) in mode_to_group for mode in source_mode_ids.cpu().tolist()):
+                child_assignments = torch.tensor(
+                    [mode_to_group[int(mode)] for mode in source_mode_ids.cpu().tolist()],
+                    dtype=torch.long,
+                    device=source_bank.device,
+                )
+            else:
+                child_assignments = bank_group_weights_all.argmax(dim=-1).to(
+                    dtype=torch.long
+                ).clone()
+                effective_rows = source_bank_evidence["evidence_weights"] > 1e-8
+                child_assignments[~effective_rows] = -1
+        else:
+            child_assignments = bank_group_weights_all.argmax(dim=-1).to(
+                dtype=torch.long
+            ).clone()
+            effective_rows = source_bank_evidence["evidence_weights"] > 1e-8
+            child_assignments[~effective_rows] = -1
+        parent_memory_mask = child_assignments < 0
     else:
         # Old direct commit payloads did not carry the persistent Bank prior.
         # Keep their previous conservative parent-retention behavior without
@@ -2601,8 +2714,12 @@ def commit_split(
                     torch.full_like(posterior_logit, -torch.inf),
                 )
                 refined_child = safe_posterior.argmax(dim=-1)
-                child_assignments[valid_indices[finite_posterior]] = (
-                    refined_child[finite_posterior]
+                effective_valid = child_assignments.index_select(
+                    0, valid_indices
+                ) >= 0
+                refine_assignment = finite_posterior & effective_valid
+                child_assignments[valid_indices[refine_assignment]] = (
+                    refined_child[refine_assignment]
                 )
         else:
             # Legacy payloads score only the rows that were explicitly

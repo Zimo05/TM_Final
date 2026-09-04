@@ -9,7 +9,7 @@ from MemoryResiduals.MemoryBank import (
     SmoothSparseRetriever,
     effective_hawkes_law_key,
 )
-from Sleep.Split import SplitModule
+from Sleep.Split import SplitBatch, SplitModule
 
 
 class PrototypeMemoryTests(unittest.TestCase):
@@ -723,6 +723,28 @@ class PrototypeMemoryTests(unittest.TestCase):
             structure["delta_bar"],
             residuals,
         )
+
+    def test_bank_mode_support_invariant_rejects_inconsistent_q_bank(self):
+        batch = SplitBatch(
+            residuals=torch.zeros(2, 2),
+            contexts=torch.zeros(2, 1),
+            weights=torch.ones(2),
+            windows=[None, None],
+            bank_group_weights=torch.full((2, 2), 0.5),
+            mode_summary={
+                "effective_mode_count": torch.tensor(1),
+            },
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "K_effective_mode=1.*two_sided_support=True",
+        ):
+            SplitModule._assert_bank_mode_support_invariant(
+                batch,
+                True,
+                stage="test",
+            )
 
 
 if __name__ == "__main__":
