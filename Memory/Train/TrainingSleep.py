@@ -88,11 +88,10 @@ class TrainingSleepMixin:
         # deliberately ignored: Sleep structural evidence starts at the
         # persistent EpisodicMemory boundary.
         self.sleep_state["structural_evidence_buffer"] = {}
-        leaf_ids = (
-            list(self.tree.leaf_ids)
-            if bank_mode_probes is None
-            else list(bank_mode_probes)
-        )
+        # Split search domain must always be all currently active leaves.
+        # ``bank_mode_probes`` only provides a frozen evidence override for
+        # protected leaves; it must never restrict which leaves are evaluated.
+        leaf_ids = list(self.tree.leaf_ids)
         for leaf_id in leaf_ids:
             if progress is not None:
                 progress.set_postfix(
@@ -109,15 +108,21 @@ class TrainingSleepMixin:
             probe = (
                 None
                 if bank_mode_probes is None
-                else bank_mode_probes[leaf_id]
+                else bank_mode_probes.get(leaf_id)
             )
             if probe is None:
+                # Keep checkpoints/config objects created before this option
+                # was added runnable; the historical replay coverage default
+                # is two samples per Bank-mode group.
+                min_replay_per_group = getattr(
+                    self.sleep_config,
+                    "split_min_replay_per_group",
+                    2,
+                )
                 batch = module.build_split_batch_from_memory_bank(
                     bank,
                     max_items=max_evidence,
-                    min_replay_per_group=(
-                        self.sleep_config.split_min_replay_per_group
-                    ),
+                    min_replay_per_group=min_replay_per_group,
                 )
                 theta_snapshot = self.tree.semantic_theta(leaf_id)
             else:
@@ -1147,6 +1152,10 @@ class TrainingSleepMixin:
                 "lambda_T": float(self.merge_lambda_T),
             }
             topology_log_lines: list[str] = []
+            evaluated_split_nodes: tuple[str, ...] = ()
+            split_eval_leaf_count = 0
+            split_proposal_count = 0
+            split_protected_count = 0
             if evaluation_needed:
                 topology_prune_proposals, topology_prune_result = (
                     self._evaluate_topology_prune(
@@ -1162,12 +1171,26 @@ class TrainingSleepMixin:
                         max_replay=self.sleep_config.deep_evidence_budget,
                     )
                 )
+                # Every active leaf enters Split evaluation.  A leaf may still
+                # produce no proposal when its current Bank has insufficient
+                # replay evidence, which is intentionally tracked separately.
+                evaluated_split_nodes = tuple(self.tree.leaf_ids)
+                split_eval_leaf_count = len(evaluated_split_nodes)
+                split_protected_count = len(protected_probes)
                 split_proposals = self.build_split_proposals(
                     progress=(
                         sleep_progress if show_progress else None
                     ),
                     max_evidence=self.sleep_config.deep_evidence_budget,
                     bank_mode_probes=protected_probes,
+                )
+                split_proposal_count = len(split_proposals)
+                topology_log_lines.append(
+                    "split_eval={} split_proposal={} split_protected={}".format(
+                        split_eval_leaf_count,
+                        split_proposal_count,
+                        split_protected_count,
+                    )
                 )
                 if not show_progress:
                     sleep_progress.update(leaf_count)
@@ -1410,6 +1433,12 @@ class TrainingSleepMixin:
                 "objective": gate_objective,
             },
             "unified_topology": selection_log,
+            "evaluated_split_nodes": list(evaluated_split_nodes),
+            "split_evaluation": {
+                "split_eval": int(split_eval_leaf_count),
+                "split_proposal": int(split_proposal_count),
+                "split_protected": int(split_protected_count),
+            },
             "bank_mode_probe": {
                 "evaluated_nodes": len(bank_mode_probes),
                 "protected_nodes": sorted(protected_probes),

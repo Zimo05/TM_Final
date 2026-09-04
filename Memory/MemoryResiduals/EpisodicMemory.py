@@ -67,7 +67,7 @@ class TreeEpisodicMemory(nn.Module):
             "retention_stale_weight": 1.0,
             "retention_age_weight": 0.1,
             "adaptive_history_size": 64,
-            "adaptive_min_samples": 16,
+            "adaptive_min_samples": 8,
             "duplicate_quantile": 0.85,
             "mode_quantile": 0.975,
             "radius_margin": 1e-3,

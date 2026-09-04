@@ -178,7 +178,14 @@ class TrainingLifecycleMixin:
             )
         if self.sleep_config.deep_evidence_budget <= 0:
             raise ValueError("deep_evidence_budget must be positive")
-        if self.sleep_config.split_min_replay_per_group < 0:
+        # Older SleepConfig objects may not carry this newer replay-coverage
+        # option.  Preserve their historical default during validation.
+        split_min_replay_per_group = getattr(
+            self.sleep_config,
+            "split_min_replay_per_group",
+            2,
+        )
+        if split_min_replay_per_group < 0:
             raise ValueError(
                 "split_min_replay_per_group must be non-negative"
             )
