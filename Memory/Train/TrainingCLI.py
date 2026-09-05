@@ -408,6 +408,15 @@ def _parse_args():
         help="Gradient-norm bound for Encoder + compatibility calibration.",
     )
     parser.add_argument(
+        "--allow-root-only-alignment",
+        action="store_true",
+        help=(
+            "Treat requested alignment as a recorded no-op when the initial "
+            "tree has only one root/leaf and therefore no routing branch. "
+            "Intended for CL task-0 initialization."
+        ),
+    )
+    parser.add_argument(
         "--prune-warmup-epochs",
         type=int,
         default=10,
@@ -1459,7 +1468,27 @@ def main() -> None:
         num_event_types=hawkes.num_types,
         z_dim=tree.z_dim,
     ).to(tree._device_anchor.device)
-    if args.alignment_epochs > 0:
+    if (
+        args.alignment_epochs > 0
+        and args.allow_root_only_alignment
+        and not tree.internal_ids
+    ):
+        alignment_stats = {
+            "epochs": 0,
+            "requested_epochs": int(args.alignment_epochs),
+            "mode": "skipped_root_only_tree",
+            "sequence_count": len(dataset),
+            "internal_node_count": 0,
+            "leaf_count": len(tree.leaf_ids),
+        }
+        tree.initialization_metadata["alignment"] = alignment_stats
+        print(
+            "[H-align Skipped] "
+            "mode=skipped_root_only_tree "
+            f"requested_epochs={args.alignment_epochs} "
+            "reason=no_internal_routing_decision updated=none"
+        )
+    elif args.alignment_epochs > 0:
         alignment_membership = load_h_tree_leaf_membership(
             args.sequence_summary,
             dataset,

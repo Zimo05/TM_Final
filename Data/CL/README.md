@@ -30,7 +30,10 @@ Each benchmark contains `task_XX/{train,val,test}.csv` with only `event_times,ev
 `run_CL` now passes the DWS routing/alignment profile explicitly instead of
 using the generic CLI defaults. The first task runs five offline alignment
 epochs with the Multi-Attention sequence summary; tasks 1 and later only
-resume the previous Memory checkpoint. The CL-specific first experiment uses
+resume the previous Memory checkpoint. If task 0 starts from a root-only
+H-tree, alignment is recorded as `skipped_root_only_tree` and training
+continues; alignment runs normally whenever internal branches exist. The
+CL-specific first experiment uses
 `merge_min_replay=16`, `merge_budget_ratio=1.0`, and
 `deep_evidence_budget=64`. Its Merge law-distinction penalties default to
 `merge_stale_weight=0.2` and `merge_dynamics_weight=0.25`.
