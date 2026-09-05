@@ -420,6 +420,24 @@ def _parse_args():
         help="Minimum child replay windows for a differentiable Merge pair.",
     )
     parser.add_argument(
+        "--merge-stale-weight",
+        type=float,
+        default=0.2,
+        help=(
+            "Penalty weight for stale replay evidence in the Merge "
+            "retention score."
+        ),
+    )
+    parser.add_argument(
+        "--merge-dynamics-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "Penalty weight for Hawkes-law/TTP divergence in the Merge "
+            "retention score."
+        ),
+    )
+    parser.add_argument(
         "--merge-loss-weight",
         type=float,
         default=0.1,
@@ -874,6 +892,10 @@ def main() -> None:
         raise ValueError("--topology-inertia-tau must be positive")
     if args.merge_min_replay < 0:
         raise ValueError("--merge-min-replay must be non-negative")
+    if args.merge_stale_weight < 0.0:
+        raise ValueError("--merge-stale-weight must be non-negative")
+    if args.merge_dynamics_weight < 0.0:
+        raise ValueError("--merge-dynamics-weight must be non-negative")
     if args.merge_loss_weight < 0.0:
         raise ValueError("--merge-loss-weight must be non-negative")
     if args.merge_gate_temperature <= 0.0:
@@ -1196,6 +1218,13 @@ def main() -> None:
         )
         trainer.sleep_config.deep_prior_weight = args.deep_prior_weight
         trainer.sleep_config.deep_evidence_budget = args.deep_evidence_budget
+        trainer.sleep_config.topology_inertia_strength = (
+            args.topology_inertia_strength
+        )
+        trainer.sleep_config.topology_inertia_tau = args.topology_inertia_tau
+        trainer.structure_config.prune_warmup_epochs = (
+            args.prune_warmup_epochs
+        )
         trainer.structure_config.merge_kwargs = {
             "min_replay": args.merge_min_replay,
             "gate_temperature": args.merge_gate_temperature,
@@ -1203,6 +1232,8 @@ def main() -> None:
             "budget_ratio": args.merge_budget_ratio,
             "dual_lr": args.merge_dual_lr,
             "dual_initial": args.merge_dual_initial,
+            "stale_weight": args.merge_stale_weight,
+            "dynamics_weight": args.merge_dynamics_weight,
             "normalize_by_events": True,
         }
         trainer._reconcile_optimizer_parameters()
@@ -1541,6 +1572,8 @@ def main() -> None:
                 "budget_ratio": args.merge_budget_ratio,
                 "dual_lr": args.merge_dual_lr,
                 "dual_initial": args.merge_dual_initial,
+                "stale_weight": args.merge_stale_weight,
+                "dynamics_weight": args.merge_dynamics_weight,
                 "normalize_by_events": True,
             },
         ),

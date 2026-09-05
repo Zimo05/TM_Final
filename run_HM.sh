@@ -30,6 +30,11 @@ H_TREE_OUTPUT="${H_TREE_OUTPUT:-$DATA_ROOT/h_tree_one_circle.pt}"
 
 RUN_NAME="${RUN_NAME:-dws_17_08281630}"
 EPOCHS="${EPOCHS:-10}"
+# Merge retention penalties.  The dynamics penalty is exposed so DWS and CL
+# can use the same Hawkes-law distinction policy; 0.25 is the first tuned
+# value, while both controls remain environment-overridable.
+MERGE_STALE_WEIGHT="${MERGE_STALE_WEIGHT:-0.2}"
+MERGE_DYNAMICS_WEIGHT="${MERGE_DYNAMICS_WEIGHT:-0.25}"
 # Two-level effective-Hawkes-law matching.  Keep duplicate stricter than mode.
 # Cold-start similarity priors only. After enough accepted observations each
 # dynamics mode calibrates its own Q80 duplicate and Q95 local-variation radii.
@@ -88,6 +93,7 @@ Usage:
 
 Optional environment overrides:
   RUN_NAME=name EPOCHS=10 PYTHON=/path/to/python DEVICES=0 ./run_HM.sh <action>
+  MERGE_STALE_WEIGHT=0.2 MERGE_DYNAMICS_WEIGHT=0.25 ./run_HM.sh memory
   BASE_CONTROLLER_CHECKPOINT=/path/model.pt CONTROLLER_VERSION=6 ./run_HM.sh controller-finetune
   # Optional cold-start priors for adaptive two-radius matching:
   PROTOTYPE_DUP_THRESHOLD=0.98 PROTOTYPE_MODE_THRESHOLD=0.90 \
@@ -342,6 +348,8 @@ start_memory() {
       --alignment-grad-clip 5.0 \
       --prune-warmup-epochs 12 \
       --merge-min-replay 12 \
+      --merge-stale-weight "$MERGE_STALE_WEIGHT" \
+      --merge-dynamics-weight "$MERGE_DYNAMICS_WEIGHT" \
       --frontier-min-experts 2 \
       --frontier-budget 7 \
       --frontier-routing-temperature 1.10 \

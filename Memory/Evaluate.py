@@ -374,6 +374,9 @@ def aggregate_metrics(
         "mean_retrieval_effective_k": _mean(
             float(row.get("retrieval_effective_k", 0.0)) for row in rows
         ),
+        "mean_retrieval_similarity": _mean(
+            float(row.get("retrieval_similarity", -1.0)) for row in rows
+        ),
         "mean_retrieval_null_alpha": _mean(
             float(row.get("retrieval_null_alpha", 1.0)) for row in rows
         ),
@@ -447,6 +450,7 @@ def run_variant(
     prototype_duplicate_threshold: float | None = None,
     prototype_mode_threshold: float | None = None,
     prototype_context_alias_capacity: int | None = None,
+    verbose: bool = True,
 ) -> tuple[list[dict], MemoryTreeInference, float]:
     settings = VARIANTS[variant]
     inference = MemoryTreeInference.from_checkpoint(
@@ -608,11 +612,12 @@ def run_variant(
         completed = sequence_position + 1
         elapsed_now = time.perf_counter() - start
         eta = elapsed_now / completed * (len(sequences) - completed)
-        print(
-            f"[Evaluate] {variant} {completed}/{len(sequences)} "
-            f"elapsed={elapsed_now:.1f}s eta={eta:.1f}s",
-            flush=True,
-        )
+        if verbose:
+            print(
+                f"[Evaluate] {variant} {completed}/{len(sequences)} "
+                f"elapsed={elapsed_now:.1f}s eta={eta:.1f}s",
+                flush=True,
+            )
         if progress_dir is not None:
             progress_dir.mkdir(parents=True, exist_ok=True)
             (progress_dir / f"{variant}.progress.json").write_text(

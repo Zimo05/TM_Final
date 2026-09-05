@@ -1459,6 +1459,11 @@ class MemoryTreeInference:
                 "nll": float(nll.detach().cpu()),
                 "predicted_type": predicted_type,
                 "true_type": int(sequence["types"][event_index].item()),
+                # ``pre_action_theta`` is the parameter state formed from the
+                # strict prefix events[:event_index].  CL law-recovery uses it
+                # to draw a genuinely causal intensity curve; the ordinary
+                # event rows intentionally keep this diagnostic internal.
+                "prediction_theta": pre_action_params.theta.detach().cpu(),
                 "intensity": intensity.detach().cpu(),
                 "type_probabilities_at_event_time": (
                     type_probabilities_at_event_time.detach().cpu()

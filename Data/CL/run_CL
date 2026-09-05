@@ -29,6 +29,33 @@ NUM_WORKERS="${NUM_WORKERS:-0}"
 DEVICES="${DEVICES:-0}"
 NUM_EVENT_TYPES="${NUM_EVENT_TYPES:-8}"
 
+# CL profile.  These values mirror the routing/alignment policy used by
+# run_HM.sh, with the CL-specific merge/evidence budget recommended for the
+# first continual-learning experiment.  Every value remains overridable from
+# the environment so a sweep does not require editing this runner.
+ALIGNMENT_EPOCHS="${ALIGNMENT_EPOCHS:-5}"
+ALIGNMENT_BATCH_SIZE="${ALIGNMENT_BATCH_SIZE:-16}"
+ALIGNMENT_LR="${ALIGNMENT_LR:-0.001}"
+ALIGNMENT_WEIGHT_DECAY="${ALIGNMENT_WEIGHT_DECAY:-0.00001}"
+ALIGNMENT_TEMPERATURE="${ALIGNMENT_TEMPERATURE:-1.0}"
+ALIGNMENT_GRAD_CLIP="${ALIGNMENT_GRAD_CLIP:-5.0}"
+PRUNE_WARMUP_EPOCHS="${PRUNE_WARMUP_EPOCHS:-12}"
+MERGE_MIN_REPLAY="${MERGE_MIN_REPLAY:-16}"
+MERGE_BUDGET_RATIO="${MERGE_BUDGET_RATIO:-1.0}"
+MERGE_STALE_WEIGHT="${MERGE_STALE_WEIGHT:-0.2}"
+MERGE_DYNAMICS_WEIGHT="${MERGE_DYNAMICS_WEIGHT:-0.25}"
+FRONTIER_ROUTING_TEMPERATURE="${FRONTIER_ROUTING_TEMPERATURE:-1.10}"
+FRONTIER_CONFIDENCE_WEIGHT="${FRONTIER_CONFIDENCE_WEIGHT:-0.60}"
+FRONTIER_COMPUTE_COST="${FRONTIER_COMPUTE_COST:-0.005}"
+FRONTIER_POSTERIOR_TEMPERATURE="${FRONTIER_POSTERIOR_TEMPERATURE:-0.85}"
+FRONTIER_CREDIBLE_MASS="${FRONTIER_CREDIBLE_MASS:-0.30}"
+FRONTIER_OWNER_CONFIDENCE="${FRONTIER_OWNER_CONFIDENCE:-0.50}"
+MAX_WRITES_PER_SEQUENCE="${MAX_WRITES_PER_SEQUENCE:-8}"
+ROUTE_ENERGY_TEMPERATURE="${ROUTE_ENERGY_TEMPERATURE:-1.0}"
+ROUTE_BALANCE_BATCH_SIZE="${ROUTE_BALANCE_BATCH_SIZE:-32}"
+WAKE_WAVEFRONT_BATCH_SIZE="${WAKE_WAVEFRONT_BATCH_SIZE:-64}"
+DEEP_EVIDENCE_BUDGET="${DEEP_EVIDENCE_BUDGET:-64}"
+
 MEMTREE_PYTHON="/Users/zimoshen/opt/miniconda3/envs/memTree/bin/python"
 if [[ -n "${PYTHON:-}" ]]; then
   PYTHON_BIN="$PYTHON"
@@ -84,6 +111,20 @@ Environment overrides:
   DEVICE=cpu|cuda|auto  DEVICES=0  PYTHON=/path/to/python
   EPOCHS=20 COLD_START_EPOCHS=10 THP_EPOCHS=100 ATTENTION_EPOCHS=50
   RUN_NAME=cl_recurrence RUN_ROOT=/path/to/output TASK_COUNT=10
+  ALIGNMENT_EPOCHS=5 PRUNE_WARMUP_EPOCHS=12 MERGE_MIN_REPLAY=16
+  MERGE_BUDGET_RATIO=1.0 DEEP_EVIDENCE_BUDGET=64
+  MERGE_STALE_WEIGHT=0.2 MERGE_DYNAMICS_WEIGHT=0.25
+  ALIGNMENT_BATCH_SIZE=16 ALIGNMENT_LR=0.001 ALIGNMENT_WEIGHT_DECAY=0.00001
+  ALIGNMENT_TEMPERATURE=1.0 ALIGNMENT_GRAD_CLIP=5.0
+  FRONTIER_ROUTING_TEMPERATURE=1.10 FRONTIER_CONFIDENCE_WEIGHT=0.60
+  FRONTIER_COMPUTE_COST=0.005 FRONTIER_POSTERIOR_TEMPERATURE=0.85
+  FRONTIER_CREDIBLE_MASS=0.30 FRONTIER_OWNER_CONFIDENCE=0.50
+  MAX_WRITES_PER_SEQUENCE=8 ROUTE_ENERGY_TEMPERATURE=1.0
+  ROUTE_BALANCE_BATCH_SIZE=32 WAKE_WAVEFRONT_BATCH_SIZE=64
+
+Alignment is intentionally run only for task 0, which has the offline
+sequence summary.  Tasks 1+ resume the previous checkpoint without repeating
+alignment.
 EOF
 }
 
@@ -231,24 +272,39 @@ run_memory_task() {
     --semantic-blend 0
     --frontier-min-experts 2
     --frontier-budget 7
+    --frontier-routing-temperature "$FRONTIER_ROUTING_TEMPERATURE"
     --frontier-exploration 0
+    --frontier-confidence-weight "$FRONTIER_CONFIDENCE_WEIGHT"
+    --frontier-compute-cost "$FRONTIER_COMPUTE_COST"
+    --frontier-posterior-temperature "$FRONTIER_POSTERIOR_TEMPERATURE"
+    --frontier-credible-mass "$FRONTIER_CREDIBLE_MASS"
+    --frontier-owner-confidence "$FRONTIER_OWNER_CONFIDENCE"
+    --max-writes-per-sequence "$MAX_WRITES_PER_SEQUENCE"
     --route-mix-weight 0
     --route-posterior-weight 0
     --route-distill-weight 0.25
     --route-mi-weight 0.15
     --route-balance-weight 0.10
+    --route-energy-temperature "$ROUTE_ENERGY_TEMPERATURE"
     --route-encoder-warmup-epochs 0
     --route-encoder-grad-scale 0.08
     --route-encoder-reliability-decay 0.80
     --route-teacher-temperature 0.85
+    --route-balance-batch-size "$ROUTE_BALANCE_BATCH_SIZE"
+    --wake-wavefront-batch-size "$WAKE_WAVEFRONT_BATCH_SIZE"
     --light-replay-budget 128
     --deep-min-interval 3
     --deep-computation-cost 0.05
     --deep-prior-probability 0.10
     --deep-prior-weight 0.01
-    --deep-evidence-budget 32
+    --deep-evidence-budget "$DEEP_EVIDENCE_BUDGET"
     --topology-inertia-strength 0.03
     --topology-inertia-tau 3.0
+    --prune-warmup-epochs "$PRUNE_WARMUP_EPOCHS"
+    --merge-min-replay "$MERGE_MIN_REPLAY"
+    --merge-stale-weight "$MERGE_STALE_WEIGHT"
+    --merge-dynamics-weight "$MERGE_DYNAMICS_WEIGHT"
+    --merge-budget-ratio "$MERGE_BUDGET_RATIO"
     --training-metrics-path "$CHECKPOINT_DIR/task_$(printf '%02d' "$task_id")_training_metrics.json"
     --training-plot-path "$CHECKPOINT_DIR/task_$(printf '%02d' "$task_id")_training_curves.png"
     --device "$DEVICE_TYPE"
@@ -260,6 +316,12 @@ run_memory_task() {
       --sequence-summary "$SUMMARY_CSV"
       --residual-init-scale "${RESIDUAL_INIT_SCALE:-0.08}"
       --residual-init-rank "${RESIDUAL_INIT_RANK:-4}"
+      --alignment-epochs "$ALIGNMENT_EPOCHS"
+      --alignment-batch-size "$ALIGNMENT_BATCH_SIZE"
+      --alignment-lr "$ALIGNMENT_LR"
+      --alignment-weight-decay "$ALIGNMENT_WEIGHT_DECAY"
+      --alignment-temperature "$ALIGNMENT_TEMPERATURE"
+      --alignment-grad-clip "$ALIGNMENT_GRAD_CLIP"
     )
     echo "[CL 5/5] Task 0: injecting Multi-Attention H-tree $H_TREE_OUTPUT"
   else
