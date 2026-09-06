@@ -1,18 +1,19 @@
-"""Continual-learning evaluation for Hawkes Memory Tree checkpoints.
+"""Frozen continual-learning evaluation for Hawkes Memory Tree checkpoints.
 
 The ordinary :mod:`Evaluate` entry point evaluates one flat CSV with one
-train/validation/test split.  CL has a different contract: every checkpoint
-is evaluated on its current task, all previous task test sets, and the
-independent frozen anchor banks.
+train/validation/test split.  CL has a different contract: checkpoint ``C_t``
+is evaluated on its current task, the next task before learning, and the
+independent frozen anchor banks.  This module intentionally contains only the
+main frozen CL benchmark.  Mechanism ablations and online-memory diagnostics
+belong in separate evaluators.
 
 Run from the repository root with ``PYTHONPATH`` containing both the project
 root and ``Memory``::
 
     PYTHONPATH="$PWD:$PWD/Memory" python -u -m EvaluateCL \
       --data-root "$PWD/Data/CL/Data" \
-      --checkpoint-dir "$PWD/Memory/Checkpoints/CL" \
+      --checkpoint-dir "$PWD/Data/CL/runs/cl_dws_aligned/memory_checkpoints" \
       --output-dir "$PWD/Memory/Eval/CL" \
-      --protocol both \
       --device cuda
 """
 
@@ -37,24 +38,18 @@ import torch.nn.functional as F
 
 try:
     from Evaluate import (
-        VARIANTS,
         SUPPORTED_ROUTER_KINDS,
-        clear_episodic_memory,
         _jsonable,
-        aggregate_metrics,
         dataset_fingerprint,
-        run_variant,
+        run_variant_compact,
         write_csv,
     )
 except ModuleNotFoundError:
     from Memory.Evaluate import (
-        VARIANTS,
         SUPPORTED_ROUTER_KINDS,
-        clear_episodic_memory,
         _jsonable,
-        aggregate_metrics,
         dataset_fingerprint,
-        run_variant,
+        run_variant_compact,
         write_csv,
     )
 
@@ -67,31 +62,8 @@ SCALAR_METRICS = (
     "events",
     "sequences",
     "nll_per_event",
-    "sequence_macro_nll",
-    "perplexity",
     "accuracy",
-    "top3_accuracy",
-    "macro_f1",
-    "micro_f1",
-    "cross_entropy",
-    "brier_score",
-    "ece_10bin",
     "local_time_mae",
-    "local_time_rmse",
-    "local_time_median_ae",
-    "memory_hit_fraction",
-    "read_coverage_fraction",
-    "nonempty_read_coverage_fraction",
-    "owner_path_coverage_fraction",
-    "mean_retrieval_alpha_mass",
-    "mean_retrieval_effective_k",
-    "mean_retrieval_similarity",
-    "mean_retrieval_null_alpha",
-    "mean_episodic_residual_norm",
-    "mean_raw_episodic_residual_norm",
-    "mean_gated_episodic_residual_norm",
-    "raw_to_gated_residual_ratio",
-    "mean_retrieve_gate",
 )
 
 
@@ -355,67 +327,70 @@ def _tree_health(checkpoint: Path) -> dict[str, Any]:
     }
 
 
-def _select_variants(
-    protocol: str,
-    requested: Sequence[str] | None,
-) -> list[str]:
-    if requested:
-        return list(requested)
-    if protocol == "frozen":
-        return ["full_frozen", "no_episodic", "no_working", "semantic_only"]
-    if protocol == "online":
-        return ["full_online", "full_online_no_write"]
-    return [
-        "full_frozen",
-        "no_episodic",
-        "no_working",
-        "semantic_only",
-        "full_online",
-        "full_online_no_write",
-    ]
-
-
-def _cache_dir(
+def _batch_cache_dir(
     output_dir: Path,
     checkpoint_task: int,
-    evaluation_set: EvaluationSet,
     variant: str,
 ) -> Path:
     return (
         output_dir
         / "cache"
         / f"checkpoint_task_{checkpoint_task:02d}"
-        / _safe_name(evaluation_set.name)
+        / "checkpoint_batch"
         / _safe_name(variant)
     )
 
 
-def _load_or_run(
+def _load_or_run_batch(
     *,
     checkpoint: Path,
     checkpoint_task: int,
-    evaluation_set: EvaluationSet,
+    evaluation_sets: Sequence[EvaluationSet],
     variant: str,
-    sequences: Sequence[Mapping[str, Any]],
-    data_sha256: str,
+    evaluation_cache: Mapping[Path, Sequence[Mapping[str, Any]]],
+    data_sha_cache: Mapping[Path, str],
     checkpoint_sha256: str,
     args: argparse.Namespace,
-) -> tuple[list[dict[str, Any]], float, bool]:
-    """Run one matrix cell, optionally reusing a completed cell."""
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], float, bool]:
+    """Evaluate all sets for one checkpoint in one compact batch transaction."""
 
-    cache = _cache_dir(args.output_dir, checkpoint_task, evaluation_set, variant)
-    rows_path = cache / "rows.json"
+    cache = _batch_cache_dir(args.output_dir, checkpoint_task, variant)
+    metrics_path = cache / "metrics.json"
+    events_path = cache / "event_rows.json"
     meta_path = cache / "meta.json"
     expected_meta = {
+        "cache_format": "compact_batch_v1",
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_sha256,
-        "data_path": str(evaluation_set.path.resolve()),
-        "data_sha256": data_sha256,
         "variant": variant,
-        "sequence_count": len(sequences),
+        "sequence_batch_size": int(args.eval_batch_size),
+        "save_event_predictions": bool(args.save_event_predictions),
+        "evaluation_sets": [
+            {
+                "name": evaluation_set.name,
+                "kind": evaluation_set.kind,
+                "path": str(evaluation_set.path.resolve()),
+                "data_sha256": data_sha_cache[evaluation_set.path],
+                "task_id": evaluation_set.task_id,
+                "regime_id": evaluation_set.regime_id,
+                "stage_label": evaluation_set.stage_label,
+                "sequence_count": len(
+                    evaluation_cache[evaluation_set.path]
+                ),
+            }
+            for evaluation_set in evaluation_sets
+        ],
     }
     cache_valid = False
-    if args.resume and rows_path.is_file() and meta_path.is_file():
+    if (
+        args.resume
+        and metrics_path.is_file()
+        and meta_path.is_file()
+        and (
+            not args.save_event_predictions
+            or events_path.is_file()
+        )
+    ):
         try:
             cache_valid = (
                 json.loads(meta_path.read_text(encoding="utf-8"))
@@ -424,43 +399,67 @@ def _load_or_run(
         except (OSError, json.JSONDecodeError):
             cache_valid = False
     if cache_valid:
-        return json.loads(rows_path.read_text(encoding="utf-8")), 0.0, True
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        events = (
+            json.loads(events_path.read_text(encoding="utf-8"))
+            if args.save_event_predictions else []
+        )
+        return metrics, events, 0.0, True
+
+    combined_sequences: list[dict[str, Any]] = []
+    for evaluation_set in evaluation_sets:
+        for sequence_position, sequence in enumerate(
+            evaluation_cache[evaluation_set.path]
+        ):
+            combined_sequences.append({
+                **dict(sequence),
+                # These fields are intentionally sequence metadata.  They are
+                # used only for post-batch aggregation and never enter model
+                # computation.
+                "eval_set_id": evaluation_set.name,
+                "eval_kind": evaluation_set.kind,
+                "eval_task": evaluation_set.task_id,
+                "regime_id": evaluation_set.regime_id,
+                "stage_label": evaluation_set.stage_label,
+                "_sequence_position": sequence_position,
+            })
+    if not combined_sequences:
+        raise ValueError(
+            f"no sequences available for checkpoint task_{checkpoint_task:02d}"
+        )
 
     progress_dir = None
-    if args.resume and not VARIANTS[variant]["online"]:
+    if args.resume:
         progress_dir = cache
         cache.mkdir(parents=True, exist_ok=True)
         meta_path.write_text(
             json.dumps(expected_meta, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    elif args.resume:
-        cache.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(
-            json.dumps(expected_meta, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    rows, _inference, elapsed = run_variant(
+    metrics, event_rows, _inference, elapsed = run_variant_compact(
         checkpoint,
-        sequences,
+        combined_sequences,
         variant,
         args.device,
+        sequence_batch_size=args.eval_batch_size,
         progress_dir=progress_dir,
-        resume_partial=(
-            args.resume
-            and not VARIANTS[variant]["online"]
-            and not rows_path.is_file()
-        ),
         prototype_duplicate_threshold=args.prototype_duplicate_threshold,
         prototype_mode_threshold=args.prototype_mode_threshold,
         prototype_context_alias_capacity=args.prototype_context_alias_capacity,
+        capture_event_predictions=args.save_event_predictions,
         verbose=args.verbose,
     )
     if args.resume:
-        rows_path.write_text(
-            json.dumps(_jsonable(rows), ensure_ascii=False), encoding="utf-8"
+        metrics_path.write_text(
+            json.dumps(_jsonable(metrics), ensure_ascii=False),
+            encoding="utf-8",
         )
-    return rows, elapsed, False
+        if args.save_event_predictions:
+            events_path.write_text(
+                json.dumps(_jsonable(event_rows), ensure_ascii=False),
+                encoding="utf-8",
+            )
+    return metrics, event_rows, elapsed, False
 
 
 def _metric_row(
@@ -567,11 +566,15 @@ def _continual_summary(
     variants: Sequence[str],
     tree_by_checkpoint: Mapping[int, Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Summarize current-task quality and positive NLL forgetting."""
+    """Summarize current-task quality and checkpoint topology.
+
+    Retention is deliberately not computed from task-test averages here.  The
+    CL retention metrics come from ``_law_metrics`` and the frozen anchor
+    matrix, which prevents future/unseen laws from contaminating the result.
+    """
 
     output: list[dict[str, Any]] = []
     task_rows = [row for row in metric_rows if row["eval_kind"] == "task_test"]
-    anchor_rows = [row for row in metric_rows if row["eval_kind"] == "anchor"]
     for variant in variants:
         for checkpoint_task in checkpoint_tasks:
             current = next(
@@ -583,63 +586,13 @@ def _continual_summary(
                 ),
                 None,
             )
-            seen = [
-                row for row in task_rows
-                if row["variant"] == variant
-                and row["checkpoint_task"] == checkpoint_task
-                and row["eval_task"] is not None
-                and int(row["eval_task"]) <= checkpoint_task
-            ]
-            anchors = [
-                row for row in anchor_rows
-                if row["variant"] == variant
-                and row["checkpoint_task"] == checkpoint_task
-            ]
-            forgetting: list[float] = []
-            seen_task_ids = sorted({
-                int(row["eval_task"])
-                for row in seen
-                if row["eval_task"] is not None
-            })
-            for task_id in seen_task_ids:
-                if task_id >= checkpoint_task:
-                    continue
-                latest = next(
-                    (row for row in seen if int(row["eval_task"]) == task_id),
-                    None,
-                )
-                history = [
-                    row for row in task_rows
-                    if row["variant"] == variant
-                    and int(row["eval_task"]) == task_id
-                    and int(row["checkpoint_task"]) < checkpoint_task
-                    and row.get("nll_per_event") is not None
-                ]
-                if latest is not None and history:
-                    forgetting.append(
-                        max(
-                            0.0,
-                            float(latest["nll_per_event"])
-                            - min(float(row["nll_per_event"]) for row in history),
-                        )
-                    )
             tree = tree_by_checkpoint[checkpoint_task]
             output.append({
                 "variant": variant,
                 "checkpoint_task": checkpoint_task,
                 "current_nll_per_event": current.get("nll_per_event") if current else None,
                 "current_accuracy": current.get("accuracy") if current else None,
-                "current_macro_f1": current.get("macro_f1") if current else None,
                 "current_local_time_mae": current.get("local_time_mae") if current else None,
-                "seen_task_count": len(seen),
-                "seen_mean_nll_per_event": _mean(row.get("nll_per_event") for row in seen),
-                "seen_mean_accuracy": _mean(row.get("accuracy") for row in seen),
-                "seen_mean_macro_f1": _mean(row.get("macro_f1") for row in seen),
-                "mean_positive_task_test_nll_forgetting": _mean(forgetting),
-                "anchor_count": len(anchors),
-                "anchor_mean_nll_per_event": _mean(row.get("nll_per_event") for row in anchors),
-                "anchor_mean_accuracy": _mean(row.get("accuracy") for row in anchors),
-                "anchor_mean_macro_f1": _mean(row.get("macro_f1") for row in anchors),
                 "leaf_count": tree.get("leaf_count"),
                 "node_count": tree.get("node_count"),
                 "memory_rows": tree.get("memory_rows"),
@@ -783,8 +736,6 @@ def _stage_metrics(
                 continue
             pre_nll = pre.get("nll_per_event") if pre else None
             post_nll = post.get("nll_per_event") if post else None
-            pre_acc = pre.get("accuracy") if pre else None
-            post_acc = post.get("accuracy") if post else None
             output.append({
                 "task_id": task_id,
                 "variant": variant,
@@ -797,75 +748,6 @@ def _stage_metrics(
                 "adaptation_gain_nll": (
                     float(pre_nll) - float(post_nll)
                     if pre_nll is not None and post_nll is not None else None
-                ),
-                "pre_accuracy": pre_acc,
-                "post_accuracy": post_acc,
-                "accuracy_delta": (
-                    float(post_acc) - float(pre_acc)
-                    if pre_acc is not None and post_acc is not None else None
-                ),
-                "pre_macro_f1": pre.get("macro_f1") if pre else None,
-                "post_macro_f1": post.get("macro_f1") if post else None,
-                "pre_local_time_mae": pre.get("local_time_mae") if pre else None,
-                "post_local_time_mae": post.get("local_time_mae") if post else None,
-            })
-    return output
-
-
-def _memory_decomposition(
-    metric_rows: Sequence[Mapping[str, Any]],
-    checkpoint_tasks: Sequence[int],
-) -> list[dict[str, Any]]:
-    """Compare semantic, episodic, working, and full frozen predictions."""
-
-    variants = ("full_frozen", "no_episodic", "no_working", "semantic_only")
-    lookup = {
-        (
-            int(row["checkpoint_task"]),
-            str(row.get("regime_id")),
-            row["variant"],
-        ): row
-        for row in metric_rows
-        if row["eval_kind"] == "anchor"
-    }
-    output: list[dict[str, Any]] = []
-    regimes = sorted({
-        str(row.get("regime_id"))
-        for row in metric_rows
-        if row["eval_kind"] == "anchor" and row.get("regime_id") is not None
-    })
-    for checkpoint_task in checkpoint_tasks:
-        for regime_id in regimes:
-            values = {
-                variant: lookup.get((checkpoint_task, regime_id, variant), {}).get(
-                    "nll_per_event"
-                )
-                for variant in variants
-            }
-            if not any(value is not None for value in values.values()):
-                continue
-            full = values["full_frozen"]
-            no_episodic = values["no_episodic"]
-            no_working = values["no_working"]
-            semantic = values["semantic_only"]
-            output.append({
-                "checkpoint_task": checkpoint_task,
-                "regime_id": regime_id,
-                "full_frozen_nll": full,
-                "no_episodic_nll": no_episodic,
-                "no_working_nll": no_working,
-                "semantic_only_nll": semantic,
-                "episodic_gain_nll": (
-                    float(no_episodic) - float(full)
-                    if no_episodic is not None and full is not None else None
-                ),
-                "working_gain_nll": (
-                    float(no_working) - float(full)
-                    if no_working is not None and full is not None else None
-                ),
-                "total_memory_gain_nll": (
-                    float(semantic) - float(full)
-                    if semantic is not None and full is not None else None
                 ),
             })
     return output
@@ -898,34 +780,6 @@ def _anchor_nll_matrix(
         for regime_id in regimes:
             target.setdefault(regime_id, None)
     return [groups[key] for key in sorted(groups)]
-
-
-def _decomposition_summary(
-    decomposition_rows: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    keys = (
-        "episodic_gain_nll",
-        "working_gain_nll",
-        "total_memory_gain_nll",
-    )
-    groups = sorted({
-        (int(row["checkpoint_task"])) for row in decomposition_rows
-    })
-    for checkpoint_task in groups:
-        current = [
-            row for row in decomposition_rows
-            if int(row["checkpoint_task"]) == checkpoint_task
-        ]
-        output.append({
-            "checkpoint_task": checkpoint_task,
-            "anchor_count": len(current),
-            **{
-                key: _mean(row.get(key) for row in current)
-                for key in keys
-            },
-        })
-    return output
 
 
 def _special_case_metrics(
@@ -1161,61 +1015,6 @@ def _decode_model_law(
     return mu, W
 
 
-def _model_semantic_law(
-    inference: MemoryTreeInference,
-    events: Sequence[Mapping[str, Any]],
-    expected_types: int,
-    expected_basis: int,
-) -> tuple[np.ndarray, np.ndarray, str, float]:
-    """Use the most frequently selected semantic owner for law recovery."""
-
-    owner_counts = Counter(
-        str(event.get("owner_id"))
-        for event in events
-        if event.get("owner_id") is not None
-    )
-    if owner_counts:
-        owner_id, owner_count = owner_counts.most_common(1)[0]
-    else:
-        owner_id, owner_count = "root", 0
-    if owner_id not in inference.tree.all_node_ids:
-        owner_id = "root"
-    raw_theta = inference.tree.semantic_theta(owner_id)
-    mu, W = _decode_model_law(raw_theta, expected_types, expected_basis)
-    owner_share = owner_count / max(len(events), 1)
-    return mu, W, owner_id, owner_share
-
-
-def _branching_matrix(W: np.ndarray, betas: np.ndarray) -> np.ndarray:
-    return np.sum(
-        W / np.asarray(betas, dtype=np.float64).reshape(1, 1, -1), axis=2
-    )
-
-
-def _relative_parameter_errors(
-    model_mu: np.ndarray,
-    model_W: np.ndarray,
-    law: GroundTruthLaw,
-    model_betas: np.ndarray,
-) -> tuple[float, float, float]:
-    model_K = _branching_matrix(model_W, model_betas)
-    target_K = _branching_matrix(law.W, law.betas)
-    epsilon = 1e-12
-    mu_error = float(
-        np.linalg.norm(model_mu - law.mu)
-        / (np.linalg.norm(law.mu) + epsilon)
-    )
-    K_error = float(
-        np.linalg.norm(model_K - target_K, ord="fro")
-        / (np.linalg.norm(target_K, ord="fro") + epsilon)
-    )
-    decay_error = float(
-        np.max(np.abs(model_betas - law.betas))
-        if model_betas.size else 0.0
-    )
-    return mu_error, K_error, decay_error
-
-
 def _representative_event_types(
     event_types: np.ndarray,
     expected_types: int,
@@ -1231,7 +1030,8 @@ def _nise(
     target: np.ndarray,
     grid: np.ndarray,
 ) -> tuple[float, np.ndarray]:
-    integrate = getattr(np, "trapezoid", np.trapz)
+    # NumPy 2.x removed ``trapz``; keep a lazy fallback for older versions.
+    integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     squared_error = (predicted - target) ** 2
     numerator = float(integrate(squared_error.sum(axis=1), grid))
     denominator = float(integrate((target ** 2).sum(axis=1), grid)) + 1e-12
@@ -1242,6 +1042,249 @@ def _nise(
         for index in range(target.shape[1])
     ], dtype=np.float64)
     return float(nise), per_type
+
+
+def _batched_trapezoid(values: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """Integrate ``values[B, G, ...]`` over one possibly different grid/row."""
+
+    if values.ndim < 2 or grid.ndim != 2 or values.size(0) != grid.size(0):
+        raise ValueError("batched trapezoid inputs must be [B, G, ...] and [B, G]")
+    if values.size(1) < 2 or grid.size(1) != values.size(1):
+        raise ValueError("batched trapezoid requires matching grids of length >= 2")
+    widths = (grid[:, 1:] - grid[:, :-1]).clamp_min(0.0)
+    return (
+        0.5
+        * (values[:, 1:] + values[:, :-1])
+        * widths.reshape(widths.size(0), widths.size(1), *([1] * (values.ndim - 2)))
+    ).sum(dim=1)
+
+
+def _hawkes_intensity_curves_batched(
+    event_times: torch.Tensor,
+    event_types: torch.Tensor,
+    valid: torch.Tensor,
+    grid: torch.Tensor,
+    mu: torch.Tensor,
+    W: torch.Tensor,
+    betas: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate strict-causal exponential Hawkes curves as ``[B, G, D]``.
+
+    ``mu/W`` may be constant per sequence (``[B, D]``/``[B, D, D, M]``) or
+    selected at every grid point (``[B, G, D]``/``[B, G, D, D, M]``).  The
+    latter is used for the model's causal parameter snapshots.
+    """
+    if (
+        event_times.ndim != 2
+        or event_types.shape != event_times.shape
+        or valid.shape != event_times.shape
+        or valid.dtype != torch.bool
+        or grid.ndim != 2
+        or grid.size(0) != event_times.size(0)
+    ):
+        raise ValueError("event batch tensors must align as [B, L] and [B, G]")
+    if betas.ndim != 1:
+        raise ValueError("Hawkes betas must be one-dimensional")
+    batch_size, _, event_type_count = (
+        event_times.size(0),
+        event_times.size(1),
+        int(mu.size(-1)),
+    )
+    if event_type_count <= 0:
+        raise ValueError("Hawkes intensity requires at least one event type")
+    if W.size(-2) != event_type_count or W.size(-3) != event_type_count:
+        raise ValueError("Hawkes branching matrix has incompatible type dimensions")
+    if W.size(-1) != betas.numel():
+        raise ValueError("Hawkes branching matrix and betas have incompatible bases")
+
+    deltas = grid[:, :, None] - event_times[:, None, :]
+    causal = valid[:, None, :] & deltas.gt(0.0)
+    kernels = torch.exp(
+        -deltas.clamp_min(0.0).unsqueeze(-1) * betas.reshape(1, 1, 1, -1)
+    ) * causal.unsqueeze(-1).to(event_times.dtype)
+    safe_types = event_types.clamp(0, event_type_count - 1)
+    source_one_hot = F.one_hot(
+        safe_types,
+        num_classes=event_type_count,
+    ).to(event_times.dtype)
+    source_kernel = (
+        kernels.unsqueeze(-2)
+        * source_one_hot[:, None, :, :, None]
+    )
+
+    if mu.ndim == 2:
+        mu_grid = mu[:, None, :].expand(batch_size, grid.size(1), -1)
+    elif mu.ndim == 3 and mu.shape[:2] == grid.shape:
+        mu_grid = mu
+    else:
+        raise ValueError("mu must have shape [B, D] or [B, G, D]")
+    if W.ndim == 4:
+        W_grid = W[:, None, :, :, :].expand(
+            batch_size,
+            grid.size(1),
+            -1,
+            -1,
+            -1,
+        )
+    elif W.ndim == 5 and W.shape[:2] == grid.shape:
+        W_grid = W
+    else:
+        raise ValueError("W must have shape [B, D, D, M] or [B, G, D, D, M]")
+    excitation = torch.einsum(
+        "bgdsm,bglsm->bgd",
+        W_grid,
+        source_kernel,
+    )
+    return (mu_grid + excitation).clamp_min(1e-12)
+
+
+def _batched_nise(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    grid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return total and per-type NISE for a padded GPU batch."""
+
+    if predicted.shape != target.shape or predicted.ndim != 3:
+        raise ValueError("predicted and target curves must align as [B, G, D]")
+    squared_error = (predicted - target).square()
+    numerator_by_type = _batched_trapezoid(squared_error, grid)
+    denominator_by_type = _batched_trapezoid(target.square(), grid) + 1e-12
+    nise_by_type = numerator_by_type / denominator_by_type
+    nise = numerator_by_type.sum(dim=-1) / (
+        denominator_by_type.sum(dim=-1) + 1e-12
+    )
+    return nise, nise_by_type
+
+
+def _batched_law_evaluation(
+    sequences: Sequence[Mapping[str, Any]],
+    snapshots: Sequence[Sequence[Mapping[str, Any] | Any]],
+    law: GroundTruthLaw,
+    *,
+    model_betas: torch.Tensor,
+    expected_types: int,
+    expected_basis: int,
+    device: torch.device,
+    intensity_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build target/predicted curves and NISE in one device batch."""
+
+    if not sequences or len(sequences) != len(snapshots):
+        raise ValueError("law batch sequences and snapshots must be non-empty/aligned")
+    lengths = [int(sequence["times"].numel()) for sequence in sequences]
+    if any(length <= 0 for length in lengths):
+        raise ValueError("law evaluation batches cannot contain empty sequences")
+    if any(len(rows) != length for rows, length in zip(snapshots, lengths)):
+        raise ValueError("every law sequence needs one causal snapshot per event")
+    batch_size = len(sequences)
+    max_length = max(lengths)
+    parameter_dim = expected_types + expected_types * expected_types * expected_basis
+    event_times = torch.zeros(
+        batch_size, max_length, device=device, dtype=torch.float64
+    )
+    event_types = torch.zeros(
+        batch_size, max_length, device=device, dtype=torch.long
+    )
+    valid = torch.zeros(
+        batch_size, max_length, device=device, dtype=torch.bool
+    )
+    theta = torch.zeros(
+        batch_size, max_length, parameter_dim, device=device, dtype=torch.float64
+    )
+    horizons = []
+    for row_index, (sequence, sequence_snapshots, length) in enumerate(
+        zip(sequences, snapshots, lengths)
+    ):
+        times = torch.as_tensor(
+            sequence["times"], device=device, dtype=torch.float64
+        ).reshape(-1)
+        types = torch.as_tensor(
+            sequence["types"], device=device, dtype=torch.long
+        ).reshape(-1)
+        if times.numel() != length or types.numel() != length:
+            raise ValueError("law sequence event tensors are misaligned")
+        event_times[row_index, :length] = times
+        event_types[row_index, :length] = types
+        valid[row_index, :length] = True
+        theta[row_index, :length] = torch.stack([
+            torch.as_tensor(snapshot, device=device, dtype=torch.float64).reshape(-1)
+            for snapshot in sequence_snapshots
+        ])
+        horizons.append(max(float(times[-1].detach().cpu()), 1e-6))
+
+    unit_grid = torch.linspace(
+        0.0,
+        1.0,
+        max(intensity_samples, 2),
+        device=device,
+        dtype=torch.float64,
+    )
+    horizon_tensor = torch.as_tensor(
+        horizons, device=device, dtype=torch.float64
+    )
+    grid = horizon_tensor[:, None] * unit_grid[None, :]
+    target_mu = torch.as_tensor(law.mu, device=device, dtype=torch.float64)
+    target_W = torch.as_tensor(law.W, device=device, dtype=torch.float64)
+    betas = torch.as_tensor(model_betas, device=device, dtype=torch.float64)
+    target_curve = _hawkes_intensity_curves_batched(
+        event_times,
+        event_types,
+        valid,
+        grid,
+        target_mu[None, :].expand(batch_size, -1),
+        target_W[None, :].expand(batch_size, -1, -1, -1),
+        torch.as_tensor(law.betas, device=device, dtype=torch.float64),
+    )
+
+    expected_size = parameter_dim
+    if theta.size(-1) != expected_size:
+        raise ValueError(
+            f"model theta has {theta.size(-1)} values; expected {expected_size}"
+        )
+    positive = F.softplus(theta)
+    model_mu_by_event = positive[..., :expected_types]
+    model_W_by_event = positive[..., expected_types:].reshape(
+        batch_size,
+        max_length,
+        expected_types,
+        expected_types,
+        expected_basis,
+    )
+    snapshot_indices = (
+        (valid[:, None, :] & event_times[:, None, :].lt(grid[:, :, None]))
+        .sum(dim=-1)
+        .clamp_min(0)
+    )
+    max_snapshot_indices = torch.as_tensor(
+        lengths, device=device, dtype=torch.long
+    ).sub(1).clamp_min(0)[:, None]
+    snapshot_indices = torch.minimum(snapshot_indices, max_snapshot_indices)
+    mu_grid = model_mu_by_event.gather(
+        1,
+        snapshot_indices[:, :, None].expand(-1, -1, expected_types),
+    )
+    W_grid = model_W_by_event.gather(
+        1,
+        snapshot_indices[:, :, None, None, None].expand(
+            -1,
+            -1,
+            expected_types,
+            expected_types,
+            expected_basis,
+        ),
+    )
+    predicted_curve = _hawkes_intensity_curves_batched(
+        event_times,
+        event_types,
+        valid,
+        grid,
+        mu_grid,
+        W_grid,
+        betas,
+    )
+    nise, nise_by_type = _batched_nise(predicted_curve, target_curve, grid)
+    return grid, target_curve, predicted_curve, nise, nise_by_type
 
 
 def _plot_intensity_curve(
@@ -1323,30 +1366,24 @@ def _plot_intensity_curve(
 
 def _law_inference(
     checkpoint: Path,
-    variant: str,
     args: argparse.Namespace,
 ) -> MemoryTreeInference:
-    """Build the same causal variant used by the ordinary matrix evaluator."""
+    """Build the frozen, read-only inference used for Hawkes NISE."""
 
-    settings = VARIANTS[variant]
     inference = MemoryTreeInference.from_checkpoint(
         checkpoint,
         device=args.device,
         inference_config=InferenceConfig(
-            adapt_working_memory=settings["working"],
-            allow_memory_writes=settings.get("writes", settings["online"]),
-            update_memory_usage=settings["online"],
-            probe_write_counterfactuals=(
-                variant in {"full_online", "full_online_no_write"}
-            ),
+            adapt_working_memory=False,
+            allow_memory_writes=False,
+            update_memory_usage=False,
+            probe_write_counterfactuals=False,
             write_probe_seed=42,
             prototype_duplicate_threshold=args.prototype_duplicate_threshold,
             prototype_mode_threshold=args.prototype_mode_threshold,
             prototype_context_alias_capacity=args.prototype_context_alias_capacity,
         ),
     )
-    if not settings["episodic"]:
-        clear_episodic_memory(inference)
     return inference
 
 
@@ -1363,162 +1400,131 @@ def _hawkes_law_evaluation(
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
 ]:
-    """Evaluate causal intensity curves and semantic Hawkes law recovery."""
+    """Evaluate causal intensity curves and return NISE only."""
 
     if not anchors or not ground_truth:
-        return [], [], [], []
+        return [], []
 
-    variant = args.intensity_variant
+    variant = "full_frozen"
     expected_basis = len(next(iter(ground_truth.values())).betas)
     intensity_rows: list[dict[str, Any]] = []
-    parameter_rows: list[dict[str, Any]] = []
     for checkpoint_task in checkpoint_tasks:
         checkpoint = checkpoint_paths[checkpoint_task]
-        inference = _law_inference(checkpoint, variant, args)
-        model_betas = inference.hawkes.decays.detach().cpu().numpy().astype(
-            np.float64, copy=True
-        )
-        if model_betas.size != expected_basis:
+        inference = _law_inference(checkpoint, args)
+        model_betas = inference.hawkes.decays.detach()
+        if model_betas.numel() != expected_basis:
             raise ValueError(
-                f"checkpoint task_{checkpoint_task:02d} has {model_betas.size} "
+                f"checkpoint task_{checkpoint_task:02d} has {model_betas.numel()} "
                 f"decay bases, expected {expected_basis}"
             )
+        # The routing table is checkpoint-static.  Reuse it for every anchor
+        # batch; the causal Working Memory state is still reset per sequence
+        # inside ``run_sequence`` below.
+        static_cache = inference.tree.frontier_routing.build_static_cache(
+            detach=True
+        )
         for anchor in anchors:
             regime_id = str(anchor.regime_id)
             law = ground_truth.get(regime_id)
             if law is None:
                 continue
-            sequences = evaluation_cache.get(anchor.path, ())
-            for anchor_index, sequence in enumerate(sequences):
-                result = inference.run_sequence(sequence)
-                events = result.get("events", ())
-                snapshots = [
-                    event.get("prediction_theta")
-                    for event in events
+            sequences = list(evaluation_cache.get(anchor.path, ()))
+            for batch_start in range(0, len(sequences), args.eval_batch_size):
+                batch = sequences[
+                    batch_start:batch_start + args.eval_batch_size
                 ]
-                if not events or any(snapshot is None for snapshot in snapshots):
+                prepared, static_cache = inference.prepare_sequence_batch(
+                    batch,
+                    frontier_static_cache=static_cache,
+                )
+                if not all(item.get("z") is not None for item in prepared):
                     raise RuntimeError(
-                        "inference did not expose causal prediction_theta; "
-                        "please use the matching Memory/Train/Inference.py"
+                        "Hawkes law evaluation requires a padded CausalPrefixEncoder"
                     )
-                event_times = sequence["times"].detach().cpu().numpy().astype(
-                    np.float64, copy=False
+                batch_results = inference.run_sequence_batch_compact(
+                    prepared,
+                    frontier_static_cache=static_cache,
+                    capture_prediction_theta=True,
                 )
-                event_types = sequence["types"].detach().cpu().numpy().astype(
-                    np.int64, copy=False
-                )
-                horizon = max(float(event_times[-1]), 1e-6)
-                grid = np.linspace(
-                    0.0,
-                    horizon,
-                    max(int(args.intensity_samples), 2),
-                    dtype=np.float64,
-                )
-                target_curve = _hawkes_intensity_curve(
-                    event_times,
-                    event_types,
-                    grid,
-                    law.mu,
-                    law.W,
-                    law.betas,
-                )
-                model_mu_by_event = []
-                model_W_by_event = []
-                for snapshot in snapshots:
-                    snapshot_tensor = (
-                        snapshot
-                        if isinstance(snapshot, torch.Tensor)
-                        else torch.as_tensor(snapshot)
-                    )
-                    model_mu, model_W = _decode_model_law(
-                        snapshot_tensor, expected_types, expected_basis
-                    )
-                    model_mu_by_event.append(model_mu)
-                    model_W_by_event.append(model_W)
-                model_mu_by_event = np.stack(model_mu_by_event, axis=0)
-                model_W_by_event = np.stack(model_W_by_event, axis=0)
-                snapshot_indices = np.searchsorted(
-                    event_times, grid, side="left"
-                ).clip(max=len(events) - 1)
-                predicted_curve = np.stack([
-                    _hawkes_intensity_at_time(
-                        event_times,
-                        event_types,
-                        float(time),
-                        model_mu_by_event[index],
-                        model_W_by_event[index],
-                        model_betas,
-                    )
-                    for time, index in zip(grid, snapshot_indices)
-                ], axis=0)
-                nise, nise_by_type = _nise(
-                    predicted_curve, target_curve, grid
-                )
-                plot_path = None
-                if anchor_index < args.intensity_plot_anchors:
-                    plot_path = _plot_intensity_curve(
-                        args.output_dir
-                        / "intensity_curves"
-                        / f"checkpoint_task_{checkpoint_task:02d}"
-                        / f"{_safe_name(regime_id)}_{anchor_index:03d}.png",
-                        grid=grid,
-                        target=target_curve,
-                        predicted=predicted_curve,
-                        event_times=event_times,
-                        event_types=event_types,
-                        regime_id=regime_id,
-                        checkpoint_task=checkpoint_task,
-                        anchor_index=anchor_index,
-                        nise=nise,
+                snapshots_by_sequence: list[list[torch.Tensor]] = []
+                for result in batch_results:
+                    events = result.get("events", ())
+                    snapshots = [
+                        event.get("prediction_theta") for event in events
+                    ]
+                    if not events or any(snapshot is None for snapshot in snapshots):
+                        raise RuntimeError(
+                            "inference did not expose causal prediction_theta; "
+                            "please use the matching Memory/Train/Inference.py"
+                        )
+                    snapshots_by_sequence.append(snapshots)
+
+                grid, target_curve, predicted_curve, nise, nise_by_type = (
+                    _batched_law_evaluation(
+                        batch,
+                        snapshots_by_sequence,
+                        law,
+                        model_betas=model_betas,
                         expected_types=expected_types,
+                        expected_basis=expected_basis,
+                        device=inference.device,
+                        intensity_samples=args.intensity_samples,
                     )
+                )
                 scope = (
                     "ood_unseen"
                     if law.kind == "transient"
                     or regime_id not in regime_first_seen
                     else "seen_law"
                 )
-                intensity_row = {
-                    "checkpoint_task": checkpoint_task,
-                    "checkpoint": str(checkpoint.resolve()),
-                    "variant": variant,
-                    "regime_id": regime_id,
-                    "anchor_index": anchor_index,
-                    "events": int(len(event_times)),
-                    "evaluation_scope": scope,
-                    "first_seen_task": regime_first_seen.get(regime_id),
-                    "nise": nise,
-                    "plot_path": plot_path,
-                }
-                for event_type, value in enumerate(nise_by_type):
-                    intensity_row[f"nise_type_{event_type}"] = float(value)
-                intensity_rows.append(intensity_row)
-
-                model_mu, model_W, owner_id, owner_share = _model_semantic_law(
-                    inference, events, expected_types, expected_basis
-                )
-                E_mu, E_K, decay_error = _relative_parameter_errors(
-                    model_mu, model_W, law, model_betas
-                )
-                parameter_rows.append({
-                    "checkpoint_task": checkpoint_task,
-                    "checkpoint": str(checkpoint.resolve()),
-                    "variant": variant,
-                    "regime_id": regime_id,
-                    "anchor_index": anchor_index,
-                    "events": int(len(event_times)),
-                    "evaluation_scope": scope,
-                    "first_seen_task": regime_first_seen.get(regime_id),
-                    "parameter_source": "semantic_owner_mode",
-                    "model_owner_id": owner_id,
-                    "owner_share": owner_share,
-                    "E_mu": E_mu,
-                    "E_K": E_K,
-                    "decay_max_abs_error": decay_error,
-                })
+                for offset, sequence in enumerate(batch):
+                    anchor_index = batch_start + offset
+                    event_times = sequence["times"].detach().cpu().numpy().astype(
+                        np.float64, copy=False
+                    )
+                    event_types = sequence["types"].detach().cpu().numpy().astype(
+                        np.int64, copy=False
+                    )
+                    grid_row = grid[offset].detach().cpu().numpy()
+                    target_row = target_curve[offset].detach().cpu().numpy()
+                    predicted_row = predicted_curve[offset].detach().cpu().numpy()
+                    nise_value = float(nise[offset].detach().cpu())
+                    plot_path = None
+                    if anchor_index < args.intensity_plot_anchors:
+                        plot_path = _plot_intensity_curve(
+                            args.output_dir
+                            / "intensity_curves"
+                            / f"checkpoint_task_{checkpoint_task:02d}"
+                            / f"{_safe_name(regime_id)}_{anchor_index:03d}.png",
+                            grid=grid_row,
+                            target=target_row,
+                            predicted=predicted_row,
+                            event_times=event_times,
+                            event_types=event_types,
+                            regime_id=regime_id,
+                            checkpoint_task=checkpoint_task,
+                            anchor_index=anchor_index,
+                            nise=nise_value,
+                            expected_types=expected_types,
+                        )
+                    intensity_row = {
+                        "checkpoint_task": checkpoint_task,
+                        "checkpoint": str(checkpoint.resolve()),
+                        "variant": variant,
+                        "regime_id": regime_id,
+                        "anchor_index": anchor_index,
+                        "events": int(len(event_times)),
+                        "evaluation_scope": scope,
+                        "first_seen_task": regime_first_seen.get(regime_id),
+                        "nise": nise_value,
+                        "plot_path": plot_path,
+                    }
+                    for event_type, value in enumerate(
+                        nise_by_type[offset].detach().cpu().tolist()
+                    ):
+                        intensity_row[f"nise_type_{event_type}"] = float(value)
+                    intensity_rows.append(intensity_row)
 
     def grouped_summary(
         rows: Sequence[Mapping[str, Any]],
@@ -1560,8 +1566,7 @@ def _hawkes_law_evaluation(
         return output
 
     intensity_summary = grouped_summary(intensity_rows, ("nise",))
-    parameter_summary = grouped_summary(parameter_rows, ("E_mu", "E_K"))
-    return intensity_rows, intensity_summary, parameter_rows, parameter_summary
+    return intensity_rows, intensity_summary
 
 
 def _ood_metrics(
@@ -1588,15 +1593,7 @@ def _ood_metrics(
             "evaluation_scope": "ood_unseen",
             "nll_per_event": row.get("nll_per_event"),
             "accuracy": row.get("accuracy"),
-            "macro_f1": row.get("macro_f1"),
-            "memory_hit_fraction": row.get("memory_hit_fraction"),
-            "read_coverage_fraction": row.get("read_coverage_fraction"),
-            "mean_retrieval_alpha_mass": row.get("mean_retrieval_alpha_mass"),
-            "mean_retrieval_effective_k": row.get("mean_retrieval_effective_k"),
-            "mean_retrieval_similarity": row.get("mean_retrieval_similarity"),
-            "mean_retrieval_null_alpha": row.get("mean_retrieval_null_alpha"),
-            "mean_episodic_residual_norm": row.get("mean_episodic_residual_norm"),
-            "owner_path_coverage_fraction": row.get("owner_path_coverage_fraction"),
+            "local_time_mae": row.get("local_time_mae"),
         })
     return output
 
@@ -1606,11 +1603,9 @@ def _plot_summary_figures(
     *,
     continual_rows: Sequence[Mapping[str, Any]],
     anchor_matrix_rows: Sequence[Mapping[str, Any]],
-    decomposition_rows: Sequence[Mapping[str, Any]],
     stage_rows: Sequence[Mapping[str, Any]],
     special_rows: Sequence[Mapping[str, Any]],
-    intensity_rows: Sequence[Mapping[str, Any]],
-    parameter_rows: Sequence[Mapping[str, Any]],
+    intensity_summary_rows: Sequence[Mapping[str, Any]],
     checkpoint_rows: Sequence[Mapping[str, Any]],
 ) -> list[str]:
     """Plot the compact CL figures most useful for diagnosis and a paper."""
@@ -1688,7 +1683,7 @@ def _plot_summary_figures(
     quality_metrics = (
         ("current_nll_per_event", "Current-task NLL/event", "lower is better"),
         ("current_accuracy", "Current-task accuracy", "higher is better"),
-        ("current_macro_f1", "Current-task macro-F1", "higher is better"),
+        ("current_local_time_mae", "Current-task time MAE", "lower is better"),
     )
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.2), squeeze=False)
     quality_plotted = False
@@ -1704,14 +1699,13 @@ def _plot_summary_figures(
     continual_metrics = (
         ("clnll", "Seen-law CLNLL", "lower is better"),
         ("average_forgetting", "Average forgetting", "near zero is best"),
-        ("average_bwt", "Backward transfer", "higher is better"),
     )
-    figure, axes = plt.subplots(1, 3, figsize=(15, 4.2), squeeze=False)
+    figure, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), squeeze=False)
     continual_plotted = False
     for axis, (metric, title, direction) in zip(axes[0], continual_metrics):
         continual_plotted |= plot_by_variant(axis, continual_rows, metric)
         axis.set_title(f"{title}\n({direction})")
-        if metric in {"average_forgetting", "average_bwt"}:
+        if metric == "average_forgetting":
             axis.axhline(0.0, color="0.35", linewidth=0.8, linestyle="--")
     if continual_plotted:
         save(figure, "continual_learning.png")
@@ -1814,100 +1808,45 @@ def _plot_summary_figures(
         axis.grid(axis="y", alpha=0.25)
         save(figure, "stage_adaptation_gain.png")
 
-    # Contribution of episodic and working memory to anchor NLL.
-    decomposition_metrics = (
-        ("episodic_gain_nll", "episodic gain"),
-        ("working_gain_nll", "working gain"),
-        ("total_memory_gain_nll", "total memory gain"),
-    )
-    figure, axis = plt.subplots(figsize=(9, 4.8))
-    decomposition_plotted = False
-    for metric, label in decomposition_metrics:
-        points = sorted(
-            (
-                (int(row["checkpoint_task"]), value)
-                for row in decomposition_rows
-                if (value := finite(row.get(metric))) is not None
-            ),
-            key=lambda item: item[0],
-        )
-        if points:
-            axis.plot(
-                [point[0] for point in points],
-                [point[1] for point in points],
-                marker="o",
-                linewidth=1.8,
-                label=label,
-            )
-            decomposition_plotted = True
-    if decomposition_plotted:
-        axis.axhline(0.0, color="0.35", linewidth=0.8, linestyle="--")
-        axis.set_xlabel("checkpoint task")
-        axis.set_ylabel("NLL gain")
-        axis.set_title("Memory decomposition on frozen anchors (positive is better)")
-        axis.grid(alpha=0.25)
-        axis.legend()
-        save(figure, "memory_decomposition.png")
-    else:
-        plt.close(figure)
-
     # Underlying Hawkes-law recovery, averaged over seen anchor laws.
     law_variants = sorted({
-        str(row.get("variant")) for row in (*intensity_rows, *parameter_rows)
+        str(row.get("variant")) for row in intensity_summary_rows
     })
     law_variant = (
         "full_frozen" if "full_frozen" in law_variants
         else (law_variants[0] if law_variants else None)
     )
     seen_intensity = [
-        row for row in intensity_rows
+        row for row in intensity_summary_rows
         if str(row.get("variant")) == law_variant
         and row.get("evaluation_scope") == "seen_law"
     ]
-    seen_parameters = [
-        row for row in parameter_rows
-        if str(row.get("variant")) == law_variant
-        and row.get("evaluation_scope") == "seen_law"
-    ]
-    law_tasks = sorted({
-        int(row["checkpoint_task"])
-        for row in (*seen_intensity, *seen_parameters)
-    })
+    law_tasks = sorted({int(row["checkpoint_task"]) for row in seen_intensity})
     if law_tasks:
-        law_metrics = (
-            (seen_intensity, "nise_mean", "Intensity NISE"),
-            (seen_parameters, "E_mu_mean", "Baseline error E_mu"),
-            (seen_parameters, "E_K_mean", "Branching error E_K"),
-        )
-        figure, axes = plt.subplots(1, 3, figsize=(14, 4.2), squeeze=False)
-        law_plotted = False
-        for axis, (rows, metric, title) in zip(axes[0], law_metrics):
-            points = []
-            for task_id in law_tasks:
-                value = _mean(
-                    row.get(metric)
-                    for row in rows
-                    if int(row["checkpoint_task"]) == task_id
-                )
-                value = finite(value)
-                if value is not None:
-                    points.append((task_id, value))
-            if points:
-                axis.plot(
-                    [point[0] for point in points],
-                    [point[1] for point in points],
-                    marker="o",
-                    linewidth=1.8,
-                    color="#264653",
-                )
-                law_plotted = True
+        points = []
+        for task_id in law_tasks:
+            value = _mean(
+                row.get("nise_mean")
+                for row in seen_intensity
+                if int(row["checkpoint_task"]) == task_id
+            )
+            value = finite(value)
+            if value is not None:
+                points.append((task_id, value))
+        if points:
+            figure, axis = plt.subplots(figsize=(8.5, 4.2))
+            axis.plot(
+                [point[0] for point in points],
+                [point[1] for point in points],
+                marker="o",
+                linewidth=1.8,
+                color="#264653",
+            )
             axis.set_xlabel("checkpoint task")
-            axis.set_title(f"{title}\n(lower is better)")
+            axis.set_ylabel("NISE")
+            axis.set_title(f"Hawkes intensity NISE — {law_variant}\n(lower is better)")
             axis.grid(alpha=0.25)
-        if law_plotted:
             save(figure, "hawkes_law_recovery.png")
-        else:
-            plt.close(figure)
 
     # Structural growth is separated from memory-row growth because the scales differ.
     topology_points = sorted(
@@ -1999,10 +1938,8 @@ def _write_report(
     continual_rows: Sequence[Mapping[str, Any]],
     law_rows: Sequence[Mapping[str, Any]],
     stage_rows: Sequence[Mapping[str, Any]],
-    decomposition_summary_rows: Sequence[Mapping[str, Any]],
     special_rows: Sequence[Mapping[str, Any]],
     intensity_summary_rows: Sequence[Mapping[str, Any]],
-    parameter_summary_rows: Sequence[Mapping[str, Any]],
     ood_rows: Sequence[Mapping[str, Any]],
     summary_plot_paths: Sequence[str],
     tree_by_checkpoint: Mapping[int, Mapping[str, Any]],
@@ -2025,7 +1962,8 @@ def _write_report(
         f"- Checkpoints: `{checkpoint_dir.resolve()}`",
         f"- Checkpoint tasks: `{list(checkpoint_tasks)}`",
         f"- Variants: `{list(variants)}`",
-        "- Task test protocol: checkpoint `task_k` is evaluated on `task_0..task_k` test sets.",
+        "- Task-test protocol: checkpoint `task_k` is evaluated on `D_k^test`; "
+        "`D_{k+1}^test` is also evaluated before learning when available.",
         f"- Frozen anchors: `{'enabled' if anchors_enabled else 'disabled'}`.",
         "",
         "## Checkpoint topology",
@@ -2045,8 +1983,8 @@ def _write_report(
         "",
         "## Current-task test quality",
         "",
-        "| checkpoint | variant | NLL/event | accuracy | macro-F1 | time MAE |",
-        "|---:|---|---:|---:|---:|---:|",
+        "| checkpoint | variant | NLL/event | accuracy | time MAE |",
+        "|---:|---|---:|---:|---:|",
     ])
     for row in metric_rows:
         if row["eval_kind"] != "task_test" or row["eval_task"] != row["checkpoint_task"]:
@@ -2054,7 +1992,7 @@ def _write_report(
         lines.append(
             f"| task_{int(row['checkpoint_task']):02d} | {row['variant']} | "
             f"{fmt(row.get('nll_per_event'), 6)} | {fmt(row.get('accuracy'))} | "
-            f"{fmt(row.get('macro_f1'))} | {fmt(row.get('local_time_mae'))} |"
+            f"{fmt(row.get('local_time_mae'))} |"
         )
 
     lines.extend([
@@ -2062,19 +2000,17 @@ def _write_report(
         "## Continual retention and anchors",
         "",
         "CLNLL averages only anchor laws whose first occurrence is no later than the checkpoint. "
-        "Forgetting is current NLL minus the best NLL since that law was first seen; BWT is start NLL minus current NLL.",
+        "Forgetting is current NLL minus the best NLL since that law was first seen.",
         "",
-        "| checkpoint | variant | CLNLL | avg forgetting | avg BWT | seen tasks | anchor mean NLL |",
-        "|---:|---|---:|---:|---:|---:|---:|",
+        "| checkpoint | variant | CLNLL | avg forgetting | seen laws |",
+        "|---:|---|---:|---:|---:|",
     ])
     for row in continual_rows:
         lines.append(
             f"| task_{int(row['checkpoint_task']):02d} | {row['variant']} | "
             f"{fmt(row.get('clnll'), 6)} | "
             f"{fmt(row.get('average_forgetting'), 6)} | "
-            f"{fmt(row.get('average_bwt'), 6)} | "
-            f"{fmt(row.get('seen_task_count'), 0)} | "
-            f"{fmt(row.get('anchor_mean_nll_per_event'), 6)} |"
+            f"{fmt(row.get('seen_law_count'), 0)} |"
         )
 
     lines.extend([
@@ -2083,33 +2019,15 @@ def _write_report(
         "",
         "`adaptation_gain_nll = pre_nll - post_nll`; positive means the current task improved after training.",
         "",
-        "| task | variant | pre NLL | post NLL | adaptation gain | pre ACC | post ACC |",
-        "|---:|---|---:|---:|---:|---:|---:|",
+        "| task | variant | pre NLL | post NLL | adaptation gain |",
+        "|---:|---|---:|---:|---:|",
     ])
     for row in stage_rows:
         lines.append(
             f"| task_{int(row['task_id']):02d} | {row['variant']} | "
             f"{fmt(row.get('pre_nll_per_event'), 6)} | "
             f"{fmt(row.get('post_nll_per_event'), 6)} | "
-            f"{fmt(row.get('adaptation_gain_nll'), 6)} | "
-            f"{fmt(row.get('pre_accuracy'))} | {fmt(row.get('post_accuracy'))} |"
-        )
-
-    lines.extend([
-        "",
-        "## Memory decomposition",
-        "",
-        "Positive gains mean the corresponding memory component lowered frozen-anchor NLL.",
-        "",
-        "| checkpoint | anchors | episodic gain | working gain | total memory gain |",
-        "|---:|---:|---:|---:|---:|",
-    ])
-    for row in decomposition_summary_rows:
-        lines.append(
-            f"| task_{int(row['checkpoint_task']):02d} | {row.get('anchor_count')} | "
-            f"{fmt(row.get('episodic_gain_nll'), 6)} | "
-            f"{fmt(row.get('working_gain_nll'), 6)} | "
-            f"{fmt(row.get('total_memory_gain_nll'), 6)} |"
+            f"{fmt(row.get('adaptation_gain_nll'), 6)} |"
         )
 
     lines.extend([
@@ -2131,41 +2049,21 @@ def _write_report(
         row for row in intensity_summary_rows
         if row.get("evaluation_scope") == "seen_law"
     ]
-    seen_parameters = [
-        row for row in parameter_summary_rows
-        if row.get("evaluation_scope") == "seen_law"
-    ]
-    if seen_intensity or seen_parameters:
-        parameter_lookup = {
-            (
-                int(row["checkpoint_task"]),
-                str(row["variant"]),
-                str(row["regime_id"]),
-            ): row
-            for row in seen_parameters
-        }
+    if seen_intensity:
         lines.extend([
             "",
             "## Hawkes law recovery",
             "",
-            "NISE compares causal intensity curves against `ground_truth/regimes.npz`. "
-            "E_mu and E_K compare the semantic owner law after applying softplus; "
-            "E_K uses K[d,d'] = sum_m W[d,d',m] / beta_m.",
+            "NISE compares causal total and representative event-type intensity curves "
+            "against `ground_truth/regimes.npz`.",
             "",
-            "| checkpoint | variant | regime | NISE | E_mu | E_K | sequences |",
-            "|---:|---|---|---:|---:|---:|---:|",
+            "| checkpoint | variant | regime | NISE | sequences |",
+            "|---:|---|---|---:|---:|",
         ])
         for row in seen_intensity:
-            parameter = parameter_lookup.get((
-                int(row["checkpoint_task"]),
-                str(row["variant"]),
-                str(row["regime_id"]),
-            ), {})
             lines.append(
                 f"| task_{int(row['checkpoint_task']):02d} | {row['variant']} | "
                 f"{row['regime_id']} | {fmt(row.get('nise_mean'), 6)} | "
-                f"{fmt(parameter.get('E_mu_mean'), 6)} | "
-                f"{fmt(parameter.get('E_K_mean'), 6)} | "
                 f"{fmt(row.get('sequence_count'), 0)} |"
             )
 
@@ -2177,17 +2075,15 @@ def _write_report(
             "Transient/unseen anchors are reported separately and never enter CLNLL, "
             "average forgetting, or average seen-task NLL.",
             "",
-            "| checkpoint | variant | regime | NLL/event | retrieval similarity | memory hit | read coverage | residual norm |",
-            "|---:|---|---|---:|---:|---:|---:|---:|",
+            "| checkpoint | variant | regime | NLL/event | accuracy | time MAE |",
+            "|---:|---|---|---:|---:|---:|",
         ])
         for row in ood_rows:
             lines.append(
                 f"| task_{int(row['checkpoint_task']):02d} | {row['variant']} | "
                 f"{row['regime_id']} | {fmt(row.get('nll_per_event'), 6)} | "
-                f"{fmt(row.get('mean_retrieval_similarity'))} | "
-                f"{fmt(row.get('memory_hit_fraction'))} | "
-                f"{fmt(row.get('read_coverage_fraction'))} | "
-                f"{fmt(row.get('mean_episodic_residual_norm'))} |"
+                f"{fmt(row.get('accuracy'))} | "
+                f"{fmt(row.get('local_time_mae'))} |"
             )
 
     if law_rows:
@@ -2225,18 +2121,15 @@ def _write_report(
         "",
         "- `task_metrics.csv`: checkpoint × task-test × variant metrics.",
         "- `anchor_metrics.csv`: checkpoint × frozen-anchor × variant metrics.",
-        "- `continual_summary.csv`: current quality, retention, forgetting, and anchor averages.",
+        "- `continual_summary.csv`: current quality, CLNLL, forgetting, and checkpoint topology.",
         "- `law_metrics.csv`: per-law CLNLL support, forgetting, and BWT terms.",
         "- `stage_metrics.csv`: pre/post task-test adaptation gains.",
-        "- `memory_decomposition.csv`: episodic/working/total memory NLL gains.",
-        "- `memory_decomposition_summary.csv`: average decomposition gains per checkpoint.",
         "- `anchor_nll_matrix.csv`: paper-style wide checkpoint × regime NLL matrix.",
         "- `special_case_metrics.csv`: A_1 recurrence, B'_1 near-recurrence, and long-gap diagnostics.",
         "- `intensity_metrics.csv` / `intensity_summary.csv`: causal intensity-curve NISE and checkpoint summaries.",
-        "- `parameter_recovery.csv` / `parameter_recovery_summary.csv`: E_mu and branching-matrix E_K.",
         "- `ood_metrics.csv`: transient/unseen-anchor novelty control, excluded from CL averages.",
         "- `intensity_curves/`: optional total-plus-representative-type GT/prediction plots.",
-        "- `plots/`: summary CL curves, anchor heatmap, memory decomposition, law recovery, and topology growth.",
+        "- `plots/`: current quality, CLNLL/forgetting, anchor heatmap, adaptation, NISE, and topology figures.",
         "- `checkpoint_tree.csv`: leaf/node counts and checkpoint memory sizes.",
         "- `summary.json`: machine-readable copy of the complete evaluation manifest.",
         "- `event_predictions.csv`: written only when `--save-event-predictions` is supplied.",
@@ -2251,11 +2144,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument(
-        "--protocol", choices=("frozen", "online", "both"), default="frozen",
-        help="frozen is the comparable CL protocol; online adapts memory during evaluation",
-    )
-    parser.add_argument("--variants", nargs="+", choices=tuple(VARIANTS), default=None)
     parser.add_argument("--task-start", type=int, default=None)
     parser.add_argument("--task-end", type=int, default=None)
     parser.add_argument(
@@ -2267,6 +2155,15 @@ def parse_args() -> argparse.Namespace:
         help="skip the independent frozen anchor banks",
     )
     parser.add_argument("--max-sequences", type=int, default=None)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=32,
+        help=(
+            "number of variable-length sequences used for each padded encoder "
+            "batch; reduce it when GPU memory is tight"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bootstrap-samples", type=int, default=1000)
     parser.add_argument("--device", default=None)
@@ -2274,12 +2171,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-event-predictions", action="store_true",
         help="write the large combined event_predictions.csv artifact",
-    )
-    parser.add_argument(
-        "--intensity-variant",
-        choices=tuple(VARIANTS),
-        default="full_frozen",
-        help="variant used for causal intensity curves and parameter recovery",
     )
     parser.add_argument(
         "--intensity-samples",
@@ -2296,7 +2187,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-hawkes-law-evaluation",
         action="store_true",
-        help="skip ground-truth intensity NISE and parameter-law recovery",
+        help="skip ground-truth intensity NISE and intensity plots",
     )
     parser.add_argument(
         "--no-summary-plots",
@@ -2317,6 +2208,8 @@ def main() -> None:
     args = parse_args()
     if args.max_sequences is not None and args.max_sequences <= 0:
         raise ValueError("--max-sequences must be positive")
+    if args.eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size must be positive")
     if args.bootstrap_samples <= 0:
         raise ValueError("--bootstrap-samples must be positive")
     if args.intensity_samples < 2:
@@ -2374,7 +2267,9 @@ def main() -> None:
             if regime_id:
                 regime_first_seen.setdefault(str(regime_id), task_id)
 
-    variants = _select_variants(args.protocol, args.variants)
+    # The CL benchmark has one primary protocol: frozen full-memory inference.
+    # Mechanism ablations and online write/read behavior are evaluated elsewhere.
+    variants = ["full_frozen"]
     anchors = [] if args.no_anchors else _discover_anchors(data_root)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(
@@ -2425,7 +2320,7 @@ def main() -> None:
         if ground_truth:
             print(
                 f"[CL Eval] Hawkes law layer: regimes={len(ground_truth)} "
-                f"variant={args.intensity_variant} "
+                "variant=full_frozen "
                 f"grid={args.intensity_samples}",
                 flush=True,
             )
@@ -2446,21 +2341,15 @@ def main() -> None:
         if args.save_event_predictions
         else None
     )
-    all_data_task_ids = sorted(task_sets)
-
     for checkpoint_task in selected_ids:
         checkpoint = checkpoint_paths[checkpoint_task]
         evaluation_sets: list[EvaluationSet] = []
         if args.current_only:
             evaluation_sets.append(task_sets[checkpoint_task])
         else:
-            evaluation_sets.extend(
-                task_sets[task_id]
-                for task_id in all_data_task_ids
-                if task_id <= checkpoint_task
-            )
+            evaluation_sets.append(task_sets[checkpoint_task])
             next_task = checkpoint_task + 1
-            if next_task in selected_ids and next_task in task_sets:
+            if next_task in task_sets:
                 next_set = task_sets[next_task]
                 evaluation_sets.append(EvaluationSet(
                     name=f"{next_set.name}_pre",
@@ -2481,30 +2370,29 @@ def main() -> None:
                 data_sha_cache[evaluation_set.path] = dataset_fingerprint(
                     evaluation_set.path
                 )
-            sequences = evaluation_cache[evaluation_set.path]
-            for variant in variants:
-                print(
-                    f"[CL Eval] checkpoint=task_{checkpoint_task:02d} "
-                    f"dataset={evaluation_set.name} variant={variant} "
-                    f"sequences={len(sequences)}",
-                    flush=True,
-                )
-                rows, elapsed, from_cache = _load_or_run(
+        for variant in variants:
+            print(
+                f"[CL Eval] checkpoint=task_{checkpoint_task:02d} "
+                f"batched_sets={[item.name for item in evaluation_sets]} "
+                f"variant={variant} "
+                f"sequences={sum(len(evaluation_cache[item.path]) for item in evaluation_sets)} "
+                f"batch_size={args.eval_batch_size}",
+                flush=True,
+            )
+            metrics_by_set, event_rows, elapsed, from_cache = (
+                _load_or_run_batch(
                     checkpoint=checkpoint,
                     checkpoint_task=checkpoint_task,
-                    evaluation_set=evaluation_set,
+                    evaluation_sets=evaluation_sets,
                     variant=variant,
-                    sequences=sequences,
-                    data_sha256=data_sha_cache[evaluation_set.path],
+                    evaluation_cache=evaluation_cache,
+                    data_sha_cache=data_sha_cache,
                     checkpoint_sha256=checkpoint_sha[checkpoint_task],
                     args=args,
                 )
-                metrics = aggregate_metrics(
-                    rows,
-                    expected_types,
-                    args.seed,
-                    args.bootstrap_samples,
-                )
+            )
+            for evaluation_set in evaluation_sets:
+                metrics = metrics_by_set.get(evaluation_set.name, {})
                 current_metric_row = _metric_row(
                     checkpoint_task=checkpoint_task,
                     checkpoint=checkpoint,
@@ -2522,7 +2410,13 @@ def main() -> None:
                 else:
                     anchor_matrix_rows.append(current_metric_row)
                 if event_writer is not None:
-                    event_writer.write(rows, current_metric_row)
+                    event_writer.write(
+                        [
+                            row for row in event_rows
+                            if row.get("eval_set_id") == evaluation_set.name
+                        ],
+                        current_metric_row,
+                    )
 
     continual_rows = _continual_summary(
         metric_rows, selected_ids, variants, tree_by_checkpoint
@@ -2540,8 +2434,6 @@ def main() -> None:
             {},
         ))
     stage_rows = _stage_metrics(metric_rows, variants)
-    decomposition_rows = _memory_decomposition(metric_rows, selected_ids)
-    decomposition_summary_rows = _decomposition_summary(decomposition_rows)
     anchor_matrix_rows_wide = _anchor_nll_matrix(metric_rows)
     special_rows = _special_case_metrics(metric_rows)
     checkpoint_rows = []
@@ -2560,18 +2452,13 @@ def main() -> None:
     write_csv(args.output_dir / "continual_summary.csv", continual_rows)
     write_csv(args.output_dir / "law_metrics.csv", law_rows)
     write_csv(args.output_dir / "stage_metrics.csv", stage_rows)
-    write_csv(args.output_dir / "memory_decomposition.csv", decomposition_rows)
-    write_csv(
-        args.output_dir / "memory_decomposition_summary.csv",
-        decomposition_summary_rows,
-    )
     write_csv(args.output_dir / "anchor_nll_matrix.csv", anchor_matrix_rows_wide)
     write_csv(args.output_dir / "special_case_metrics.csv", special_rows)
     write_csv(args.output_dir / "checkpoint_tree.csv", checkpoint_rows)
     if event_writer is not None:
         event_writer.close()
 
-    intensity_rows, intensity_summary_rows, parameter_rows, parameter_summary_rows = (
+    intensity_rows, intensity_summary_rows = (
         _hawkes_law_evaluation(
             checkpoint_paths=checkpoint_paths,
             checkpoint_tasks=selected_ids,
@@ -2588,11 +2475,6 @@ def main() -> None:
     )
     write_csv(args.output_dir / "intensity_metrics.csv", intensity_rows)
     write_csv(args.output_dir / "intensity_summary.csv", intensity_summary_rows)
-    write_csv(args.output_dir / "parameter_recovery.csv", parameter_rows)
-    write_csv(
-        args.output_dir / "parameter_recovery_summary.csv",
-        parameter_summary_rows,
-    )
     write_csv(args.output_dir / "ood_metrics.csv", ood_rows)
 
     summary_plot_paths = (
@@ -2602,11 +2484,9 @@ def main() -> None:
             args.output_dir,
             continual_rows=continual_rows,
             anchor_matrix_rows=anchor_matrix_rows_wide,
-            decomposition_rows=decomposition_summary_rows,
             stage_rows=stage_rows,
             special_rows=special_rows,
-            intensity_rows=intensity_summary_rows,
-            parameter_rows=parameter_summary_rows,
+            intensity_summary_rows=intensity_summary_rows,
             checkpoint_rows=checkpoint_rows,
         )
     )
@@ -2615,7 +2495,7 @@ def main() -> None:
         "data_root": str(data_root.resolve()),
         "checkpoint_dir": str(args.checkpoint_dir.resolve()),
         "output_dir": str(args.output_dir.resolve()),
-        "protocol": args.protocol,
+        "protocol": "frozen",
         "variants": variants,
         "task_ids": selected_ids,
         "available_data_task_ids": sorted(task_sets),
@@ -2639,7 +2519,7 @@ def main() -> None:
         "ground_truth": ground_truth_meta,
         "hawkes_law_evaluation": {
             "enabled": not args.no_hawkes_law_evaluation and bool(anchors),
-            "variant": args.intensity_variant,
+            "variant": "full_frozen",
             "intensity_samples": args.intensity_samples,
             "intensity_plot_anchors": args.intensity_plot_anchors,
         },
@@ -2647,19 +2527,16 @@ def main() -> None:
         "continual_summary": continual_rows,
         "law_metrics": law_rows,
         "stage_metrics": stage_rows,
-        "memory_decomposition": decomposition_rows,
-        "memory_decomposition_summary": decomposition_summary_rows,
         "anchor_nll_matrix": anchor_matrix_rows_wide,
         "special_case_metrics": special_rows,
         "intensity_metrics": intensity_rows,
         "intensity_summary": intensity_summary_rows,
-        "parameter_recovery": parameter_rows,
-        "parameter_recovery_summary": parameter_summary_rows,
         "ood_metrics": ood_rows,
         "summary_plots": summary_plot_paths,
         "note": (
             "CL evaluation uses model-facing task CSVs and independent frozen anchors. "
-            "Oracle manifests are used only for task labels."
+            "Oracle manifests provide task/law labels; ground-truth laws are used only "
+            "for the separate Hawkes intensity NISE layer."
         ),
     }
     (args.output_dir / "summary.json").write_text(
@@ -2676,10 +2553,8 @@ def main() -> None:
         continual_rows=continual_rows,
         law_rows=law_rows,
         stage_rows=stage_rows,
-        decomposition_summary_rows=decomposition_summary_rows,
         special_rows=special_rows,
         intensity_summary_rows=intensity_summary_rows,
-        parameter_summary_rows=parameter_summary_rows,
         ood_rows=ood_rows,
         summary_plot_paths=summary_plot_paths,
         tree_by_checkpoint=tree_by_checkpoint,

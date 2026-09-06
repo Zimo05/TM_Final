@@ -638,6 +638,187 @@ def run_variant(
     return rows, inference, elapsed
 
 
+def run_variant_compact(
+    checkpoint: Path,
+    sequences: Sequence[Mapping[str, Any]],
+    variant: str,
+    device: str | None,
+    *,
+    sequence_batch_size: int = 32,
+    progress_dir: Path | None = None,
+    prototype_duplicate_threshold: float | None = None,
+    prototype_mode_threshold: float | None = None,
+    prototype_context_alias_capacity: int | None = None,
+    capture_event_predictions: bool = False,
+    verbose: bool = True,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], MemoryTreeInference, float]:
+    """Evaluate frozen sequences with device-side scalar accumulation.
+
+    This is deliberately separate from :func:`run_variant`, whose large event
+    rows are still required by the generic ablation/diagnostic evaluator.  The
+    compact path is for the CL benchmark only: prefix encodings are produced
+    from padded ``[B, L_max]`` batches, static routing tables are shared, and
+    each sequence then keeps its original causal Working Memory recurrence.
+    """
+    if variant not in VARIANTS:
+        raise KeyError(f"unknown evaluation variant: {variant}")
+    if not sequences:
+        raise ValueError("compact evaluation requires at least one sequence")
+    if sequence_batch_size <= 0:
+        raise ValueError("sequence_batch_size must be positive")
+    settings = VARIANTS[variant]
+    if settings["online"] or settings.get("writes", settings["online"]):
+        raise ValueError(
+            "compact evaluation is restricted to frozen read-only variants"
+        )
+
+    inference = MemoryTreeInference.from_checkpoint(
+        checkpoint,
+        device=device,
+        inference_config=InferenceConfig(
+            adapt_working_memory=settings["working"],
+            allow_memory_writes=False,
+            update_memory_usage=False,
+            probe_write_counterfactuals=False,
+            write_probe_seed=42,
+            prototype_duplicate_threshold=prototype_duplicate_threshold,
+            prototype_mode_threshold=prototype_mode_threshold,
+            prototype_context_alias_capacity=prototype_context_alias_capacity,
+        ),
+    )
+    if not settings["episodic"]:
+        clear_episodic_memory(inference)
+
+    static_cache = inference.tree.frontier_routing.build_static_cache(
+        detach=True
+    )
+    accumulators: dict[str, dict[str, Any]] = {}
+    event_rows: list[dict[str, Any]] = []
+    start = time.perf_counter()
+
+    for batch_start in range(0, len(sequences), sequence_batch_size):
+        batch = sequences[batch_start:batch_start + sequence_batch_size]
+        prepared, static_cache = inference.prepare_sequence_batch(
+            batch,
+            frontier_static_cache=static_cache,
+        )
+        if all(item.get("z") is not None for item in prepared):
+            batch_results = inference.run_sequence_batch_compact(
+                prepared,
+                frontier_static_cache=static_cache,
+                capture_event_predictions=capture_event_predictions,
+            )
+        else:
+            # Custom encoders may not expose a padded prefix API. Preserve
+            # their established event-wise semantics while still reusing the
+            # static frontier cache.
+            batch_results = [
+                inference.run_sequence(
+                    item["sequence"],
+                    precomputed_z=item["z"],
+                    frontier_static_cache=static_cache,
+                    precomputed_projected_z=item["projected_z"],
+                    precomputed_memory_query=item["memory_query"],
+                    compact=True,
+                    capture_event_predictions=capture_event_predictions,
+                )
+                for item in prepared
+            ]
+        for offset, (source_sequence, prepared_sequence) in enumerate(
+            zip(batch, prepared)
+        ):
+            sequence_position = batch_start + offset
+            result = batch_results[offset]
+            scalar = result.get("scalar_metrics")
+            if not isinstance(scalar, Mapping):
+                raise RuntimeError(
+                    "compact inference did not return scalar metrics"
+                )
+            group_id = str(source_sequence.get("eval_set_id", "all"))
+            group = accumulators.setdefault(group_id, {
+                "events": 0,
+                "sequences": 0,
+                "nll_sum": 0.0,
+                "correct": 0,
+                "time_abs_sum": 0.0,
+            })
+            group["events"] += int(scalar["events"])
+            group["sequences"] += 1
+            group["nll_sum"] += float(scalar["nll_sum"])
+            group["correct"] += int(scalar["correct"])
+            group["time_abs_sum"] += float(scalar["time_abs_sum"])
+
+            if capture_event_predictions:
+                for event in result.get("events", ()):
+                    event_rows.append({
+                        "variant": variant,
+                        "eval_set_id": group_id,
+                        "sequence_position": int(
+                            source_sequence.get(
+                                "_sequence_position", sequence_position
+                            )
+                        ),
+                        "source_index": int(source_sequence["source_index"]),
+                        "cluster_id": source_sequence.get("cluster_id"),
+                        "event_index": int(event["event_index"]),
+                        "true_type": int(event["true_type"]),
+                        "predicted_type_at_event_time": int(
+                            event["predicted_type"]
+                        ),
+                        "type_probabilities": [
+                            float(value)
+                            for value in event[
+                                "type_probabilities_at_event_time"
+                            ]
+                        ],
+                        "prefix_type_probabilities": [
+                            float(value)
+                            for value in event["forecast_type_probabilities"]
+                        ],
+                        "nll": float(event["nll"]),
+                        "true_time": float(event["true_time"]),
+                        "predicted_time": float(event["predicted_time"]),
+                        "predicted_delta": float(event["predicted_delta"]),
+                    })
+
+            completed = sequence_position + 1
+            elapsed_now = time.perf_counter() - start
+            if verbose:
+                eta = elapsed_now / completed * (len(sequences) - completed)
+                print(
+                    f"[Evaluate compact] {variant} {completed}/{len(sequences)} "
+                    f"elapsed={elapsed_now:.1f}s eta={eta:.1f}s",
+                    flush=True,
+                )
+            if progress_dir is not None:
+                progress_dir.mkdir(parents=True, exist_ok=True)
+                (progress_dir / f"{variant}.progress.json").write_text(
+                    json.dumps({
+                        "variant": variant,
+                        "completed_sequences": completed,
+                        "total_sequences": len(sequences),
+                        "elapsed_seconds": elapsed_now,
+                        "last_source_index": int(source_sequence["source_index"]),
+                        "last_eval_set_id": group_id,
+                    }, indent=2),
+                    encoding="utf-8",
+                )
+
+    elapsed = time.perf_counter() - start
+    metrics_by_group: dict[str, dict[str, Any]] = {}
+    for group_id, group in accumulators.items():
+        event_count = int(group["events"])
+        denominator = max(event_count, 1)
+        metrics_by_group[group_id] = {
+            "events": event_count,
+            "sequences": int(group["sequences"]),
+            "nll_per_event": float(group["nll_sum"]) / denominator,
+            "accuracy": float(group["correct"]) / denominator,
+            "local_time_mae": float(group["time_abs_sum"]) / denominator,
+        }
+    return metrics_by_group, event_rows, inference, elapsed
+
+
 def preflight_checkpoint(
     checkpoint: Path,
     sequence: Mapping[str, Any],
