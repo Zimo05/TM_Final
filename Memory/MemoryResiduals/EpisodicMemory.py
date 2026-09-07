@@ -104,6 +104,7 @@ class TreeEpisodicMemory(nn.Module):
         # broadcast below.
         self._packed_mirror_signature = None
         self._packed_mirror = None
+        self._packed_mirror_node_ids = None
         self._packed_mirror_rebuilds = 0
         # Logical chronological event counter. Advancing age is O(1); each
         # bank stores the clock at which its age tensor was last materialized.
@@ -180,6 +181,7 @@ class TreeEpisodicMemory(nn.Module):
                             setattr(window, cache_name, fn(cached))
         self._packed_mirror_signature = None
         self._packed_mirror = None
+        self._packed_mirror_node_ids = None
         return self
 
     @staticmethod
@@ -312,6 +314,7 @@ class TreeEpisodicMemory(nn.Module):
             "age_reference": age_reference,
             "valid": valid,
         }
+        self._packed_mirror_node_ids = tuple(node_ids)
         self._packed_mirror_signature = signature
         self._packed_mirror_rebuilds += 1
         return self._packed_mirror
@@ -377,18 +380,59 @@ class TreeEpisodicMemory(nn.Module):
         effective Hawkes law and all law-derived statistics remain stable.
         """
         rebased = False
+        mirror = self._packed_mirror
+        mirror_node_ids = self._packed_mirror_node_ids
+        mirror_indices = {
+            node_id: index
+            for index, node_id in enumerate(mirror_node_ids or ())
+        }
+        mirror_can_update = mirror is not None and mirror_node_ids is not None
         for node_id, theta_old in old_references.items():
             bank = self.banks.get(node_id)
             if bank is None or len(bank) == 0:
                 continue
+            theta_new = semantic_theta_for_node(node_id)
             bank.rebase_reference(
                 theta_old,
-                semantic_theta_for_node(node_id),
+                theta_new,
             )
+            # Keep an already materialized packed mirror hot.  The residual
+            # coordinate shift is exactly the same ``theta_old-theta_new``
+            # added by MemoryBank.rebase_reference, so updating only the
+            # corresponding mirror slice preserves every effective law row
+            # without forcing a full [node, capacity, param] reconstruction.
+            if mirror_can_update and node_id in mirror_indices:
+                mirror_index = mirror_indices[node_id]
+                width = len(bank)
+                if width > mirror["deltas"].size(1):
+                    mirror_can_update = False
+                else:
+                    shift = torch.as_tensor(
+                        theta_old,
+                        device=mirror["deltas"].device,
+                        dtype=mirror["deltas"].dtype,
+                    ).reshape(-1) - torch.as_tensor(
+                        theta_new,
+                        device=mirror["deltas"].device,
+                        dtype=mirror["deltas"].dtype,
+                    ).reshape(-1)
+                    mirror["deltas"][mirror_index, :width].add_(shift)
             rebased = True
         if rebased:
-            self._packed_mirror_signature = None
-            self._packed_mirror = None
+            if (
+                mirror is not None
+                and mirror_can_update
+                and mirror_node_ids is not None
+            ):
+                self._packed_mirror_signature = self._bank_state_signature(
+                    mirror_node_ids,
+                    dtype=mirror["deltas"].dtype,
+                    device=mirror["deltas"].device,
+                )
+            else:
+                self._packed_mirror_signature = None
+                self._packed_mirror = None
+                self._packed_mirror_node_ids = None
 
     @torch.no_grad()
     def rebuild_law_keys(
@@ -1241,6 +1285,109 @@ class TreeEpisodicMemory(nn.Module):
             deltas=deltas, usage=usage, age=age,
             write_quality=qualities,
         )
+
+    def read_nodes_with_virtual_items_batch(
+        self,
+        query: Tensor,
+        node_indices: Tensor,
+        node_ids: Sequence[str],
+        *,
+        keys: Tensor,
+        deltas: Tensor,
+        write_quality: Tensor,
+        virtual_usage: Tensor,
+        virtual_age: Tensor,
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+        """Read owner banks with one ephemeral row per query.
+
+        This is the batched equivalent of
+        :meth:`read_node_with_virtual_item`.  The persistent banks remain in
+        the cached padded mirror; only the candidate row is appended per
+        query.  No bank usage, age, or prototype state is mutated.
+        """
+        if query.ndim != 2 or query.size(-1) != self.key_dim:
+            raise ValueError("query must have shape [R, key_dim]")
+        row_count = query.size(0)
+        if (
+            node_indices.shape != (row_count,)
+            or keys.shape != query.shape
+            or deltas.shape != (row_count, self.param_dim)
+            or write_quality.shape != (row_count,)
+            or virtual_usage.shape != (row_count,)
+            or virtual_age.shape != (row_count,)
+        ):
+            raise ValueError("virtual batch inputs do not align")
+        if not node_ids:
+            raise ValueError("node_ids cannot be empty")
+        if node_indices.device != query.device:
+            node_indices = node_indices.to(device=query.device)
+        node_indices = node_indices.to(dtype=torch.long)
+        if bool((node_indices < 0).any()) or bool(
+            (node_indices >= len(node_ids)).any()
+        ):
+            raise ValueError("virtual owner indices are out of range")
+
+        mirror = self._packed_bank_mirror(node_ids, query)
+        safe_nodes = node_indices
+        capacity = int(mirror["deltas"].size(1))
+        aliases = int(mirror["context_keys"].size(2))
+        base_valid = mirror["valid"].index_select(0, safe_nodes)
+        base_context_valid = mirror["context_valid"].index_select(
+            0, safe_nodes
+        )
+        base_context_keys = mirror["context_keys"].index_select(
+            0, safe_nodes
+        )
+        base_deltas = mirror["deltas"].index_select(0, safe_nodes)
+        base_quality = mirror["quality"].index_select(0, safe_nodes)
+        base_usage = mirror["usage"].index_select(0, safe_nodes)
+        age_offset = (
+            self._age_clock
+            - mirror["age_reference"].index_select(0, safe_nodes)
+        ).to(query.dtype)
+        base_age = mirror["base_age"].index_select(0, safe_nodes)
+        base_age = base_age + age_offset[:, None] * base_valid.to(query.dtype)
+
+        virtual_context_keys = query.new_zeros(row_count, 1, aliases, self.key_dim)
+        virtual_context_keys[:, 0, 0] = F.normalize(keys, dim=-1)
+        virtual_context_valid = torch.zeros(
+            row_count,
+            1,
+            aliases,
+            dtype=torch.bool,
+            device=query.device,
+        )
+        virtual_context_valid[:, 0, 0] = True
+
+        all_context_keys = torch.cat(
+            (base_context_keys, virtual_context_keys), dim=1
+        )
+        all_context_valid = torch.cat(
+            (base_context_valid, virtual_context_valid), dim=1
+        )
+        all_valid = torch.cat(
+            (base_valid, torch.ones(row_count, 1, dtype=torch.bool, device=query.device)),
+            dim=1,
+        )
+        all_deltas = torch.cat((base_deltas, deltas[:, None, :].to(query)), dim=1)
+        all_usage = torch.cat((base_usage, virtual_usage[:, None].to(query)), dim=1)
+        all_age = torch.cat((base_age, virtual_age[:, None].to(query)), dim=1)
+        all_quality = torch.cat(
+            (base_quality, write_quality[:, None].to(query)), dim=1
+        )
+        virtual_delta, info = self.retriever.forward_batched(
+            query=query,
+            keys=all_context_keys,
+            deltas=all_deltas,
+            usage=all_usage,
+            age=all_age,
+            valid_mask=all_valid,
+            write_quality=all_quality,
+            context_valid=all_context_valid,
+        )
+        info = dict(info)
+        info["virtual_alpha"] = info["alpha"][:, capacity]
+        return virtual_delta, info
 
     def read_node_without_item(
         self,

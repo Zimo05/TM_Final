@@ -896,18 +896,27 @@ class TrainingWakeMixin:
             device=self.device,
             dtype=torch.long,
         )
-        active_rows_by_time = tuple(
-            torch.as_tensor(
-                [
-                    row
-                    for row, length in enumerate(lengths)
-                    if event_index < length
-                ],
-                device=self.device,
-                dtype=torch.long,
-            )
-            for event_index in range(max(lengths))
+        fixed_length = len(set(lengths)) == 1
+        fixed_time_count = lengths[0] if fixed_length else None
+        all_rows = torch.arange(
+            batch_size,
+            device=self.device,
+            dtype=torch.long,
         )
+        active_rows_by_time = None
+        if not fixed_length:
+            active_rows_by_time = tuple(
+                torch.as_tensor(
+                    [
+                        row
+                        for row, length in enumerate(lengths)
+                        if event_index < length
+                    ],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                for event_index in range(max(lengths))
+            )
 
         leaf_count = len(self.tree.leaf_ids)
         node_ids = tuple(self.tree.all_node_ids)
@@ -1012,15 +1021,15 @@ class TrainingWakeMixin:
         write_candidates = [0 for _ in range(batch_size)]
         action_values = tuple(Action)
         # Read the immutable controller mode once for the whole transaction.
-        # The v4/v5 path below uses a padded [B, T, ...] cache for delayed
-        # probe evidence; controller-only/v6 keeps its existing scalar
-        # fallback until its causal sampler is migrated as well.
+        # Every v6 mode shares the tensor probe buffer; v6 controller-only
+        # exploration is sampled at the small selected-row boundary so its
+        # historical CPU seed+signature RNG remains reproducible.
         controller_version = int(
             self.controller.controller_version.detach().cpu()
         )
         batched_write_path = (
             not self.training_config.controller_only_finetune
-            and controller_version < 6
+            or controller_version >= 6
         )
         padded_wake = (
             self._padded_wake_sequences(sequences)
@@ -1272,6 +1281,9 @@ class TrainingWakeMixin:
                 # the delayed request snapshot. Large diagnostic tensors such
                 # as expanded-child parameters do not need to live through
                 # the whole Wake transaction.
+                context_frontier_semantic_theta_flat = memory_output_flat[
+                    "frontier_semantic_theta"
+                ].detach()
                 memory_output_flat = {
                     key: memory_output_flat[key]
                     for key in (
@@ -1285,52 +1297,102 @@ class TrainingWakeMixin:
                     )
                 }
 
-            for event_index, active in enumerate(active_rows_by_time):
-                if active.numel() == 0:
-                    continue
-                flat_rows = offsets_tensor.index_select(0, active) + event_index
-                working_delta = self.tree.working_memory.make_trainable_rows(
-                    working_state,
-                    active,
-                )
-                step_flat = {
-                    key: flat[key].index_select(0, flat_rows)
-                    for key in (
-                        "types",
-                        "duration",
-                        HAWKES_HISTORY_STATS_KEY,
-                        HAWKES_INTERVAL_STATS_KEY,
-                    )
+            fixed_views = None
+            if fixed_length:
+                time_count = int(fixed_time_count)
+                fixed_flat_starts = all_rows * time_count
+                fixed_views = {
+                    "types": flat["types"].reshape(batch_size, time_count),
+                    "duration": flat["duration"].reshape(batch_size, time_count),
+                    HAWKES_HISTORY_STATS_KEY: flat[
+                        HAWKES_HISTORY_STATS_KEY
+                    ].reshape(batch_size, time_count, *flat[HAWKES_HISTORY_STATS_KEY].shape[1:]),
+                    HAWKES_INTERVAL_STATS_KEY: flat[
+                        HAWKES_INTERVAL_STATS_KEY
+                    ].reshape(batch_size, time_count, *flat[HAWKES_INTERVAL_STATS_KEY].shape[1:]),
+                    "owner_indices": owner_indices_flat.reshape(batch_size, time_count),
+                    "owner_confidence": owner_confidence_flat.reshape(batch_size, time_count),
+                    "novelty": novelty_flat.reshape(batch_size, time_count),
+                    "similarity_count": similarity_count_flat.reshape(batch_size, time_count),
+                    "max_similarity": max_similarity_flat.reshape(batch_size, time_count),
+                    "retrieval_residual_norm": retrieval_residual_norm_flat.reshape(batch_size, time_count),
+                    "semantic_base": semantic_base_flat.reshape(batch_size, time_count, *semantic_base_flat.shape[1:]),
+                    "episodic_base": episodic_base_flat.reshape(batch_size, time_count, *episodic_base_flat.shape[1:]),
                 }
-                owner_indices = owner_indices_flat.index_select(0, flat_rows)
-                owner_confidence = owner_confidence_flat.index_select(
-                    0,
-                    flat_rows,
-                )
-                novelty = novelty_flat.index_select(0, flat_rows)
-                similarity_count = similarity_count_flat.index_select(
-                    0,
-                    flat_rows,
-                )
-                max_similarity = max_similarity_flat.index_select(
-                    0,
-                    flat_rows,
-                )
+
+            time_steps = (
+                int(fixed_time_count)
+                if fixed_length
+                else len(active_rows_by_time)
+            )
+            for event_index in range(time_steps):
+                if fixed_length:
+                    active = all_rows
+                    flat_rows = fixed_flat_starts + event_index
+                    working_delta = (
+                        working_state.detach().clone().requires_grad_(True)
+                    )
+                    step_flat = {
+                        key: fixed_views[key][:, event_index]
+                        for key in (
+                            "types",
+                            "duration",
+                            HAWKES_HISTORY_STATS_KEY,
+                            HAWKES_INTERVAL_STATS_KEY,
+                        )
+                    }
+                    owner_indices = fixed_views["owner_indices"][:, event_index]
+                    owner_confidence = fixed_views["owner_confidence"][:, event_index]
+                    novelty = fixed_views["novelty"][:, event_index]
+                    similarity_count = fixed_views["similarity_count"][:, event_index]
+                    max_similarity = fixed_views["max_similarity"][:, event_index]
+                    retrieval_residual_norm = fixed_views[
+                        "retrieval_residual_norm"
+                    ][:, event_index]
+                    semantic_base = fixed_views["semantic_base"][:, event_index]
+                    episodic_base = fixed_views["episodic_base"][:, event_index]
+                else:
+                    active = active_rows_by_time[event_index]
+                    if active.numel() == 0:
+                        continue
+                    flat_rows = offsets_tensor.index_select(0, active) + event_index
+                    working_delta = self.tree.working_memory.make_trainable_rows(
+                        working_state,
+                        active,
+                    )
+                    step_flat = {
+                        key: flat[key].index_select(0, flat_rows)
+                        for key in (
+                            "types",
+                            "duration",
+                            HAWKES_HISTORY_STATS_KEY,
+                            HAWKES_INTERVAL_STATS_KEY,
+                        )
+                    }
+                    owner_indices = owner_indices_flat.index_select(0, flat_rows)
+                    owner_confidence = owner_confidence_flat.index_select(
+                        0,
+                        flat_rows,
+                    )
+                    novelty = novelty_flat.index_select(0, flat_rows)
+                    similarity_count = similarity_count_flat.index_select(
+                        0,
+                        flat_rows,
+                    )
+                    max_similarity = max_similarity_flat.index_select(
+                        0,
+                        flat_rows,
+                    )
+                    retrieval_residual_norm = retrieval_residual_norm_flat.index_select(
+                        0,
+                        flat_rows,
+                    )
+                    semantic_base = semantic_base_flat.index_select(0, flat_rows)
+                    episodic_base = episodic_base_flat.index_select(0, flat_rows)
                 # The controller consumes the no-retrieval pre-action NLL.
                 # Do not evaluate the tree output's full-retrieval NLL here:
                 # the final Wake objective below uses only the gated result.
-                semantic_base = semantic_base_flat.index_select(0, flat_rows)
-                episodic_base = episodic_base_flat.index_select(0, flat_rows)
-                pre_action_theta = semantic_base + working_delta
-                pre_action_effective = self._effective_parameters_from_theta(
-                    pre_action_theta,
-                    detach=True,
-                )
-                pre_action_nll = self._batched_sequence_event_nll(
-                    step_flat,
-                    {"effective_params": pre_action_effective},
-                )
-                pending_write_ratio = pre_action_nll.new_full(
+                pending_write_ratio = semantic_base.new_full(
                     (active.numel(),),
                     float(event_index)
                     / max(
@@ -1339,40 +1401,28 @@ class TrainingWakeMixin:
                         1,
                     ),
                 ).clamp_max(1.0)
-                controller_output = self.controller.action_distribution_batch(
+                (
                     pre_action_nll,
+                    action_probabilities,
+                    raw_action_probabilities,
+                    gated_effective,
+                    prediction_nll,
+                    working_grad,
+                ) = self._wake_step_tensor_dispatch(
+                    step_flat,
+                    semantic_base,
+                    episodic_base,
+                    working_delta,
                     novelty,
                     similarity_count,
-                    owner_confidence=owner_confidence,
-                    retrieval_similarity=max_similarity,
-                    retrieval_residual_norm=(
-                        retrieval_residual_norm_flat.index_select(
-                            0,
-                            flat_rows,
-                        )
-                    ),
-                    working_memory_norm=working_delta.norm(dim=-1),
-                    pending_write_ratio=pending_write_ratio,
+                    owner_confidence,
+                    max_similarity,
+                    retrieval_residual_norm,
+                    pending_write_ratio,
                 )
-                action_probabilities = controller_output["probabilities"]
-                raw_action_probabilities = controller_output.get(
-                    "raw_probabilities",
-                    action_probabilities,
-                )
-                gated_theta = (
-                    pre_action_theta
-                    + action_probabilities[:, 1, None] * episodic_base
-                )
-                gated_effective = self._effective_parameters_from_theta(
-                    gated_theta,
-                    detach=True,
-                )
+                self._update_controller_surprise_batch(pre_action_nll)
                 # This is the only prediction NLL used for Wake loss and the
                 # recurrent working-memory gradient at this time position.
-                prediction_nll, working_grad = self._batched_sequence_event_nll_and_grad(
-                    step_flat,
-                    gated_effective,
-                )
                 action_index = action_probabilities.detach().argmax(dim=-1)
                 wm_penalty = (
                     self.wake_config.lambda_wm
@@ -1448,10 +1498,7 @@ class TrainingWakeMixin:
                             similarity_count,
                             owner_confidence,
                             max_similarity,
-                            retrieval_residual_norm_flat.index_select(
-                                0,
-                                flat_rows,
-                            ),
+                            retrieval_residual_norm,
                             working_delta.norm(dim=-1),
                             pending_write_ratio,
                         ],
@@ -1528,12 +1575,12 @@ class TrainingWakeMixin:
                 ),
             )
 
-        # The recurrent GPU phase is complete.  The optimized v4/v5 path keeps
-        # delayed Adapt/Write candidates as a tensor-backed probe buffer.  No
-        # per-event Python request is created; only top-C probes cross the
-        # host boundary below.  The controller-only/v6 fallback retains its
-        # historical request objects because its disjoint future sampler is
-        # not yet packed.
+        # The recurrent GPU phase is complete. Every v6 and ordinary training
+        # controller version keeps delayed Adapt/Write candidates as a
+        # tensor-backed probe buffer. No per-event Python request is created;
+        # only selected top-C probes cross the host boundary below. v6's
+        # disjoint future sampler consumes the same buffer with its own causal
+        # label, while controller-only v6 preserves its CPU exploration RNG.
         if batched_write_path:
             flat_sequence_rows = ()
             flat_event_indices = ()
@@ -1568,11 +1615,15 @@ class TrainingWakeMixin:
                 torch.arange(cursor, device=self.device, dtype=torch.long)
                 - offsets_tensor.index_select(0, sequence_rows_tensor)
             )
+            horizon = int(self.wake_config.write_horizon)
+            ready_offset = (
+                2 * horizon - 1 if controller_version >= 6 else horizon
+            )
             probe_buffer = {
                 "sequence_rows": sequence_rows_tensor,
                 "event_indices": event_indices_tensor,
-                "ready_indices": event_indices_tensor
-                + int(self.wake_config.write_horizon),
+                "admission_indices": event_indices_tensor + horizon - 1,
+                "ready_indices": event_indices_tensor + ready_offset,
                 "queries": query_flat.detach(),
                 "frontier_node_indices": memory_output_flat[
                     "frontier_node_indices"
@@ -1594,6 +1645,22 @@ class TrainingWakeMixin:
                 "assimilation_theta": assimilation_theta_flat.detach(),
                 "assimilation_grad": working_gradient_flat.detach(),
                 "owner_indices": owner_indices_flat.detach(),
+                # v6's disjoint score window reuses these stateless routing
+                # and recurrent snapshots by flat row, without creating one
+                # Python context dictionary per event.
+                "context_queries": query_flat.detach(),
+                "context_frontier_semantic_theta": (
+                    context_frontier_semantic_theta_flat
+                ),
+                "context_frontier_episodic_delta": (
+                    frontier_episodic_delta_flat.detach()
+                ),
+                "context_posterior": posterior_flat.detach(),
+                "context_working_delta": working_delta_snapshot_flat.detach(),
+                "context_retrieve_gate": action_probability_flat[:, 1].detach(),
+                "context_no_write_theta": assimilation_theta_flat.detach(),
+                "context_path_incidence": frontier_flat.path_incidence.detach(),
+                "context_visited_indices": frontier_flat.visited_indices.detach(),
             }
             write_candidates = [int(length) for length in lengths]
         else:
@@ -1777,8 +1844,10 @@ class TrainingWakeMixin:
             harmful_write_counts = write_summary["harmful_write_counts"]
             pending_counts = write_summary["pending_counts"]
         else:
-            # Controller-only/v6 still has version-specific delayed sampling
-            # semantics. Keep that path isolated until its sampler is batched.
+            # Controller-only versions below v6 retain their historical
+            # replay-only scalar contract. v6 is handled by the tensor path
+            # above because its delayed construction/score evidence is fully
+            # tensorized.
             for row, sequence in enumerate(sequences):
                 for request in self._select_adapt_probes(adapt_probes[row]):
                     self._record_adapt_utility(sequence, request)

@@ -5,7 +5,8 @@ from __future__ import annotations
 import random
 from copy import deepcopy
 from collections import defaultdict
-from typing import Any, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
@@ -13,6 +14,42 @@ import torch
 ACTION_NAMES = ("adapt", "retrieve", "write", "split")
 DEFAULT_CAPACITIES = (1024, 1024, 1536, 512)
 DEFAULT_BATCH_SIZES = (64, 64, 96, 32)
+
+
+@dataclass(frozen=True)
+class ReplayTensorBatch:
+    """Columnar replay payload used by the global controller objective.
+
+    The legacy replay API intentionally remains row/dict based for checkpoint
+    compatibility and write-ranking diagnostics.  The hot global path uses
+    this compact representation so it does not rebuild five independent
+    ``torch.stack`` lists or perform a device transfer for every event.
+    """
+
+    inputs: torch.Tensor
+    target: torch.Tensor
+    mask: torch.Tensor
+    utility: torch.Tensor
+    propensity: torch.Tensor
+
+    @property
+    def label_mask(self) -> torch.Tensor:
+        """Compatibility alias used by older objective code."""
+        return self.mask
+
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> "ReplayTensorBatch":
+        return ReplayTensorBatch(
+            inputs=self.inputs.to(device, non_blocking=non_blocking),
+            target=self.target.to(device, non_blocking=non_blocking),
+            mask=self.mask.to(device, non_blocking=non_blocking),
+            utility=self.utility.to(device, non_blocking=non_blocking),
+            propensity=self.propensity.to(device, non_blocking=non_blocking),
+        )
 
 
 def _cpu_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -77,10 +114,10 @@ class ControllerUtilityReplay:
         half = self.capacities[action] // 2
         return max(1, half // 2)  # half storage mode, then positive/negative
 
-    def add(self, row: Mapping[str, Any], action: int) -> None:
+    def _add_stored(self, stored: dict[str, Any], action: int) -> None:
+        """Insert an already CPU-resident row without another device sync."""
         action = int(action)
         if action == 2 and self.write_ranking_enabled:
-            stored = _cpu_row(row)
             group_id = int(stored.get("group_id", stored.get("source_index", -1)))
             stored["group_id"] = group_id
             stored["raw_write_utility"] = float(
@@ -92,10 +129,9 @@ class ControllerUtilityReplay:
             stored["probe_top"] = bool(stored.get("probe_top", False))
             self.write_pending[group_id].append(stored)
             return
-        utility = float(torch.as_tensor(row["utility"])[action])
+        utility = float(torch.as_tensor(stored["utility"])[action])
         sign = int(utility > 0.0)
         key = (action, sign)
-        stored = _cpu_row(row)
         self.seen[key] += 1
         uniform_capacity = self._bucket_capacity(action, False)
         uniform = self.uniform[key]
@@ -108,13 +144,188 @@ class ControllerUtilityReplay:
 
         hard_capacity = self._bucket_capacity(action, True)
         hard = self.hard[key]
-        gate = float(torch.as_tensor(row["gate"])[action])
-        target = float(torch.as_tensor(row["target"])[action])
+        gate = float(torch.as_tensor(stored["gate"])[action])
+        target = float(torch.as_tensor(stored["target"])[action])
         score = abs(gate - target) * max(abs(utility), 1e-12)
         stored["hard_score"] = score
         hard.append(stored)
         hard.sort(key=lambda item: float(item["hard_score"]), reverse=True)
         del hard[hard_capacity:]
+
+    def add(self, row: Mapping[str, Any], action: int) -> None:
+        """Insert one row, retaining the original compatibility API."""
+        self._add_stored(_cpu_row(row), int(action))
+
+    def add_batch(
+        self,
+        inputs: torch.Tensor,
+        utility: torch.Tensor,
+        target: torch.Tensor,
+        label_mask: torch.Tensor,
+        propensity: torch.Tensor,
+        gate: torch.Tensor,
+        action: int,
+        *,
+        metadata: Optional[Mapping[str, Sequence[Any]]] = None,
+    ) -> None:
+        """Insert a batch while transferring the payload to CPU once.
+
+        Reservoir replacement still consumes ``random.Random`` in event order,
+        exactly like :meth:`add`, so the uniform reservoir and its checkpointed
+        RNG stream remain unchanged.  Metadata is supplied as host-side
+        sequences because it is never part of the differentiable payload.
+        """
+        tensors = {
+            "inputs": inputs,
+            "utility": utility,
+            "target": target,
+            "label_mask": label_mask,
+            "propensity": propensity,
+            "gate": gate,
+        }
+        batch_size = int(inputs.size(0))
+        if inputs.ndim != 2:
+            raise ValueError("inputs must have shape [N, features]")
+        for name, value in tensors.items():
+            if value.ndim != 2 or value.size(0) != batch_size:
+                raise ValueError(f"{name} must have shape [N, width]")
+        if utility.size(1) != target.size(1) or utility.size(1) != gate.size(1):
+            raise ValueError("utility, target, and gate widths must match")
+        if metadata is not None:
+            for name, values in metadata.items():
+                if len(values) != batch_size:
+                    raise ValueError(f"metadata[{name!r}] must have length N")
+
+        # All differentiable fields are packed before the single host transfer.
+        # The mask is reconstructed as bool below; its numeric representation is
+        # only an intermediate transport format.
+        payload = torch.cat((
+            inputs.detach(),
+            utility.detach(),
+            target.detach(),
+            label_mask.detach().to(dtype=inputs.dtype),
+            propensity.detach(),
+            gate.detach(),
+        ), dim=1).to("cpu")
+        input_width = inputs.size(1)
+        action_width = utility.size(1)
+        start_utility = input_width
+        start_target = start_utility + action_width
+        start_mask = start_target + action_width
+        start_propensity = start_mask + action_width
+        start_gate = start_propensity + action_width
+        action = int(action)
+
+        def make_stored(row_index: int) -> dict[str, Any]:
+            """Materialize only rows that survive uniform or hard replay."""
+            stored: dict[str, Any] = {
+                "inputs": payload[row_index, :input_width].clone(),
+                "utility": payload[
+                    row_index, start_utility:start_target
+                ].clone(),
+                "target": payload[
+                    row_index, start_target:start_mask
+                ].clone(),
+                "label_mask": payload[
+                    row_index, start_mask:start_propensity
+                ].clone().bool(),
+                "propensity": payload[
+                    row_index, start_propensity:start_gate
+                ].clone(),
+                "gate": payload[row_index, start_gate:].clone(),
+            }
+            if metadata is not None:
+                for name, values in metadata.items():
+                    stored[name] = deepcopy(values[row_index])
+            return stored
+
+        # Grouped Write replay has sequence-level semantics, so retain its
+        # legacy admission path.  It is not the hot Global retrieve path.
+        if action == 2 and self.write_ranking_enabled:
+            for row_index in range(batch_size):
+                self._add_stored(make_stored(row_index), action)
+            return
+
+        utility_values = payload[:, start_utility:start_target]
+        gate_values = payload[:, start_gate:]
+        target_values = payload[:, start_target:start_mask]
+        uniform_assignments = {
+            key: list(self.uniform[key])
+            for key in ((action, 0), (action, 1))
+        }
+        seen = dict(self.seen)
+        # Generate reservoir replacements in the original event order.  This
+        # preserves random.Random's exact stream while avoiding per-event dict
+        # construction and device-to-host scalar conversion.
+        for row_index in range(batch_size):
+            sign = int(float(utility_values[row_index, action]) > 0.0)
+            key = (action, sign)
+            seen[key] += 1
+            uniform = uniform_assignments[key]
+            uniform_capacity = self._bucket_capacity(action, False)
+            if len(uniform) < uniform_capacity:
+                uniform.append(row_index)
+            else:
+                position = self.rng.randrange(seen[key])
+                if position < uniform_capacity:
+                    uniform[position] = row_index
+        self.seen = seen
+
+        row_cache: dict[int, dict[str, Any]] = {}
+
+        def cached_row(row_index: int) -> dict[str, Any]:
+            row = row_cache.get(row_index)
+            if row is None:
+                row = make_stored(row_index)
+                row_cache[row_index] = row
+            return row
+
+        for key, assignments in uniform_assignments.items():
+            self.uniform[key] = [
+                cached_row(value) if isinstance(value, int) else value
+                for value in assignments
+            ]
+
+        # Hard replay is the stable TopK of the previous hard set followed by
+        # this batch.  The stable argsort is algebraically identical to the
+        # old append/sort/trim loop, but performs the expensive ranking once.
+        for sign in (0, 1):
+            key = (action, sign)
+            previous = self.hard[key]
+            previous_scores = torch.tensor(
+                [float(row["hard_score"]) for row in previous],
+                dtype=torch.float64,
+            )
+            new_scores = (
+                (gate_values[:, action].double() - target_values[:, action].double())
+                .abs()
+                * utility_values[:, action].double().abs().clamp_min(1e-12)
+            )
+            row_mask = (
+                utility_values[:, action] > 0.0
+                if sign
+                else utility_values[:, action] <= 0.0
+            )
+            batch_indices = row_mask.nonzero(as_tuple=False).reshape(-1)
+            if batch_indices.numel():
+                new_scores = new_scores.index_select(0, batch_indices)
+            else:
+                new_scores = new_scores[:0]
+            scores = torch.cat((previous_scores, new_scores), dim=0)
+            hard_capacity = self._bucket_capacity(action, True)
+            order = torch.argsort(scores, descending=True, stable=True)
+            selected = order[:hard_capacity].tolist()
+            hard_rows: list[dict[str, Any]] = []
+            previous_count = len(previous)
+            for candidate in selected:
+                score = float(scores[candidate])
+                if candidate < previous_count:
+                    row = previous[candidate]
+                else:
+                    row = cached_row(int(batch_indices[candidate - previous_count]))
+                row["hard_score"] = score
+                hard_rows.append(row)
+            self.hard[key] = hard_rows
 
     @staticmethod
     def _decorate_write_group(
@@ -284,7 +495,7 @@ class ControllerUtilityReplay:
             return self.rng.sample(rows, count)
         return [rows[self.rng.randrange(len(rows))] for _ in range(count)]
 
-    def sample(
+    def _sample_rows(
         self, batch_sizes: Sequence[int] = DEFAULT_BATCH_SIZES
     ) -> list[dict[str, Any]]:
         if len(batch_sizes) != 4:
@@ -312,6 +523,37 @@ class ControllerUtilityReplay:
             output.extend(self._sample_bucket(negative, negative_count))
         self.rng.shuffle(output)
         return output
+
+    def sample(
+        self, batch_sizes: Sequence[int] = DEFAULT_BATCH_SIZES
+    ) -> list[dict[str, Any]]:
+        """Legacy row-oriented sampler."""
+        return self._sample_rows(batch_sizes)
+
+    def sample_batch(
+        self,
+        batch_sizes: Sequence[int] = DEFAULT_BATCH_SIZES,
+        *,
+        pin_memory: bool = False,
+    ) -> ReplayTensorBatch | None:
+        """Sample once and return the differentiable fields in columnar form."""
+        rows = self._sample_rows(batch_sizes)
+        if not rows:
+            return None
+
+        def stack(name: str) -> torch.Tensor:
+            value = torch.stack([row[name] for row in rows])
+            if pin_memory and value.device.type == "cpu":
+                value = value.pin_memory()
+            return value
+
+        return ReplayTensorBatch(
+            inputs=stack("inputs"),
+            target=stack("target"),
+            mask=stack("label_mask").bool(),
+            utility=stack("utility"),
+            propensity=stack("propensity"),
+        )
 
     def state_dict(self) -> dict[str, Any]:
         return {

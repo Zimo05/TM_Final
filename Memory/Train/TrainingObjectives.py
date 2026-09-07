@@ -120,6 +120,115 @@ class TrainingObjectivesMixin:
                 visits[leaf_id] = visits.get(leaf_id, 0) + 1
         return selected
 
+    def _regional_probe_topology(self) -> dict[str, Any]:
+        """Cache topology-only tensors used by the regional probe.
+
+        Probe coverage is deliberately not cached: its visit counters are
+        mutable training state.  Paths, node indices, and padded descendant
+        slots depend only on topology and are therefore safe to reuse across
+        global batches until Sleep changes the tree.
+        """
+        signature = (
+            tuple(self.tree.all_node_ids),
+            tuple(self.tree.internal_ids),
+            tuple(self.tree.leaf_ids),
+            tuple(
+                (leaf_id, tuple(self.tree.node_paths[leaf_id]))
+                for leaf_id in self.tree.leaf_ids
+            ),
+        )
+        cached = getattr(self, "_regional_probe_topology_cache", None)
+        if cached is not None and cached["signature"] == signature:
+            return cached
+
+        node_index = {
+            node_id: index
+            for index, node_id in enumerate(self.tree.all_node_ids)
+        }
+        region_ids: list[str] = []
+        descendants_by_region: list[tuple[str, ...]] = []
+        probe_counts: list[int] = []
+        for coarse_id in self.tree.internal_ids:
+            descendants = tuple(
+                leaf_id
+                for leaf_id in self.tree.leaf_ids
+                if coarse_id in self.tree.node_paths[leaf_id]
+            )
+            if len(descendants) < 2:
+                continue
+            region_ids.append(coarse_id)
+            descendants_by_region.append(descendants)
+            probe_counts.append(self._regional_probe_leaf_count(len(descendants)))
+
+        region_count = len(region_ids)
+        max_descendants = max(
+            (len(value) for value in descendants_by_region),
+            default=0,
+        )
+        max_probe_count = max(probe_counts, default=0)
+        max_path_length = 0
+        for coarse_id, descendants in zip(region_ids, descendants_by_region):
+            for leaf_id in descendants:
+                path = self.tree.node_paths[leaf_id]
+                max_path_length = max(
+                    max_path_length,
+                    len(path) - path.index(coarse_id) - 1,
+                )
+
+        descendant_nodes = torch.full(
+            (region_count, max_descendants),
+            -1,
+            dtype=torch.long,
+        )
+        router_nodes = torch.full(
+            (region_count, max_descendants, max_path_length),
+            -1,
+            dtype=torch.long,
+        )
+        router_targets = torch.full_like(router_nodes, -1)
+        path_valid = torch.zeros_like(router_nodes, dtype=torch.bool)
+        for region_index, (coarse_id, descendants) in enumerate(
+            zip(region_ids, descendants_by_region)
+        ):
+            for leaf_index, leaf_id in enumerate(descendants):
+                descendant_nodes[region_index, leaf_index] = node_index[leaf_id]
+                path = self.tree.node_paths[leaf_id]
+                start = path.index(coarse_id)
+                for path_index in range(start, len(path) - 1):
+                    router_id = path[path_index]
+                    next_id = path[path_index + 1]
+                    router = self.tree.nodes[router_id]
+                    if router.left == next_id:
+                        target = 0
+                    elif router.right == next_id:
+                        target = 1
+                    else:
+                        raise RuntimeError("invalid descendant routing path")
+                    offset = path_index - start
+                    router_nodes[region_index, leaf_index, offset] = (
+                        node_index[router_id]
+                    )
+                    router_targets[region_index, leaf_index, offset] = target
+                    path_valid[region_index, leaf_index, offset] = True
+
+        cached = {
+            "signature": signature,
+            "region_ids": tuple(region_ids),
+            "region_node_indices": torch.tensor(
+                [node_index[node_id] for node_id in region_ids],
+                dtype=torch.long,
+            ),
+            "descendants_by_region": tuple(descendants_by_region),
+            "probe_counts": tuple(probe_counts),
+            "max_probe_count": max_probe_count,
+            "descendant_nodes": descendant_nodes,
+            "router_nodes": router_nodes,
+            "router_targets": router_targets,
+            "path_valid": path_valid,
+        }
+        self._regional_probe_topology_cache = cached
+        return cached
+
     def _regional_probe_objective(
         self,
         memory_output: Mapping[str, Any],
@@ -180,155 +289,189 @@ class TrainingObjectivesMixin:
         sequence_embedding, _ = self._segment_mean(
             sequence_event_embeddings, sequence_index, sequence_count
         )
-        node_index = {
-            node_id: index for index, node_id in enumerate(self.tree.all_node_ids)
-        }
-        cumulative_node = self.tree._node_embedding_table()
-        target_mass = self.tree.frontier_routing._target_leaf_mass_by_id
-
-        query_rows: list[Tensor] = []
-        router_node_rows: list[int] = []
-        target_rows: list[int] = []
-        row_weights: list[Tensor] = []
-        expand_losses: list[Tensor] = []
-        leaf_losses: list[Tensor] = []
-        gain_nodes: list[int] = []
-        gains: list[Tensor] = []
-        expand_probabilities: list[Tensor] = []
-        expand_targets: list[Tensor] = []
-        stop_energies: list[Tensor] = []
-        fine_energies: list[Tensor] = []
-        assignment_confidences: list[Tensor] = []
-        selected_leaf_count = 0
-
-        for coarse_id in self.tree.internal_ids:
-            coarse_index = node_index[coarse_id]
-            coarse_weight = sequence_node_mass[:, coarse_index].detach()
-            total_weight = coarse_weight.sum()
-            if float(total_weight) <= 1e-12:
-                continue
-            descendants = [
-                leaf_id
-                for leaf_id in self.tree.leaf_ids
-                if coarse_id in self.tree.node_paths[leaf_id]
-            ]
-            if len(descendants) < 2:
-                continue
-            selected_leaves = self._least_probed_leaves(descendants)
-            selected_leaf_count += len(selected_leaves)
-            coarse_theta = self.tree.semantic_theta(coarse_id).detach()
-            leaf_theta = torch.stack([
-                self._probe_leaf_local_theta(leaf_id)
-                for leaf_id in selected_leaves
-            ])
-            candidate_theta = torch.cat((
-                coarse_theta[None, :], leaf_theta
-            ), dim=0)[None, :, :].expand(sequence_count, -1, -1)
-            energy = self._probe_sequence_energy(
-                flat, sequence_index, sequence_count, candidate_theta
-            )
-            coarse_energy = energy[:, 0]
-            selected_energy = energy[:, 1:]
-            prior = selected_energy.new_tensor([
-                target_mass.get(leaf_id, 1.0)
-                for leaf_id in selected_leaves
-            ])
-            probe = counterfactual_energy_probe(
-                coarse_energy.detach(),
-                selected_energy.detach(),
-                coarse_weight,
-                prior,
-                teacher_temperature=(
-                    self.wake_config.route_probe_residual_temperature
-                ),
-                gain_temperature=(
-                    self.wake_config.route_probe_gain_temperature
-                ),
-                leaf_smoothing=(
-                    self.wake_config.route_probe_leaf_smoothing
-                ),
-            )
-
-            expansion_logit = self.tree.expansion_predictor(
-                sequence_embedding.detach(),
-                cumulative_node[coarse_index].detach(),
-            )
-            expansion_loss = (
-                coarse_weight
-                * F.binary_cross_entropy_with_logits(
-                    expansion_logit,
-                    probe.expand_target,
-                    reduction="none",
-                )
-            ).sum() / total_weight.clamp_min(1e-12)
-            leaf_loss = (
-                coarse_weight
-                * (
-                    probe.smoothed_leaf_credit * selected_energy
-                ).sum(dim=1)
-            ).sum() / total_weight.clamp_min(1e-12)
-            expand_losses.append(expansion_loss)
-            leaf_losses.append(leaf_loss)
-
-            pooling_weight = (
-                coarse_weight[:, None] * probe.teacher[:, 1:]
-            )
-            leaf_mass = pooling_weight.sum(dim=0)
-            pooled_query = (
-                pooling_weight.transpose(0, 1) @ sequence_embedding
-            ) / leaf_mass.clamp_min(1e-12)[:, None]
-            leaf_fraction = leaf_mass / leaf_mass.sum().clamp_min(1e-12)
-            for leaf_position, leaf_id in enumerate(selected_leaves):
-                path = self.tree.node_paths[leaf_id]
-                start = path.index(coarse_id)
-                for path_position in range(start, len(path) - 1):
-                    router_node_id = path[path_position]
-                    next_node_id = path[path_position + 1]
-                    router_node = self.tree.nodes[router_node_id]
-                    if router_node.left == next_node_id:
-                        target = 0
-                    elif router_node.right == next_node_id:
-                        target = 1
-                    else:
-                        raise RuntimeError("invalid descendant routing path")
-                    query_rows.append(pooled_query[leaf_position])
-                    router_node_rows.append(node_index[router_node_id])
-                    target_rows.append(target)
-                    row_weights.append(leaf_fraction[leaf_position].detach())
-
-            gain_nodes.append(coarse_index)
-            gains.append(probe.observed_gain)
-            expand_probabilities.append(
-                (
-                    coarse_weight * expansion_logit.sigmoid().detach()
-                ).sum() / total_weight.clamp_min(1e-12)
-            )
-            expand_targets.append(
-                (coarse_weight * probe.expand_target).sum()
-                / total_weight.clamp_min(1e-12)
-            )
-            stop_energies.append(
-                (coarse_weight * coarse_energy.detach()).sum()
-                / total_weight.clamp_min(1e-12)
-            )
-            fine_energies.append(
-                (coarse_weight * probe.fine_energy).sum()
-                / total_weight.clamp_min(1e-12)
-            )
-            assignment_confidences.append(
-                (coarse_weight * probe.assignment_confidence).sum()
-                / total_weight.clamp_min(1e-12)
-            )
-
-        if not query_rows:
+        topology = self._regional_probe_topology()
+        region_count = len(topology["region_ids"])
+        if region_count == 0:
             return empty_result()
 
-        query = torch.stack(query_rows)
-        router_nodes = torch.tensor(
-            router_node_rows, device=self.device, dtype=torch.long
+        region_nodes = topology["region_node_indices"].to(self.device)
+        coarse_weight = sequence_node_mass.index_select(
+            1, region_nodes
+        ).transpose(0, 1).detach()
+        total_weight = coarse_weight.sum(dim=1)
+        active_region = total_weight > 1e-12
+        active_count = int(active_region.sum().item())
+        if active_count == 0:
+            return empty_result()
+
+        # The only host-side work left here is the small mutable coverage
+        # policy.  No event rows or per-region energies cross the device
+        # boundary; all active regions share the tensor path below.
+        active_host = active_region.detach().cpu().tolist()
+        selected_by_region: list[list[str]] = []
+        selected_positions = torch.full(
+            (region_count, topology["max_probe_count"]),
+            -1,
+            dtype=torch.long,
+            device=self.device,
         )
-        targets = torch.tensor(target_rows, device=self.device, dtype=torch.long)
-        weights = torch.stack(row_weights)
+        for region_index, descendants in enumerate(
+            topology["descendants_by_region"]
+        ):
+            selected = (
+                self._least_probed_leaves(descendants)
+                if active_host[region_index]
+                else []
+            )
+            selected_by_region.append(selected)
+            position_by_leaf = {
+                leaf_id: position
+                for position, leaf_id in enumerate(descendants)
+            }
+            if selected:
+                selected_positions[region_index, :len(selected)] = (
+                    selected_positions.new_tensor(
+                        [position_by_leaf[leaf_id] for leaf_id in selected]
+                    )
+                )
+
+        cumulative_node = self.tree._node_embedding_table()
+        coarse_theta = torch.stack([
+            self.tree.semantic_theta(region_id).detach()
+            for region_id in topology["region_ids"]
+        ])
+        leaf_theta_rows: list[Tensor] = []
+        for region_index, selected in enumerate(selected_by_region):
+            rows = [
+                self._probe_leaf_local_theta(leaf_id)
+                for leaf_id in selected
+            ]
+            while len(rows) < topology["max_probe_count"]:
+                rows.append(coarse_theta[region_index].detach())
+            leaf_theta_rows.append(torch.stack(rows))
+        leaf_theta = torch.stack(leaf_theta_rows)
+        candidate_theta = torch.cat(
+            (coarse_theta[:, None, :], leaf_theta),
+            dim=1,
+        )
+
+        # Flatten [region, sequence] into the existing segmented energy kernel.
+        region_offsets = torch.arange(
+            region_count, device=self.device, dtype=sequence_index.dtype
+        ).repeat_interleave(sequence_index.numel()) * sequence_count
+        regional_sequence_index = sequence_index.repeat(region_count) + region_offsets
+        regional_flat = {
+            key: value.repeat(
+                (region_count, *([1] * (value.ndim - 1)))
+            )
+            if value.ndim > 0 else value
+            for key, value in flat.items()
+        }
+        regional_theta = candidate_theta[:, None, :, :].expand(
+            region_count,
+            sequence_count,
+            candidate_theta.size(1),
+            candidate_theta.size(2),
+        ).reshape(region_count * sequence_count, candidate_theta.size(1), -1)
+        energy = self._probe_sequence_energy(
+            regional_flat,
+            regional_sequence_index,
+            region_count * sequence_count,
+            regional_theta,
+        ).reshape(region_count, sequence_count, -1)
+        coarse_energy = energy[:, :, 0]
+        selected_energy = energy[:, :, 1:]
+        candidate_valid = selected_positions.ge(0)
+        selected_energy = selected_energy.masked_fill(
+            ~candidate_valid[:, None, :],
+            1e6,
+        )
+
+        target_mass = self.tree.frontier_routing._target_leaf_mass_by_id
+        prior = selected_energy.new_ones(
+            region_count, topology["max_probe_count"]
+        )
+        for region_index, selected in enumerate(selected_by_region):
+            if selected:
+                prior[region_index, :len(selected)] = selected_energy.new_tensor([
+                    target_mass.get(leaf_id, 1.0)
+                    for leaf_id in selected
+                ])
+        probe = counterfactual_energy_probe(
+            coarse_energy.detach(),
+            selected_energy.detach(),
+            coarse_weight,
+            prior,
+            teacher_temperature=(
+                self.wake_config.route_probe_residual_temperature
+            ),
+            gain_temperature=(
+                self.wake_config.route_probe_gain_temperature
+            ),
+            leaf_smoothing=self.wake_config.route_probe_leaf_smoothing,
+        )
+
+        sequence_embedding_batch = sequence_embedding[None, :, :].expand(
+            region_count, -1, -1
+        )
+        region_embedding = cumulative_node.index_select(0, region_nodes).detach()
+        expansion_logit = self.tree.expansion_predictor(
+            sequence_embedding_batch.reshape(-1, sequence_embedding.size(-1)),
+            region_embedding[:, None, :].expand(
+                region_count, sequence_count, -1
+            ).reshape(-1, region_embedding.size(-1)),
+        ).reshape(region_count, sequence_count)
+        safe_total = total_weight.clamp_min(1e-12)
+        expansion_loss_by_region = (
+            coarse_weight
+            * F.binary_cross_entropy_with_logits(
+                expansion_logit,
+                probe.expand_target,
+                reduction="none",
+            )
+        ).sum(dim=1) / safe_total
+        leaf_loss_by_region = (
+            coarse_weight
+            * (probe.smoothed_leaf_credit * selected_energy).sum(dim=-1)
+        ).sum(dim=1) / safe_total
+
+        pooling_weight = coarse_weight[:, :, None] * probe.teacher[:, :, 1:]
+        leaf_mass = pooling_weight.sum(dim=1)
+        pooled_query = torch.einsum(
+            "rsk,sz->rkz", pooling_weight, sequence_embedding
+        ) / leaf_mass.clamp_min(1e-12)[:, :, None]
+        leaf_fraction = leaf_mass / leaf_mass.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        path_router = topology["router_nodes"].to(self.device).gather(
+            1,
+            selected_positions.clamp_min(0)[:, :, None].expand(
+                -1, -1, topology["router_nodes"].size(-1)
+            ),
+        )
+        path_targets = topology["router_targets"].to(self.device).gather(
+            1,
+            selected_positions.clamp_min(0)[:, :, None].expand(
+                -1, -1, topology["router_targets"].size(-1)
+            ),
+        )
+        path_valid = topology["path_valid"].to(self.device).gather(
+            1,
+            selected_positions.clamp_min(0)[:, :, None].expand(
+                -1, -1, topology["path_valid"].size(-1)
+            ),
+        ) & candidate_valid[:, :, None]
+        valid_rows = path_valid.reshape(-1)
+        query = pooled_query[:, :, None, :].expand(
+            region_count,
+            topology["max_probe_count"],
+            path_valid.size(-1),
+            pooled_query.size(-1),
+        ).reshape(-1, pooled_query.size(-1))[valid_rows]
+        router_nodes = path_router.reshape(-1)[valid_rows]
+        targets = path_targets.reshape(-1)[valid_rows]
+        weights = leaf_fraction[:, :, None].expand_as(path_valid).reshape(-1)[
+            valid_rows
+        ].detach()
         child_index = self.tree.frontier_routing._topology_tensors[
             "child_index"
         ].index_select(0, router_nodes)
@@ -352,9 +495,9 @@ class TrainingObjectivesMixin:
         )
         router_loss = (
             weights * F.cross_entropy(logits, targets, reduction="none")
-        ).sum() / max(len(gains), 1)
-        expand_loss = torch.stack(expand_losses).mean()
-        leaf_loss = torch.stack(leaf_losses).mean()
+        ).sum() / active_region.sum().to(weights).clamp_min(1.0)
+        expand_loss = expansion_loss_by_region[active_region].mean()
+        leaf_loss = leaf_loss_by_region[active_region].mean()
         loss = (
             self.wake_config.route_probe_router_weight * router_loss
             + self.wake_config.route_probe_expand_weight * expand_loss
@@ -365,18 +508,26 @@ class TrainingObjectivesMixin:
             "router_loss": router_loss,
             "expand_loss": expand_loss,
             "leaf_loss": leaf_loss,
-            "node_indices": torch.tensor(
-                gain_nodes, device=self.device, dtype=torch.long
-            ),
-            "refinement_gain": torch.stack(gains),
-            "expand_probability": torch.stack(expand_probabilities),
-            "expand_target": torch.stack(expand_targets),
-            "stop_distortion": torch.stack(stop_energies),
-            "leaf_distortion": torch.stack(fine_energies),
-            "assignment_confidence": torch.stack(assignment_confidences),
-            "regions": loss.new_tensor(float(len(gains))).detach(),
-            "router_rows": loss.new_tensor(float(len(query_rows))).detach(),
-            "probe_leaves": loss.new_tensor(float(selected_leaf_count)).detach(),
+            "node_indices": region_nodes[active_region],
+            "refinement_gain": probe.observed_gain[active_region],
+            "expand_probability": (
+                coarse_weight * expansion_logit.sigmoid().detach()
+            ).sum(dim=1).div(safe_total)[active_region],
+            "expand_target": (
+                coarse_weight * probe.expand_target
+            ).sum(dim=1).div(safe_total)[active_region],
+            "stop_distortion": (
+                coarse_weight * coarse_energy.detach()
+            ).sum(dim=1).div(safe_total)[active_region],
+            "leaf_distortion": (
+                coarse_weight * probe.fine_energy
+            ).sum(dim=1).div(safe_total)[active_region],
+            "assignment_confidence": (
+                coarse_weight * probe.assignment_confidence
+            ).sum(dim=1).div(safe_total)[active_region],
+            "regions": active_region.sum().detach().to(loss),
+            "router_rows": path_valid.sum().detach().to(loss),
+            "probe_leaves": candidate_valid.sum().detach().to(loss),
         }
 
     def _batched_local_frontier_objective(
@@ -987,37 +1138,56 @@ class TrainingObjectivesMixin:
                 ])
                 owner_values = owner_indices.detach().cpu().tolist()
                 sequence_values = sequence_index.detach().cpu().tolist()
-                for event_row in range(inputs.size(0)) if train_retrieve else ():
-                    sequence_row = sequence_values[event_row]
-                    sequence = moved_sequences[sequence_row]
-                    utility_row = retrieval_values[event_row]
-                    target_row = retrieval_targets[event_row]
-                    self.controller_utility_replay.add({
-                        "inputs": inputs[event_row],
-                        "utility": utility_row,
-                        "target": target_row,
-                        "label_mask": retrieval_mask[event_row],
-                        "propensity": utility_row.new_ones(4),
-                        "gate": controller_output["probabilities"][event_row].detach(),
-                        "cluster_id": int(torch.as_tensor(sequence.get("cluster_id", -1)).cpu()),
-                        "source_index": int(torch.as_tensor(sequence.get("source_index", -1)).cpu()),
-                        "event_index": int(event_offsets[event_row].detach().cpu()),
-                        "owner_id": self.tree.all_node_ids[owner_values[event_row]],
-                    }, 1)
+                if train_retrieve and inputs.size(0):
+                    # Keep the reservoir's event order and Random stream, but
+                    # move the differentiable payload to CPU exactly once.
+                    cluster_by_sequence = [
+                        int(torch.as_tensor(sequence.get("cluster_id", -1)))
+                        for sequence in moved_sequences
+                    ]
+                    source_by_sequence = [
+                        int(torch.as_tensor(sequence.get("source_index", -1)))
+                        for sequence in moved_sequences
+                    ]
+                    metadata = {
+                        "cluster_id": [
+                            cluster_by_sequence[index]
+                            for index in sequence_values
+                        ],
+                        "source_index": [
+                            source_by_sequence[index]
+                            for index in sequence_values
+                        ],
+                        "event_index": event_offsets.detach().cpu().tolist(),
+                        "owner_id": [
+                            self.tree.all_node_ids[index]
+                            for index in owner_values
+                        ],
+                    }
+                    self.controller_utility_replay.add_batch(
+                        inputs,
+                        retrieval_values,
+                        retrieval_targets,
+                        retrieval_mask,
+                        retrieval_values.new_ones(4).expand_as(retrieval_values),
+                        controller_output["probabilities"].detach(),
+                        1,
+                        metadata=metadata,
+                    )
 
-                replay = self.controller_utility_replay.sample(
-                    self.wake_config.controller_replay_batch_sizes
+                replay_batch = self.controller_utility_replay.sample_batch(
+                    self.wake_config.controller_replay_batch_sizes,
+                    pin_memory=self.device.type == "cuda",
                 )
-                if replay:
-                    # Replay rows may come from a checkpoint loaded with
-                    # ``map_location=self.device`` while rows collected during
-                    # the current epoch are kept on CPU by
-                    # ControllerUtilityReplay.  Move each row before stacking;
-                    # calling ``.to`` on the stacked result is too late when
-                    # the input list contains mixed CPU/CUDA tensors.
-                    replay_inputs = torch.stack([
-                        row["inputs"].to(self.device) for row in replay
-                    ])
+                if replay_batch is not None:
+                    # A pinned columnar payload avoids the old event-level
+                    # ``.to``/``torch.stack`` pipeline.  Checkpoint rows and
+                    # freshly collected rows share the same CPU representation.
+                    replay_batch = replay_batch.to(
+                        self.device,
+                        non_blocking=self.device.type == "cuda",
+                    )
+                    replay_inputs = replay_batch.inputs
                     replay_output = self.controller.action_distribution_batch(
                         replay_inputs[:, 0], replay_inputs[:, 1], replay_inputs[:, 2],
                         update_statistics=False,
@@ -1027,18 +1197,10 @@ class TrainingObjectivesMixin:
                         working_memory_norm=replay_inputs[:, 6],
                         pending_write_ratio=replay_inputs[:, 7],
                     )
-                    targets = torch.stack([
-                        row["target"].to(self.device) for row in replay
-                    ])
-                    masks = torch.stack([
-                        row["label_mask"].to(self.device) for row in replay
-                    ])
-                    utilities = torch.stack([
-                        row["utility"].to(self.device) for row in replay
-                    ])
-                    propensities = torch.stack([
-                        row["propensity"].to(self.device) for row in replay
-                    ])
+                    targets = replay_batch.target
+                    masks = replay_batch.mask
+                    utilities = replay_batch.utility
+                    propensities = replay_batch.propensity
                     weights = self.controller.normalized_inverse_propensity(
                         propensities, masks
                     )

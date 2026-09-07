@@ -581,8 +581,11 @@ class Controller(nn.Module):
                 raw_probabilities[..., action_index],
                 raw_probabilities[..., action_index] * 0.0,
             )
-        if not bool(self.split_enabled):
-            probabilities[..., 3] = raw_probabilities[..., 3] * 0.0
+        # Keep the tensor Wake kernel free of a host-side scalar branch so
+        # ``torch.compile`` can capture the controller gate computation.
+        probabilities[..., 3] = raw_probabilities[..., 3] * self.split_enabled.to(
+            raw_probabilities
+        )
         return {
             "normalized_surprise": normalized,
             "features": features,

@@ -187,16 +187,26 @@ def counterfactual_energy_probe(
     and leaf-local calibration, but cannot move the energy targets merely to
     make their own assignment easier.
     """
-    if coarse_energy.ndim != 1:
-        raise ValueError("coarse_energy must have shape [S]")
-    if leaf_energy.ndim != 2 or leaf_energy.size(0) != coarse_energy.numel():
-        raise ValueError("leaf_energy must have shape [S, Kp]")
-    if leaf_energy.size(1) <= 0:
+    if coarse_energy.ndim < 1:
+        raise ValueError("coarse_energy must have at least one dimension")
+    if (
+        leaf_energy.ndim != coarse_energy.ndim + 1
+        or leaf_energy.shape[:-1] != coarse_energy.shape
+    ):
+        raise ValueError("leaf_energy must have shape coarse_energy.shape + [Kp]")
+    if leaf_energy.size(-1) <= 0:
         raise ValueError("leaf_energy must contain at least one probe leaf")
     if coarse_responsibility.shape != coarse_energy.shape:
-        raise ValueError("coarse_responsibility must have shape [S]")
-    if leaf_prior.shape != (leaf_energy.size(1),):
+        raise ValueError("coarse_responsibility must align with coarse_energy")
+    if leaf_prior.ndim == 1 and leaf_prior.shape != (leaf_energy.size(-1),):
         raise ValueError("leaf_prior must have shape [Kp]")
+    if leaf_prior.ndim > 1:
+        if coarse_energy.ndim < 2 or leaf_prior.shape != (
+            coarse_energy.shape[0], leaf_energy.size(-1)
+        ):
+            raise ValueError(
+                "batched leaf_prior must have shape [R, Kp]"
+            )
     if teacher_temperature <= 0.0 or gain_temperature <= 0.0:
         raise ValueError("probe temperatures must be positive")
     if not 0.0 <= leaf_smoothing < 1.0:
@@ -213,27 +223,27 @@ def counterfactual_energy_probe(
     if (
         not bool(torch.isfinite(leaf_prior).all())
         or bool((leaf_prior < 0.0).any())
-        or float(leaf_prior.sum()) <= 0.0
+        or bool((leaf_prior.sum(dim=-1) <= 0.0).any())
     ):
         raise ValueError("leaf_prior must be finite, non-negative, and nonzero")
 
     with torch.no_grad():
         all_energy = torch.cat(
-            (coarse_energy[:, None], leaf_energy), dim=1
+            (coarse_energy.unsqueeze(-1), leaf_energy), dim=-1
         )
         teacher = F.softmax(
             -all_energy / teacher_temperature,
-            dim=1,
+            dim=-1,
         )
-        expand_target = 1.0 - teacher[:, 0]
+        expand_target = 1.0 - teacher[..., 0]
         # Compute the algebraically identical conditional distribution in its
         # own softmax so a very strong stop option cannot underflow every leaf
         # numerator to zero.
         leaf_credit = F.softmax(
             -leaf_energy / teacher_temperature,
-            dim=1,
+            dim=-1,
         )
-        leaf_count = leaf_energy.size(1)
+        leaf_count = leaf_energy.size(-1)
         smoothed_credit = (
             (1.0 - leaf_smoothing) * leaf_credit
             + leaf_smoothing / float(leaf_count)
@@ -244,21 +254,27 @@ def counterfactual_energy_probe(
             entropy = -(
                 leaf_credit.clamp_min(eps)
                 * leaf_credit.clamp_min(eps).log()
-            ).sum(dim=1)
+            ).sum(dim=-1)
             confidence = (
                 1.0
                 - entropy / coarse_energy.new_tensor(float(leaf_count)).log()
             ).clamp(0.0, 1.0)
-        prior = leaf_prior / leaf_prior.sum().clamp_min(eps)
+        if leaf_prior.ndim == 1:
+            prior = leaf_prior / leaf_prior.sum().clamp_min(eps)
+        else:
+            prior = leaf_prior / leaf_prior.sum(dim=-1, keepdim=True).clamp_min(eps)
+            prior = prior.unsqueeze(-2)
         fine_energy = -gain_temperature * torch.logsumexp(
-            prior.clamp_min(eps).log()[None, :]
+            prior.clamp_min(eps).log()
             - leaf_energy / gain_temperature,
-            dim=1,
+            dim=-1,
         )
         weight = coarse_responsibility
-        observed_gain = (
-            weight * (coarse_energy - fine_energy).clamp_min(0.0)
-        ).sum() / weight.sum().clamp_min(eps)
+        gain = weight * (coarse_energy - fine_energy).clamp_min(0.0)
+        if coarse_energy.ndim == 1:
+            observed_gain = gain.sum() / weight.sum().clamp_min(eps)
+        else:
+            observed_gain = gain.sum(dim=-1) / weight.sum(dim=-1).clamp_min(eps)
     return CounterfactualEnergyProbe(
         teacher=teacher,
         expand_target=expand_target,

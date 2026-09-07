@@ -58,6 +58,111 @@ class TrainingWakeSupportMixin:
             decays=self.hawkes.decays,
         )
 
+    def _wake_step_tensor(
+        self,
+        step_flat: Mapping[str, Tensor],
+        semantic_base: Tensor,
+        episodic_base: Tensor,
+        working_delta: Tensor,
+        novelty: Tensor,
+        similarity_count: Tensor,
+        owner_confidence: Tensor,
+        max_similarity: Tensor,
+        retrieval_residual_norm: Tensor,
+        pending_write_ratio: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Any, Tensor, Tensor]:
+        """Pure tensor Wake transition for one causal time position.
+
+        This intentionally stops before request creation, MemoryBank mutation,
+        topology, replay, and logging.  Fixed-shape DWS batches may opt into
+        compiling this function; variable-length masking and all host-side
+        work remain outside the compiled region.
+        """
+        pre_action_theta = semantic_base + working_delta
+        pre_action_effective = self._effective_parameters_from_theta(
+            pre_action_theta,
+            detach=True,
+        )
+        pre_action_nll = self._batched_sequence_event_nll(
+            step_flat,
+            {"effective_params": pre_action_effective},
+        )
+        controller_output = self.controller.action_distribution_batch(
+            pre_action_nll,
+            novelty,
+            similarity_count,
+            update_statistics=False,
+            owner_confidence=owner_confidence,
+            retrieval_similarity=max_similarity,
+            retrieval_residual_norm=retrieval_residual_norm,
+            working_memory_norm=working_delta.norm(dim=-1),
+            pending_write_ratio=pending_write_ratio,
+        )
+        action_probabilities = controller_output["probabilities"]
+        raw_action_probabilities = controller_output.get(
+            "raw_probabilities",
+            action_probabilities,
+        )
+        gated_theta = (
+            pre_action_theta
+            + action_probabilities[:, 1, None] * episodic_base
+        )
+        gated_effective = self._effective_parameters_from_theta(
+            gated_theta,
+            detach=True,
+        )
+        prediction_nll, working_grad = self._batched_sequence_event_nll_and_grad(
+            step_flat,
+            gated_effective,
+        )
+        return (
+            pre_action_nll,
+            action_probabilities,
+            raw_action_probabilities,
+            gated_effective,
+            prediction_nll,
+            working_grad,
+        )
+
+    @torch.no_grad()
+    def _update_controller_surprise_batch(self, surprise: Tensor) -> None:
+        """Advance controller EMA state outside the compilable Wake kernel."""
+        values = surprise.detach().to(self.controller.surprise_mean)
+        if values.numel() == 0:
+            return
+        decay = self.controller.surprise_ema_decay
+        batch_decay = decay ** values.numel()
+        difference = values - self.controller.surprise_mean
+        self.controller.surprise_mean.mul_(batch_decay).add_(
+            values.mean(),
+            alpha=1.0 - batch_decay,
+        )
+        self.controller.surprise_variance.mul_(batch_decay).add_(
+            difference.square().mean(),
+            alpha=1.0 - batch_decay,
+        )
+        self.controller.surprise_observations.add_(values.numel())
+
+    def _wake_step_tensor_dispatch(self, *args, **kwargs):
+        """Run the tensor Wake step, optionally through ``torch.compile``."""
+        if not getattr(self.wake_config, "compile_wake_step", False):
+            return self._wake_step_tensor(*args, **kwargs)
+        compiled = getattr(self, "_compiled_wake_step", None)
+        if compiled is None:
+            compiler = getattr(torch, "compile", None)
+            if compiler is None:
+                raise RuntimeError("compile_wake_step requires torch.compile")
+            compiled = compiler(
+                self._wake_step_tensor,
+                mode=getattr(
+                    self.wake_config,
+                    "compile_wake_mode",
+                    "reduce-overhead",
+                ),
+            )
+            self._compiled_wake_step = compiled
+        return compiled(*args, **kwargs)
+
     def _move_sequence(self, sequence: Mapping[str, Tensor]) -> Dict[str, Any]:
         if "times" not in sequence or "types" not in sequence:
             raise ValueError("each sequence requires times and types")
@@ -1176,6 +1281,8 @@ class TrainingWakeSupportMixin:
         indices: Tensor,
         *,
         exploration_key: str,
+        exploration_override: Optional[Tensor] = None,
+        propensity_override: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """Pack a tensor-backed probe buffer for a selected subset.
 
@@ -1190,10 +1297,15 @@ class TrainingWakeSupportMixin:
             raise ValueError("probe indices must be a one-dimensional long tensor")
         if indices.numel() == 0:
             return {}
-        exploration = buffer[f"{exploration_key}_exploration"]
-        return {
+        exploration = (
+            buffer[f"{exploration_key}_exploration"]
+            if exploration_override is None
+            else exploration_override
+        )
+        packed = {
             "sequence_rows": buffer["sequence_rows"].index_select(0, indices),
             "event_indices": buffer["event_indices"].index_select(0, indices),
+            "owner_indices": buffer["owner_indices"].index_select(0, indices),
             "queries": buffer["queries"].index_select(0, indices),
             "frontier_node_indices": buffer["frontier_node_indices"].index_select(0, indices),
             "frontier_mask": buffer["frontier_mask"].index_select(0, indices),
@@ -1208,6 +1320,11 @@ class TrainingWakeSupportMixin:
             "assimilation_theta": buffer["assimilation_theta"].index_select(0, indices),
             "assimilation_grad": buffer["assimilation_grad"].index_select(0, indices),
         }
+        if propensity_override is not None:
+            packed["probe_propensity"] = propensity_override.index_select(
+                0, indices
+            )
+        return packed
 
     def _select_probe_buffer_batch(
         self,
@@ -1258,6 +1375,98 @@ class TrainingWakeSupportMixin:
             buffer,
             selected_indices,
             exploration_key=exploration_key,
+        )
+
+    def _select_v6_probe_buffer_batch(
+        self,
+        buffer: Mapping[str, Tensor],
+        *,
+        topc: int,
+        sequence_count: int,
+        eligible_mask: Tensor,
+    ) -> tuple[Tensor, Dict[str, Tensor]]:
+        """Select v6 probes while preserving the scalar exploration RNG.
+
+        Stable Top-C remains a device operation.  Only the small remaining
+        candidate-index list for each sequence crosses to CPU, where v6's
+        historical ``seed + signature`` generator chooses exploration rows.
+        The selected indices are then gathered back into the tensor buffer.
+        """
+        sequence_rows = buffer["sequence_rows"]
+        eligible_mask = eligible_mask.to(
+            device=sequence_rows.device,
+            dtype=torch.bool,
+        )
+        exploration = torch.zeros_like(eligible_mask)
+        propensity = buffer["write_gate"].new_ones(eligible_mask.shape)
+        ordered_indices: list[int] = []
+        for sequence_row in range(int(sequence_count)):
+            candidates = torch.nonzero(
+                (sequence_rows == sequence_row) & eligible_mask,
+                as_tuple=False,
+            ).flatten()
+            if candidates.numel() == 0:
+                continue
+            order = torch.argsort(
+                buffer["write_gate"].index_select(0, candidates),
+                descending=True,
+                stable=True,
+            )
+            ranked = candidates.index_select(0, order)
+            top = ranked[: int(topc)]
+            top_cpu = top.detach().cpu().tolist()
+            ordered_indices.extend(int(index) for index in top_cpu)
+            remaining = ranked[int(topc):]
+            remaining_cpu = remaining.detach().cpu().tolist()
+            count = min(16, len(remaining_cpu))
+            if count == 0:
+                continue
+            signature = sum(
+                int(value)
+                for value in buffer["event_indices"]
+                .index_select(0, candidates)
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(self.training_config.seed) + signature)
+            permutation = torch.randperm(
+                len(remaining_cpu),
+                generator=generator,
+            )[:count].tolist()
+            explored_cpu = [remaining_cpu[index] for index in permutation]
+            explored = torch.as_tensor(
+                explored_cpu,
+                device=sequence_rows.device,
+                dtype=torch.long,
+            )
+            ordered_indices.extend(int(index) for index in explored_cpu)
+            exploration.index_fill_(0, explored, True)
+            propensity.index_fill_(
+                0,
+                explored,
+                propensity.new_full((), count / max(len(remaining_cpu), 1)),
+            )
+
+        if not ordered_indices:
+            empty = torch.empty(
+                0,
+                device=sequence_rows.device,
+                dtype=torch.long,
+            )
+            return empty, {}
+        selected_indices = torch.as_tensor(
+            ordered_indices,
+            device=sequence_rows.device,
+            dtype=torch.long,
+        )
+        return selected_indices, self._pack_probe_buffer(
+            buffer,
+            selected_indices,
+            exploration_key="write",
+            exploration_override=exploration,
+            propensity_override=propensity,
         )
 
     def _materialize_probe_requests_batch(
@@ -1417,7 +1626,10 @@ class TrainingWakeSupportMixin:
         semantic_theta_table: Tensor,
     ) -> Dict[str, Tensor]:
         """Compute v4 Write posterior, residuals, utility and priority for Q rows."""
-        if not requests:
+        if not requests and (
+            "frontier_mass" not in packed
+            or packed["frontier_mass"].numel() == 0
+        ):
             return {}
         D = self.hawkes.num_types
         M = self.hawkes.num_basis
@@ -1508,6 +1720,238 @@ class TrainingWakeSupportMixin:
             "priority": priority,
         }
 
+    def _window_write_evidence_v6_batch(
+        self,
+        buffer: Mapping[str, Tensor],
+        packed: Mapping[str, Tensor],
+        lengths: Sequence[int],
+        padded: Mapping[str, Tensor],
+        semantic_theta_table: Tensor,
+    ) -> Dict[str, Tensor]:
+        """Compute causal v6 Write labels for selected tensor probes.
+
+        v6 builds a residual on ``F=[t, t+H)`` and scores its virtual read on
+        the disjoint ``C=[t+H, t+2H)`` window.  The probe buffer keeps those
+        contexts as tensors; only the eventual top-C rows are materialized as
+        MemoryItems after this method returns.
+        """
+        event_indices = packed["event_indices"]
+        sequence_rows = packed["sequence_rows"]
+        query = packed["queries"]
+        write_gate = packed["write_gate"]
+        probe_count = int(event_indices.numel())
+        if probe_count == 0:
+            return {}
+        h = int(self.wake_config.write_horizon)
+        if h <= 0:
+            raise ValueError("v6 write horizon must be positive")
+
+        # Construction-window posterior and causal owner.
+        frontier_mass = packed["frontier_mass"]
+        frontier_theta = packed["frontier_theta"]
+        frontier_mask = packed["frontier_mask"]
+        Q, K = frontier_mass.shape
+        candidate_rows = sequence_rows[:, None].expand(-1, K).reshape(-1)
+        candidate_starts = event_indices[:, None].expand(-1, K).reshape(-1)
+        frontier_losses, valid = self._batched_window_event_nll(
+            frontier_theta.reshape(Q * K, -1),
+            candidate_starts,
+            candidate_rows,
+            padded,
+            torch.arange(
+                h,
+                device=event_indices.device,
+                dtype=torch.long,
+            ),
+        )
+        frontier_losses = frontier_losses.reshape(Q, K, h)
+        valid = valid.reshape(Q, K, h)
+        valid_count = valid[:, 0].sum(dim=-1).clamp_min(1).to(frontier_losses)
+        construction_energy = frontier_losses.sum(dim=-1) / valid_count[:, None]
+        posterior = self._frontier_posterior(
+            frontier_mass,
+            construction_energy,
+            frontier_mask,
+        )
+        owner_indices, owner_is_lca, confidence = self._posterior_owner_indices_batch(
+            packed["frontier_node_indices"],
+            posterior,
+        )
+
+        D = self.hawkes.num_types
+        M = self.hawkes.num_basis
+        owner_theta = semantic_theta_table.index_select(
+            0, owner_indices.clamp_min(0)
+        )
+        owner_params = HawkesParams(
+            owner_theta[:, :D],
+            owner_theta[:, D:].reshape(Q, D, D, M),
+        )
+        candidate_delta, _ = self.controller._residual_delta_batch(
+            owner_params,
+            padded["times"],
+            padded["types"],
+            event_indices,
+            cached_sequence=padded,
+            sequence_rows=sequence_rows,
+            sequence_lengths=padded["lengths"],
+            window_events=h,
+        )
+
+        # Map each selected probe to its disjoint score-window rows in the
+        # original flat wavefront.  The flat layout is sequence-major, so this
+        # is one arithmetic index construction rather than per-event Python
+        # context objects.
+        offsets = torch.cat((
+            event_indices.new_zeros(1),
+            torch.as_tensor(lengths, device=event_indices.device).cumsum(0)[:-1],
+        ))
+        score_events = event_indices[:, None] + h + torch.arange(
+            h,
+            device=event_indices.device,
+            dtype=torch.long,
+        )[None, :]
+        score_flat_rows = (
+            offsets.index_select(0, sequence_rows)[:, None] + score_events
+        )
+        score_flat = score_flat_rows.reshape(-1)
+        context_semantic = buffer["context_frontier_semantic_theta"].index_select(
+            0, score_flat
+        ).reshape(Q, h, K, -1)
+        context_episodic = buffer["context_frontier_episodic_delta"].index_select(
+            0, score_flat
+        ).reshape(Q, h, K, -1)
+        context_posterior = buffer["context_posterior"].index_select(
+            0, score_flat
+        ).reshape(Q, h, K)
+        context_working = buffer["context_working_delta"].index_select(
+            0, score_flat
+        ).reshape(Q, h, -1)
+        context_retrieve_gate = buffer["context_retrieve_gate"].index_select(
+            0, score_flat
+        ).reshape(Q, h)
+        context_no_write_theta = buffer["context_no_write_theta"].index_select(
+            0, score_flat
+        ).reshape(Q, h, -1)
+        context_queries = buffer["context_queries"].index_select(
+            0, score_flat
+        ).reshape(Q, h, -1)
+        context_path_incidence = buffer["context_path_incidence"].index_select(
+            0, score_flat
+        ).reshape(Q, h, K, -1)
+        context_visited_indices = buffer["context_visited_indices"].index_select(
+            0, score_flat
+        ).reshape(Q, h, -1)
+
+        memory = self.tree.episodic_memory
+        node_ids = tuple(self.tree.all_node_ids)
+        virtual_usage = query.new_ones(Q)
+        before = query.new_zeros(Q)
+        after = query.new_zeros(Q)
+        owner_on_path = torch.zeros(
+            Q,
+            device=query.device,
+            dtype=torch.bool,
+        )
+        virtual_alpha_total = query.new_zeros(Q)
+        for age in range(h):
+            score_query = context_queries[:, age]
+            owner_path = (
+                context_path_incidence[:, age]
+                & context_visited_indices[:, age]
+                .eq(owner_indices[:, None])
+                .unsqueeze(1)
+            ).any(dim=-1)
+            owner_on_path = owner_on_path | owner_path.any(dim=-1)
+
+            base_delta, _ = memory.read_packed(
+                query=score_query,
+                node_indices=owner_indices[:, None],
+                node_mask=torch.ones(
+                    Q,
+                    1,
+                    device=query.device,
+                    dtype=torch.bool,
+                ),
+                node_ids=node_ids,
+                update_state=False,
+            )
+            base_delta = base_delta[:, 0]
+            virtual_delta, virtual_info = (
+                memory.read_nodes_with_virtual_items_batch(
+                    query=score_query,
+                    node_indices=owner_indices,
+                    node_ids=node_ids,
+                    keys=query,
+                    deltas=candidate_delta,
+                    write_quality=write_gate,
+                    virtual_usage=virtual_usage,
+                    virtual_age=query.new_full((Q,), float(age)),
+                )
+            )
+            virtual_alpha = virtual_info["virtual_alpha"]
+            virtual_alpha_total = virtual_alpha_total + virtual_alpha
+            virtual_usage = virtual_usage + virtual_alpha
+
+            episodic = context_episodic[:, age] + (
+                virtual_delta - base_delta
+            )[:, None, :] * owner_path.to(context_episodic.dtype).unsqueeze(-1)
+            virtual_output = {
+                "frontier_semantic_theta": context_semantic[:, age],
+                "frontier_episodic_delta": episodic,
+                "r": context_posterior[:, age],
+            }
+            with_theta = self._controller_effective_parameters(
+                virtual_output,
+                context_working[:, age],
+                context_retrieve_gate[:, age],
+            ).theta
+            score_start = event_indices + h + age
+            before_loss, score_valid = self._batched_window_event_nll(
+                context_no_write_theta[:, age],
+                score_start,
+                sequence_rows,
+                padded,
+                torch.zeros(1, device=query.device, dtype=torch.long),
+            )
+            after_loss, _ = self._batched_window_event_nll(
+                with_theta,
+                score_start,
+                sequence_rows,
+                padded,
+                torch.zeros(1, device=query.device, dtype=torch.long),
+            )
+            valid_score = score_valid[:, 0].to(before.dtype)
+            before = before + before_loss[:, 0] * valid_score
+            after = after + after_loss[:, 0] * valid_score
+
+        raw_gain = before - after
+        raw_gain = torch.where(owner_on_path, raw_gain, raw_gain.new_zeros(()))
+        utility = raw_gain / h - self.wake_config.lambda_write
+        bounded_gain = -torch.expm1(
+            -raw_gain.clamp_min(0.0)
+            / self.wake_config.controller_gain_reference
+        )
+        threshold = self.controller.calibration_thresholds[2].to(write_gate)
+        priority = (
+            (write_gate - threshold).clamp_min(0.0)
+            * confidence
+            * packed["novelty"].clamp(0.0, 1.0)
+        )
+        return {
+            "posterior": posterior,
+            "owner_indices": owner_indices,
+            "owner_is_lca": owner_is_lca,
+            "confidence": confidence,
+            "candidate_delta": candidate_delta,
+            "write_gain": raw_gain,
+            "write_utility": utility,
+            "bounded_gain": bounded_gain,
+            "priority": priority,
+            "virtual_candidate_alpha": virtual_alpha_total / h,
+            "owner_on_score_path": owner_on_path,
+        }
+
     def _update_structural_evidence_buffer(
         self,
         records: Sequence[Mapping[str, Any]],
@@ -1532,7 +1976,7 @@ class TrainingWakeSupportMixin:
         semantic_theta_table: Tensor,
         controller_version: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Batch v4 Write evidence and commit only the segmented top-4 rows."""
+        """Batch delayed Write evidence and commit selected rows."""
         batch_size = len(sequences)
         version = (
             int(controller_version)
@@ -1568,19 +2012,26 @@ class TrainingWakeSupportMixin:
                 weights=(~eligible_mask).to(torch.float32),
                 minlength=batch_size,
             ).to(torch.long).detach().cpu().tolist()
-            selected_indices, packed = self._select_probe_buffer_batch(
-                buffer,
-                topc=self.wake_config.controller_write_probe_topc,
-                score="write",
-                sequence_count=batch_size,
-                exploration_key="write",
-                eligible_mask=eligible_mask,
-            )
-            probe_requests = self._materialize_probe_requests_batch(
-                buffer,
-                selected_indices,
-                exploration_key="write",
-            )
+            if version >= 6 and self.training_config.controller_only_finetune:
+                selected_indices, packed = self._select_v6_probe_buffer_batch(
+                    buffer,
+                    topc=self.wake_config.controller_write_probe_topc,
+                    sequence_count=batch_size,
+                    eligible_mask=eligible_mask,
+                )
+            else:
+                selected_indices, packed = self._select_probe_buffer_batch(
+                    buffer,
+                    topc=self.wake_config.controller_write_probe_topc,
+                    score="write",
+                    sequence_count=batch_size,
+                    exploration_key="write",
+                    eligible_mask=eligible_mask,
+                )
+            # Keep the selected rows tensor-backed through evidence scoring.
+            # MemoryItem/EventWindow objects are created only after the final
+            # admission masks have reduced Q to the physical/shadow rows.
+            probe_requests = None
         else:
             eligible = [
                 request
@@ -1601,7 +2052,10 @@ class TrainingWakeSupportMixin:
                 score="write",
                 sequence_count=batch_size,
             )
-        if not probe_requests:
+        if (
+            (tensor_buffer and selected_indices.numel() == 0)
+            or (not tensor_buffer and not probe_requests)
+        ):
             finalize_write_groups()
             return {
                 "write_counts": [0] * batch_size,
@@ -1616,12 +2070,28 @@ class TrainingWakeSupportMixin:
                 "harmful_write_counts": [0] * batch_size,
                 "pending_counts": incomplete_counts,
             }
-        evidence = self._window_write_evidence_batch(
-            probe_requests,
-            packed,
-            padded,
-            semantic_theta_table,
-        )
+        if tensor_buffer and version >= 6:
+            evidence = self._window_write_evidence_v6_batch(
+                buffer,
+                packed,
+                lengths,
+                padded,
+                semantic_theta_table,
+            )
+        elif tensor_buffer:
+            evidence = self._window_write_evidence_batch(
+                (),
+                packed,
+                padded,
+                semantic_theta_table,
+            )
+        else:
+            evidence = self._window_write_evidence_batch(
+                probe_requests,
+                packed,
+                padded,
+                semantic_theta_table,
+            )
         sequence_rows = packed["sequence_rows"]
         gate_threshold = self.controller.calibration_thresholds[2].to(
             packed["write_gate"]
@@ -1635,14 +2105,28 @@ class TrainingWakeSupportMixin:
             )
         gate_pass = packed["write_gate"] >= gate_threshold
         utility_pass = evidence["write_utility"] > 0.0
-        admissible = (
-            gate_pass
-            & utility_pass
-            & (
+        if version >= 6:
+            # v6 is deployable: admission may use only construction-window
+            # information and the calibrated gate/priority.  The disjoint
+            # score-window utility is a training diagnostic, never an
+            # admission label.
+            admissible = gate_pass & (
                 evidence["priority"]
                 > float(self.wake_config.controller_priority_threshold)
             )
-        )
+            if self.training_config.controller_only_finetune:
+                # Controller-only v6 probes use exploration rows for replay
+                # coverage, never as deployable write decisions.
+                admissible = admissible & ~packed["exploration"]
+        else:
+            admissible = (
+                gate_pass
+                & utility_pass
+                & (
+                    evidence["priority"]
+                    > float(self.wake_config.controller_priority_threshold)
+                )
+            )
         selected = torch.zeros_like(admissible)
         max_writes = min(
             4,
@@ -1661,6 +2145,59 @@ class TrainingWakeSupportMixin:
                 stable=True,
             )
             selected[candidates.index_select(0, order[:max_writes])] = True
+
+        def per_sequence_count(mask: Tensor) -> list[int]:
+            return torch.bincount(
+                sequence_rows,
+                weights=mask.to(packed["write_gate"].dtype),
+                minlength=batch_size,
+            ).detach().cpu().to(torch.long).tolist()
+
+        if version >= 6:
+            # v6 utility is a training-only delayed label.  Replay needs only
+            # the selected Q-row metadata; it does not need one Python request
+            # or MemoryItem for every BT event.
+            utility_requests = [
+                {
+                    "_sequence_row": int(sequence_rows[index].detach().cpu()),
+                    "event_index": int(
+                        packed["event_indices"][index].detach().cpu()
+                    ),
+                    "provisional_owner_id": self.tree.all_node_ids[
+                        int(packed["owner_indices"][index].detach().cpu())
+                    ],
+                }
+                for index in range(int(sequence_rows.numel()))
+            ]
+            self._add_controller_utility_batch(
+                sequences,
+                utility_requests,
+                packed,
+                action_index=2,
+                utility=evidence["write_utility"],
+                propensities=packed.get("probe_propensity"),
+            )
+
+        if self.training_config.controller_only_finetune:
+            # Controller-only fine-tuning never mutates the episodic bank or
+            # creates residual MemoryItems.  Keep the same diagnostics as the
+            # scalar path while retaining only the replay rows above.
+            finalize_write_groups()
+            return {
+                "write_counts": [0] * batch_size,
+                "accepted_write_counts": [0] * batch_size,
+                "append_counts": [0] * batch_size,
+                "refresh_counts": [0] * batch_size,
+                "write_decision_counts": per_sequence_count(selected),
+                "write_probe_counts": per_sequence_count(
+                    torch.ones_like(selected)
+                ),
+                "write_gate_pass_counts": per_sequence_count(gate_pass),
+                "write_utility_pass_counts": per_sequence_count(utility_pass),
+                "accepted_write_utility_sums": [0.0] * batch_size,
+                "harmful_write_counts": [0] * batch_size,
+                "pending_counts": incomplete_counts,
+            }
 
         shadow_priority = (
             packed["queue_weight"]
@@ -1698,6 +2235,11 @@ class TrainingWakeSupportMixin:
             0, selected_indices
         ).detach().cpu().tolist()
         owner_ids = [self.tree.all_node_ids[int(index)] for index in owner_indices_cpu]
+        candidate_window = (
+            self.wake_config.write_horizon
+            if version >= 6
+            else self.wake_config.write_horizon + 1
+        )
         selected_items = []
         if selected_cpu:
             selected_items = self.controller.materialize_residual_memory_items_batch(
@@ -1722,7 +2264,7 @@ class TrainingWakeSupportMixin:
                     0, selected_indices
                 ),
                 sequence_lengths=padded["lengths"],
-                window_events=self.wake_config.write_horizon + 1,
+                window_events=candidate_window,
             )
         shadow_indices = torch.nonzero(
             shadow_selected, as_tuple=False
@@ -1762,7 +2304,7 @@ class TrainingWakeSupportMixin:
                         0, shadow_indices
                     ),
                     sequence_lengths=padded["lengths"],
-                    window_events=self.wake_config.write_horizon + 1,
+                    window_events=candidate_window,
                 )
             )
         # ``selected`` is already sequence-major because requests were packed
@@ -1884,13 +2426,6 @@ class TrainingWakeSupportMixin:
             shadow_records,
             accepted_tokens=accepted_tokens,
         )
-
-        def per_sequence_count(mask: Tensor) -> list[int]:
-            return torch.bincount(
-                sequence_rows,
-                weights=mask.to(packed["write_gate"].dtype),
-                minlength=batch_size,
-            ).detach().cpu().to(torch.long).tolist()
 
         write_probe_counts = torch.bincount(
             sequence_rows, minlength=batch_size
