@@ -41,6 +41,7 @@ class TreeEpisodicMemory(nn.Module):
         init_lambda_usage: float = 0.1,
         init_lambda_age: float = 0.01,
         query_input_dim: Optional[int] = None,
+        continual_memory_age_mode: str = "linear",
     ):
         super().__init__()
         if key_dim <= 0:
@@ -87,7 +88,11 @@ class TreeEpisodicMemory(nn.Module):
             init_tau=init_tau,
             init_lambda_usage=init_lambda_usage,
             init_lambda_age=init_lambda_age,
+            continual_memory_age_mode=continual_memory_age_mode,
         )
+        self.continual_memory_age_mode = "linear"
+        self.memory_mode = "stationary"
+        self.configure_memory_age_mode(continual_memory_age_mode)
         self.banks: Dict[str, MemoryBank] = {}
         # Lazily rebuilt GPU mirror for packed retrieval. Bank dictionaries
         # remain authoritative; tensor identity/version signatures invalidate
@@ -115,6 +120,24 @@ class TreeEpisodicMemory(nn.Module):
     @property
     def device(self) -> torch.device:
         return self._device_anchor.device
+
+    def configure_memory_age_mode(self, mode: str) -> str:
+        """Configure the age penalty for stationary or continual runs."""
+        normalized = str(mode).strip().lower()
+        if normalized in {"continual", "log"}:
+            public_mode = "continual"
+            age_mode = "log"
+        elif normalized in {"stationary", "linear"}:
+            public_mode = "stationary"
+            age_mode = "linear"
+        else:
+            raise ValueError(
+                "memory mode must be one of: continual, stationary"
+            )
+        self.retriever.set_continual_memory_age_mode(age_mode)
+        self.continual_memory_age_mode = age_mode
+        self.memory_mode = public_mode
+        return self.memory_mode
 
     def _apply(self, fn):
         """Make module.to(...) move dynamic memory tensors as well."""
@@ -328,6 +351,44 @@ class TreeEpisodicMemory(nn.Module):
         self._prototype_policy = merged
         for bank in self.banks.values():
             bank.configure_prototype_policy(**merged)
+
+    @torch.no_grad()
+    def snapshot_semantic_references(
+        self,
+        semantic_theta_for_node: Callable[[str], Tensor],
+    ) -> Dict[str, Tensor]:
+        """Snapshot semantic baselines for every non-empty memory bank."""
+        return {
+            node_id: semantic_theta_for_node(node_id).detach().clone()
+            for node_id, bank in self.banks.items()
+            if len(bank) > 0
+        }
+
+    @torch.no_grad()
+    def rebase_semantic_references(
+        self,
+        old_references: Mapping[str, Tensor],
+        semantic_theta_for_node: Callable[[str], Tensor],
+    ) -> None:
+        """Rebase all snapshotted banks to their current semantic baselines.
+
+        The method intentionally does not rebuild law identities.  Each bank
+        row is translated by :meth:`MemoryBank.rebase_reference`, so its
+        effective Hawkes law and all law-derived statistics remain stable.
+        """
+        rebased = False
+        for node_id, theta_old in old_references.items():
+            bank = self.banks.get(node_id)
+            if bank is None or len(bank) == 0:
+                continue
+            bank.rebase_reference(
+                theta_old,
+                semantic_theta_for_node(node_id),
+            )
+            rebased = True
+        if rebased:
+            self._packed_mirror_signature = None
+            self._packed_mirror = None
 
     @torch.no_grad()
     def rebuild_law_keys(

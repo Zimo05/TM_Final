@@ -42,6 +42,7 @@ PROTOTYPE_DUP_THRESHOLD="${PROTOTYPE_DUP_THRESHOLD:-0.98}"
 PROTOTYPE_MODE_THRESHOLD="${PROTOTYPE_MODE_THRESHOLD:-0.90}"
 PROTOTYPE_MODE_CAPACITY="${PROTOTYPE_MODE_CAPACITY:-12}"
 PROTOTYPE_CONTEXT_ALIAS_CAPACITY="${PROTOTYPE_CONTEXT_ALIAS_CAPACITY:-3}"
+ADAPTIVE_HISTORY_SIZE="${ADAPTIVE_HISTORY_SIZE:-64}"
 SPLIT_SEED="${SPLIT_SEED:-42}"
 SPLIT_MANIFEST="${SPLIT_MANIFEST:-$DATA_ROOT/splits/memory_seed${SPLIT_SEED}.json}"
 BASE_CONTROLLER_CHECKPOINT="${BASE_CONTROLLER_CHECKPOINT:-$PROJECT_ROOT/Memory/Checkpoints/dws_17_controller_v4_best.pt}"
@@ -76,23 +77,27 @@ Usage:
   ./run_HM.sh train-attention  Train Attention Encoder (foreground)
   ./run_HM.sh build-h-tree     Generate Data/tree_17/h_tree_17.pt (foreground)
   ./run_HM.sh build-strict-baseline Build leakage-free upstream artifacts in strict_seed${SPLIT_SEED}
-  ./run_HM.sh memory           Start Memory Tree training with nohup (background)
+  ./run_HM.sh memory [mode]    Start Memory Tree training with nohup (background)
   ./run_HM.sh prepare-memory-split  Create the fixed DWS17 train/validation/test split
-  ./run_HM.sh memory-controller     Train Controller v4 with integrated Router/Sleep
-  ./run_HM.sh controller-finetune   Warm-start strict Controller-only v5/v6 training
-  ./run_HM.sh controller-write-rank-finetune  Run Write-only ranking fine-tuning
+  ./run_HM.sh memory-controller [mode]     Train Controller v4 with integrated Router/Sleep
+  ./run_HM.sh controller-finetune [mode]   Warm-start strict Controller-only v5/v6 training
+  ./run_HM.sh controller-write-rank-finetune [mode]  Run Write-only ranking fine-tuning
   ./run_HM.sh inspect-checkpoint    Show Controller/Router/Sleep checkpoint identity
   ./run_HM.sh recalibrate-controller  Jointly recalibrate Controller thresholds
   ./run_HM.sh calibrate-write-rollout Calibrate Write using validation rollouts
   ./run_HM.sh evaluate-controller-quick Evaluate two test sequences per DWS17 cluster
   ./run_HM.sh evaluate-controller-full  Evaluate the complete DWS17 test split
-  ./run_HM.sh all              Run the first four stages, then start Memory in background
+  ./run_HM.sh all [mode]       Run the first four stages, then start Memory in background
   ./run_HM.sh status           Show Memory background-process status
   ./run_HM.sh logs             Follow the Memory training log
   ./run_HM.sh stop             Stop the Memory background process
 
 Optional environment overrides:
   RUN_NAME=name EPOCHS=10 PYTHON=/path/to/python DEVICES=0 ./run_HM.sh <action>
+  ./run_HM.sh memory continual  # continual age penalty: log1p(age)
+  ./run_HM.sh memory stationary  # legacy linear age penalty (default)
+  MEMORY_MODE=continual ./run_HM.sh memory
+  ADAPTIVE_HISTORY_SIZE=64 ./run_HM.sh memory
   MERGE_STALE_WEIGHT=0.2 MERGE_DYNAMICS_WEIGHT=0.25 ./run_HM.sh memory
   BASE_CONTROLLER_CHECKPOINT=/path/model.pt CONTROLLER_VERSION=6 ./run_HM.sh controller-finetune
   # Optional cold-start priors for adaptive two-radius matching:
@@ -306,7 +311,7 @@ start_memory() {
     fi
   fi
 
-  echo "[HM 5/5] Starting integrated Memory training: RUN_NAME=$RUN_NAME"
+  echo "[HM 5/5] Starting integrated Memory training: RUN_NAME=$RUN_NAME mode=$MEMORY_MODE adaptive_history_size=$ADAPTIVE_HISTORY_SIZE"
   # The current CLI accepts this historical Deep-Sleep option as an alias;
   # it also keeps the script compatible with the server's older CLI.
   nohup env \
@@ -321,6 +326,7 @@ start_memory() {
       --h-tree "$H_TREE_OUTPUT" \
       --sequence-summary "$SUMMARY_CSV" \
       --checkpoint "$MEMORY_CHECKPOINT" \
+      --mode "$MEMORY_MODE" \
       "${cli_output_args[@]}" \
       "${controller_args[@]}" \
       --epochs "$training_epochs" \
@@ -332,6 +338,7 @@ start_memory() {
       --prototype-mode-threshold "$PROTOTYPE_MODE_THRESHOLD" \
       --prototype-mode-capacity "$PROTOTYPE_MODE_CAPACITY" \
       --prototype-context-alias-capacity "$PROTOTYPE_CONTEXT_ALIAS_CAPACITY" \
+      --adaptive-history-size "$ADAPTIVE_HISTORY_SIZE" \
       --tree-init-depth 0 \
       --num-basis 2 \
       --decays 0.5 1.5 \
@@ -408,7 +415,7 @@ inspect_checkpoint() {
   require_memory_runtime
   require_file "$MEMORY_CHECKPOINT"
   env PYTHONPATH="$MEMORY_PYTHONPATH" "$PYTHON_BIN" -c \
-    "import torch; p=torch.load(r'$MEMORY_CHECKPOINT',map_location='cpu',weights_only=False); print({'epoch':p.get('epoch'),'format_version':p.get('format_version'),'router':p.get('model_config',{}).get('router_kind'),'controller_version':p.get('controller_state',{}).get('controller_version'),'sleep_keys':[k for k in ('deep_sleep_gate_state_dict','topology_selector_state_dict','sleep_state') if k in p]})"
+    "import torch; p=torch.load(r'$MEMORY_CHECKPOINT',map_location='cpu',weights_only=False); print({'epoch':p.get('epoch'),'format_version':p.get('format_version'),'memory_mode':p.get('model_config',{}).get('memory_mode','stationary'),'router':p.get('model_config',{}).get('router_kind'),'controller_version':p.get('controller_state',{}).get('controller_version'),'sleep_keys':[k for k in ('deep_sleep_gate_state_dict','topology_selector_state_dict','sleep_state') if k in p]})"
 }
 
 recalibrate_controller() {
@@ -489,6 +496,15 @@ stop_memory() {
 }
 
 ACTION="${1:-help}"
+MEMORY_MODE="${MEMORY_MODE:-${2:-stationary}}"
+case "$MEMORY_MODE" in
+  continual|stationary)
+    ;;
+  *)
+    echo "[Error] mode must be 'continual' or 'stationary', got: $MEMORY_MODE" >&2
+    exit 2
+    ;;
+esac
 case "$ACTION" in
   train-thp|train_thp)
     train_thp

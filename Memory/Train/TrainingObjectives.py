@@ -1128,7 +1128,18 @@ class TrainingObjectivesMixin:
                 context="cross-sequence global update",
             )
             max_gradient_norm = max(max_gradient_norm, gradient_norm)
+            # Global optimization moves semantic references. Snapshot the
+            # old coordinate system immediately before the atomic update, then
+            # translate every existing residual before the next batch can
+            # retrieve it. This preserves each effective Hawkes law exactly.
+            old_refs = self.tree.episodic_memory.snapshot_semantic_references(
+                self.tree.semantic_theta
+            )
             self.optimizer.step()
+            self.tree.episodic_memory.rebase_semantic_references(
+                old_refs,
+                self.tree.semantic_theta,
+            )
             reliability = child_teacher_reliability(
                 local["energy_teacher"],
                 local["student"],

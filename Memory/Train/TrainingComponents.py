@@ -237,6 +237,9 @@ class WakeObjectiveConfig:
     # Appended to preserve positional construction of older configs.
     # Accepted-sample calibrated duplicate radius quantile.
     prototype_duplicate_quantile: float = 0.85
+    # Number of recent accepted observations retained by adaptive prototype
+    # statistics. Appended to preserve positional construction of older configs.
+    adaptive_history_size: int = 64
 
 
 @dataclass

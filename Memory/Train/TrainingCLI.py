@@ -50,6 +50,17 @@ def _parse_args():
     )
     parser.add_argument("--resume", default=None)
     parser.add_argument(
+        "--mode",
+        "--memory-mode",
+        dest="mode",
+        choices=("continual", "stationary"),
+        default="stationary",
+        help=(
+            "Memory age profile: continual uses log1p(age), while stationary "
+            "keeps the legacy linear age penalty."
+        ),
+    )
+    parser.add_argument(
         "--training-metrics-path",
         default=None,
         help=(
@@ -98,6 +109,15 @@ def _parse_args():
     parser.add_argument(
         "--prototype-context-alias-capacity", type=int, default=3,
         help="Maximum retrieval/context aliases retained per law prototype.",
+    )
+    parser.add_argument(
+        "--adaptive-history-size",
+        type=int,
+        default=64,
+        help=(
+            "Number of recent accepted observations retained by adaptive "
+            "prototype statistics."
+        ),
     )
     parser.add_argument(
         "--count-similarity-low",
@@ -817,6 +837,8 @@ def main() -> None:
         raise ValueError("--residual-init-rank must be non-negative")
     if args.residual_init_grad_clip < 0.0:
         raise ValueError("--residual-init-grad-clip must be non-negative")
+    if args.adaptive_history_size <= 0:
+        raise ValueError("--adaptive-history-size must be positive")
     if args.alignment_epochs < 0:
         raise ValueError("--alignment-epochs must be non-negative")
     if args.alignment_batch_size <= 0:
@@ -1017,6 +1039,11 @@ def main() -> None:
             args.controller_base_checkpoint,
             device=constructor.device,
         )
+        trainer.tree.configure_memory_age_mode(args.mode)
+        trainer.wake_config.adaptive_history_size = args.adaptive_history_size
+        trainer.tree.episodic_memory.configure_prototype_memory(
+            adaptive_history_size=trainer.wake_config.adaptive_history_size
+        )
         trainer.training_config.epochs = args.epochs
         trainer.training_config.checkpoint_path = args.checkpoint
         trainer.training_config.best_checkpoint_path = args.best_checkpoint
@@ -1092,6 +1119,8 @@ def main() -> None:
             args.resume,
             device=constructor.device,
         )
+        trainer.tree.configure_memory_age_mode(args.mode)
+        trainer.wake_config.adaptive_history_size = args.adaptive_history_size
         trainer.tree.configure_frontier_routing(
             config=FrontierRoutingConfig(
                 frontier_budget=args.frontier_budget,
@@ -1137,7 +1166,8 @@ def main() -> None:
             args.prototype_duplicate_quantile
         )
         trainer.tree.episodic_memory.configure_prototype_memory(
-            duplicate_quantile=trainer.wake_config.prototype_duplicate_quantile
+            duplicate_quantile=trainer.wake_config.prototype_duplicate_quantile,
+            adaptive_history_size=args.adaptive_history_size,
         )
         trainer.wake_config.lambda_route_mi = args.route_mi_weight
         trainer.wake_config.lambda_route_posterior = (
@@ -1286,6 +1316,13 @@ def main() -> None:
         )
     if tree is None:
         raise RuntimeError("tree construction failed")
+    tree.configure_memory_age_mode(args.mode)
+    print(
+        "[Memory age] "
+        f"mode={tree.episodic_memory.memory_mode} "
+        "continual_memory_age_mode="
+        f"{tree.episodic_memory.continual_memory_age_mode}"
+    )
     if args.h_tree is not None:
         from AttentionEncoderAdapter import initialize_tree_from_h_tree_file
 
@@ -1534,6 +1571,7 @@ def main() -> None:
             prototype_duplicate_quantile=args.prototype_duplicate_quantile,
             prototype_mode_capacity=args.prototype_mode_capacity,
             prototype_context_alias_capacity=args.prototype_context_alias_capacity,
+            adaptive_history_size=args.adaptive_history_size,
             lambda_route_mi=args.route_mi_weight,
             lambda_route_posterior=args.route_posterior_weight,
             lambda_route_distill=args.route_distill_weight,

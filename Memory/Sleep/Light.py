@@ -958,7 +958,7 @@ def run_light_sleep(
                 tree.set_semantic_theta(leaf_id, theta_new)
                 # Exact rebasing:
                 # theta_new + delta_new == theta_old + delta_old.
-                bank.deltas.add_(theta_old - theta_new)
+                bank.rebase_reference(theta_old, theta_new)
                 _clear_optimizer_state(
                     optimizer,
                     tree.semantic_offset[leaf_id],

@@ -586,6 +586,7 @@ class SmoothSparseRetriever(nn.Module):
         init_lambda_age: float = 0.01,
         dense_gradient_mass: float = 0.05,
         eps: float = 1e-8,
+        continual_memory_age_mode: str = "linear",
     ):
         super().__init__()
 
@@ -593,12 +594,40 @@ class SmoothSparseRetriever(nn.Module):
             raise ValueError("dense_gradient_mass must be in (0, 1)")
         self.eps = eps
         self.dense_gradient_mass = float(dense_gradient_mass)
+        self.continual_memory_age_mode = self._normalize_age_mode(
+            continual_memory_age_mode
+        )
         self.raw_gamma = nn.Parameter(self._inverse_softplus(init_gamma))
         self.raw_tau = nn.Parameter(self._inverse_softplus(init_tau))
         self.raw_lambda_usage = nn.Parameter(
             self._inverse_softplus(init_lambda_usage)
         )
         self.raw_lambda_age = nn.Parameter(self._inverse_softplus(init_lambda_age))
+
+    @staticmethod
+    def _normalize_age_mode(mode: str) -> str:
+        mode = str(mode).strip().lower()
+        aliases = {
+            "stationary": "linear",
+            "linear": "linear",
+            "continual": "log",
+            "log": "log",
+        }
+        if mode not in aliases:
+            raise ValueError(
+                "continual_memory_age_mode must be one of: "
+                "linear, log"
+            )
+        return aliases[mode]
+
+    def set_continual_memory_age_mode(self, mode: str) -> None:
+        """Select the age penalty while retaining the legacy linear default."""
+        self.continual_memory_age_mode = self._normalize_age_mode(mode)
+
+    def _age_penalty(self, age: Tensor) -> Tensor:
+        if self.continual_memory_age_mode == "log":
+            return torch.log1p(age)
+        return age
 
     def _inverse_softplus(self, value: float) -> Tensor:
         target = torch.tensor(float(value) - self.eps)
@@ -688,7 +717,7 @@ class SmoothSparseRetriever(nn.Module):
         sparse_scores = (
             attn_logits
             - lambda_usage * torch.log1p(usage)
-            - lambda_age * age
+            - lambda_age * self._age_penalty(age)
         )
 
         scaled_scores = sparse_scores / tau
@@ -840,7 +869,7 @@ class SmoothSparseRetriever(nn.Module):
         sparse_scores = (
             attn_logits
             - lambda_usage * torch.log1p(usage)
-            - lambda_age * age
+            - lambda_age * self._age_penalty(age)
         )
         scaled_scores = sparse_scores / tau
         sparse_rho = entmax15_masked(
@@ -3033,6 +3062,48 @@ class MemoryBank:
         if delta > 0 and len(self) > 0:
             self.age.add_(float(delta))
         self._age_reference_clock = current_clock
+
+    @torch.no_grad()
+    def rebase_reference(
+        self,
+        theta_old: Tensor,
+        theta_new: Tensor,
+    ) -> None:
+        """Translate residual coordinates while preserving every law row.
+
+        A memory row represents ``theta_reference + delta_theta``.  When the
+        semantic reference moves, translate all residuals by the opposite
+        shift.  ``law_keys`` deliberately remain untouched: this operation
+        changes only the coordinate system, not the physical Hawkes law.
+        """
+        if len(self) == 0:
+            return
+        theta_old = torch.as_tensor(
+            theta_old,
+            device=self.device,
+            dtype=self.deltas.dtype,
+        ).detach().reshape(-1)
+        theta_new = torch.as_tensor(
+            theta_new,
+            device=self.device,
+            dtype=self.deltas.dtype,
+        ).detach().reshape(-1)
+        if theta_old.numel() != self.param_dim:
+            raise ValueError(
+                f"theta_old must contain {self.param_dim} values"
+            )
+        if theta_new.numel() != self.param_dim:
+            raise ValueError(
+                f"theta_new must contain {self.param_dim} values"
+            )
+        if not bool(torch.isfinite(theta_old).all()) or not bool(
+            torch.isfinite(theta_new).all()
+        ):
+            raise FloatingPointError(
+                "semantic reference contains NaN or Inf"
+            )
+        shift = theta_old - theta_new
+        self.deltas.add_(shift.unsqueeze(0))
 
     def retrieve(
         self,

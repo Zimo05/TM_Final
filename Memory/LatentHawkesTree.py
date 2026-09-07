@@ -240,6 +240,10 @@ class HawkesTree(
         self.frontier_routing.config = config
         self.frontier_routing._reset_target_leaf_mass_from_config()
 
+    def configure_memory_age_mode(self, mode: str) -> str:
+        """Configure stationary or continual episodic-memory age scoring."""
+        return self.episodic_memory.configure_memory_age_mode(mode)
+
     def _frontier_router_logits(
         self,
         samples,
