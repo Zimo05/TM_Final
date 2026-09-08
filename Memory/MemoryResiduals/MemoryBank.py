@@ -938,29 +938,41 @@ class SmoothSparseRetriever(nn.Module):
             )
         else:
             # Frontier rows repeatedly visit the same small set of tree
-            # nodes.  Expanding shared [node, M, P] residual banks to
-            # [visit, M, P] can require several GiB.  Aggregate visits by
-            # source node instead, so the dominant residual tensor remains
-            # shared and peak temporary memory is independent of R * M * P.
-            delta_epi = deltas.new_zeros(
-                query.size(0), deltas.size(-1)
-            )
-            for bank_index in torch.unique(
-                row_bank_indices
-            ).detach().cpu().tolist():
-                rows = torch.nonzero(
-                    row_bank_indices == int(bank_index),
-                    as_tuple=False,
-                ).flatten()
-                # Chunk the output-side matmul as well: a heavily visited
-                # root should not create another full [R, P] temporary.
-                for start in range(0, int(rows.numel()), 1024):
-                    row_chunk = rows[start : start + 1024]
-                    node_delta = (
-                        weighted_alpha.index_select(0, row_chunk)
-                        @ deltas[int(bank_index)]
+            # nodes.  The caller bounds this tensor operation with
+            # ``read_packed``'s retrieval chunk, so gathering only the bank
+            # rows for this chunk is both memory-safe and much cheaper than
+            # synchronizing the accelerator to enumerate unique banks.
+            #
+            # This is the same row-wise operation as
+            # ``weighted_alpha[r] @ deltas[row_bank_indices[r]]``.  Keep a
+            # conservative fallback for direct callers that pass a much
+            # larger batch, so the optimization cannot recreate the old
+            # multi-GiB temporary outside read_packed.
+            if query.size(0) <= 1024:
+                selected_deltas = deltas.index_select(
+                    0, row_bank_indices
+                )
+                delta_epi = torch.bmm(
+                    weighted_alpha.unsqueeze(1), selected_deltas
+                ).squeeze(1)
+            else:
+                # Keep direct callers with a larger row batch bounded too.
+                # Chunking by row position preserves the same independent
+                # bank selection and never enumerates accelerator indices on
+                # the host.
+                delta_chunks = []
+                for start in range(0, query.size(0), 1024):
+                    stop = min(start + 1024, query.size(0))
+                    selected_deltas = deltas.index_select(
+                        0, row_bank_indices[start:stop]
                     )
-                    delta_epi.index_copy_(0, row_chunk, node_delta)
+                    delta_chunks.append(
+                        torch.bmm(
+                            weighted_alpha[start:stop].unsqueeze(1),
+                            selected_deltas,
+                        ).squeeze(1)
+                    )
+                delta_epi = torch.cat(delta_chunks, dim=0)
 
         info = {
             "sim": sim.detach(),

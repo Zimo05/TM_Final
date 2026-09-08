@@ -305,6 +305,15 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--global-retrieval-microbatch",
+        type=int,
+        default=64,
+        help=(
+            "Number of active visited-node rows per inner packed episodic "
+            "retrieval kernel. This bounds MemoryBank workspace."
+        ),
+    )
+    parser.add_argument(
         "--route-balance-max-steps",
         type=int,
         default=8,
@@ -1041,6 +1050,9 @@ def main() -> None:
         )
         trainer.tree.configure_memory_age_mode(args.mode)
         trainer.wake_config.adaptive_history_size = args.adaptive_history_size
+        trainer.wake_config.global_retrieval_microbatch = (
+            args.global_retrieval_microbatch
+        )
         trainer.tree.episodic_memory.configure_prototype_memory(
             adaptive_history_size=trainer.wake_config.adaptive_history_size
         )
@@ -1223,6 +1235,9 @@ def main() -> None:
         )
         trainer.wake_config.retrieval_microbatch = (
             args.retrieval_microbatch
+        )
+        trainer.wake_config.global_retrieval_microbatch = (
+            args.global_retrieval_microbatch
         )
         trainer.wake_config.route_balance_max_steps = (
             args.route_balance_max_steps
@@ -1603,6 +1618,7 @@ def main() -> None:
             route_balance_batch_size=args.route_balance_batch_size,
             wake_wavefront_batch_size=args.wake_wavefront_batch_size,
             retrieval_microbatch=args.retrieval_microbatch,
+            global_retrieval_microbatch=args.global_retrieval_microbatch,
             route_balance_max_steps=args.route_balance_max_steps,
             route_balance_target_kl=args.route_balance_target_kl,
             count_similarity_low=args.count_similarity_low,

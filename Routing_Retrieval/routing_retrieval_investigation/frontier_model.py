@@ -124,6 +124,13 @@ class FrontierBatchOutput:
     episodic_delta_packed: Tensor
     frontier_theta_packed: Tensor
     packed_memory_info: Mapping[str, Tensor]
+    # Optional at the end to preserve positional construction compatibility
+    # for callers that predate Global's shared semantic-table handoff.
+    semantic_theta_table: Optional[Tensor] = None
+    # The Regional Probe reuses the same static tables built for this forward
+    # instead of reconstructing node geometry after Global routing returns.
+    node_embedding_table: Optional[Tensor] = None
+    normalized_node_table: Optional[Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -1146,6 +1153,7 @@ class FrontierRoutingRetrieval(nn.Module):
         precomputed_node_delta: Optional[Tensor] = None,
         precomputed_episodic_delta: Optional[Tensor] = None,
         precomputed_memory_info: Optional[Mapping[str, Tensor]] = None,
+        retrieval_chunk_size: Optional[int] = None,
     ) -> FrontierBatchOutput:
         if static_cache is None:
             static_cache = self.build_static_cache()
@@ -1211,6 +1219,7 @@ class FrontierRoutingRetrieval(nn.Module):
                 node_mask=frontier.visited_mask,
                 node_ids=self.tree.all_node_ids,
                 update_state=update_memory_state,
+                retrieval_chunk_size=retrieval_chunk_size,
             )
         else:
             expected_delta_shape = (
@@ -1443,6 +1452,9 @@ class FrontierRoutingRetrieval(nn.Module):
             visited_node_indices=frontier.visited_indices,
             visited_node_mask=frontier.visited_mask,
             semantic_theta_packed=semantic_theta,
+            semantic_theta_table=semantic_table,
+            node_embedding_table=node_embedding_table,
+            normalized_node_table=static_cache.normalized_node_table,
             episodic_delta_packed=episodic_delta,
             frontier_theta_packed=frontier_theta,
             packed_memory_info=packed_memory_info,

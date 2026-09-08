@@ -124,6 +124,8 @@ class TrainingLifecycleMixin:
             raise ValueError("wake_wavefront_batch_size must be positive")
         if self.wake_config.retrieval_microbatch <= 0:
             raise ValueError("retrieval_microbatch must be positive")
+        if self.wake_config.global_retrieval_microbatch <= 0:
+            raise ValueError("global_retrieval_microbatch must be positive")
         if self.wake_config.route_balance_max_steps <= 0:
             raise ValueError("route_balance_max_steps must be positive")
         if self.wake_config.route_balance_target_kl < 0.0:

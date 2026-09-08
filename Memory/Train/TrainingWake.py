@@ -823,6 +823,9 @@ class TrainingWakeMixin:
                 node_mask=frontier_flat.visited_mask[start:end],
                 node_ids=node_ids,
                 update_state=False,
+                retrieval_chunk_size=(
+                    self.wake_config.global_retrieval_microbatch
+                ),
             )
             node_delta_chunks.append(node_delta)
             episodic_delta_chunks.append(torch.einsum(

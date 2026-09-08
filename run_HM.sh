@@ -43,6 +43,7 @@ PROTOTYPE_MODE_THRESHOLD="${PROTOTYPE_MODE_THRESHOLD:-0.90}"
 PROTOTYPE_MODE_CAPACITY="${PROTOTYPE_MODE_CAPACITY:-12}"
 PROTOTYPE_CONTEXT_ALIAS_CAPACITY="${PROTOTYPE_CONTEXT_ALIAS_CAPACITY:-3}"
 ADAPTIVE_HISTORY_SIZE="${ADAPTIVE_HISTORY_SIZE:-64}"
+GLOBAL_RETRIEVAL_MICROBATCH="${GLOBAL_RETRIEVAL_MICROBATCH:-64}"
 SPLIT_SEED="${SPLIT_SEED:-42}"
 SPLIT_MANIFEST="${SPLIT_MANIFEST:-$DATA_ROOT/splits/memory_seed${SPLIT_SEED}.json}"
 BASE_CONTROLLER_CHECKPOINT="${BASE_CONTROLLER_CHECKPOINT:-$PROJECT_ROOT/Memory/Checkpoints/dws_17_controller_v4_best.pt}"
@@ -379,6 +380,7 @@ start_memory() {
       --route-teacher-temperature 0.85 \
       --route-balance-batch-size 32 \
       --wake-wavefront-batch-size 64 \
+      --global-retrieval-microbatch "$GLOBAL_RETRIEVAL_MICROBATCH" \
       --light-replay-budget 128 \
       --deep-min-interval 3 \
       --deep-computation-cost 0.05 \

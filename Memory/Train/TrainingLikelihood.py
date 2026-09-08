@@ -329,6 +329,59 @@ class TrainingLikelihoodMixin:
         )
         return log_term + integral
 
+    def _batched_raw_event_nll_candidates(
+        self,
+        flat: Mapping[str, Tensor],
+        raw_theta: Tensor,
+        mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Evaluate several raw Hawkes candidates against shared event stats.
+
+        ``raw_theta`` is ``[N, C, P]`` and the returned energy is ``[N, C]``.
+        This is used for Global's detached full/pre/frontier/child teacher
+        calculations.  The candidate axis is only a batching dimension: each
+        candidate still uses the same softplus parameterization, event-type
+        term, and integral as the corresponding standalone implementation.
+        """
+        if raw_theta.ndim != 3 or raw_theta.size(-1) != self.tree.param_dim:
+            raise ValueError("raw candidate theta must have shape [N, C, P]")
+        event_count = flat["types"].numel()
+        if raw_theta.size(0) != event_count:
+            raise ValueError(
+                "raw candidate theta must align with flat event statistics"
+            )
+        if mask is not None:
+            if mask.shape != raw_theta.shape[:2] or mask.dtype != torch.bool:
+                raise ValueError("candidate mask must have shape [N, C]")
+
+        D = self.hawkes.num_types
+        M = self.hawkes.num_basis
+        raw_mu = raw_theta[..., :D]
+        raw_W = raw_theta[..., D:].reshape(
+            raw_theta.size(0), raw_theta.size(1), D, D, M
+        )
+        mu = F.softplus(raw_mu)
+        W = F.softplus(raw_W)
+        history = flat[HAWKES_HISTORY_STATS_KEY]
+        interval = flat[HAWKES_INTERVAL_STATS_KEY]
+        types = flat["types"].long()
+        duration = flat["duration"]
+        intensity = (
+            mu + torch.einsum("ncdem,nem->ncd", W, history)
+        ).clamp_min(1e-8)
+        selected = intensity.gather(
+            2,
+            types[:, None, None].expand(-1, raw_theta.size(1), 1),
+        ).squeeze(2)
+        integral = (
+            mu.sum(dim=-1) * duration[:, None]
+            + torch.einsum("ncdem,nem->nc", W, interval)
+        )
+        energy = -selected.log() + integral
+        if mask is not None:
+            energy = energy.masked_fill(~mask, torch.inf)
+        return energy
+
     def _batched_frontier_event_nll(
         self,
         flat: Mapping[str, Tensor],

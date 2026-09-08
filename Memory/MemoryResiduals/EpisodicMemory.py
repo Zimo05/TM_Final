@@ -358,11 +358,40 @@ class TreeEpisodicMemory(nn.Module):
     @torch.no_grad()
     def snapshot_semantic_references(
         self,
-        semantic_theta_for_node: Callable[[str], Tensor],
+        semantic_theta_for_node: Callable[[str], Tensor] | Tensor,
+        *,
+        node_ids: Optional[Sequence[str]] = None,
     ) -> Dict[str, Tensor]:
-        """Snapshot semantic baselines for every non-empty memory bank."""
+        """Snapshot semantic baselines for every non-empty memory bank.
+
+        ``semantic_theta_for_node`` remains callable for compatibility with
+        sleep and older callers. Global Wake passes one full ``[node, P]``
+        table plus ``node_ids`` so the HyperNet is evaluated once per batch,
+        rather than once for every populated bank.
+        """
+        if torch.is_tensor(semantic_theta_for_node):
+            if node_ids is None:
+                raise ValueError(
+                    "node_ids are required when passing a semantic table"
+                )
+            node_index = {
+                node_id: index for index, node_id in enumerate(node_ids)
+            }
+
+            def semantic_theta_for_node_lookup(node_id: str) -> Tensor:
+                try:
+                    index = node_index[node_id]
+                except KeyError as error:
+                    raise KeyError(
+                        f"semantic table has no node {node_id!r}"
+                    ) from error
+                return semantic_theta_for_node[index]
+
+            lookup = semantic_theta_for_node_lookup
+        else:
+            lookup = semantic_theta_for_node
         return {
-            node_id: semantic_theta_for_node(node_id).detach().clone()
+            node_id: lookup(node_id).detach().clone()
             for node_id, bank in self.banks.items()
             if len(bank) > 0
         }
@@ -371,7 +400,9 @@ class TreeEpisodicMemory(nn.Module):
     def rebase_semantic_references(
         self,
         old_references: Mapping[str, Tensor],
-        semantic_theta_for_node: Callable[[str], Tensor],
+        semantic_theta_for_node: Callable[[str], Tensor] | Tensor,
+        *,
+        node_ids: Optional[Sequence[str]] = None,
     ) -> None:
         """Rebase all snapshotted banks to their current semantic baselines.
 
@@ -379,6 +410,27 @@ class TreeEpisodicMemory(nn.Module):
         row is translated by :meth:`MemoryBank.rebase_reference`, so its
         effective Hawkes law and all law-derived statistics remain stable.
         """
+        if torch.is_tensor(semantic_theta_for_node):
+            if node_ids is None:
+                raise ValueError(
+                    "node_ids are required when passing a semantic table"
+                )
+            node_index = {
+                node_id: index for index, node_id in enumerate(node_ids)
+            }
+
+            def semantic_theta_for_node_lookup(node_id: str) -> Tensor:
+                try:
+                    index = node_index[node_id]
+                except KeyError as error:
+                    raise KeyError(
+                        f"semantic table has no node {node_id!r}"
+                    ) from error
+                return semantic_theta_for_node[index]
+
+            lookup = semantic_theta_for_node_lookup
+        else:
+            lookup = semantic_theta_for_node
         rebased = False
         mirror = self._packed_mirror
         mirror_node_ids = self._packed_mirror_node_ids
@@ -391,7 +443,7 @@ class TreeEpisodicMemory(nn.Module):
             bank = self.banks.get(node_id)
             if bank is None or len(bank) == 0:
                 continue
-            theta_new = semantic_theta_for_node(node_id)
+            theta_new = lookup(node_id)
             bank.rebase_reference(
                 theta_old,
                 theta_new,
@@ -758,6 +810,7 @@ class TreeEpisodicMemory(nn.Module):
         update_state: bool = True,
         keep_gate: Optional[Tensor] = None,
         null_logit: Optional[float | Tensor] = None,
+        retrieval_chunk_size: Optional[int] = None,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """Retrieve all ``prefix × visited-node × bank-row`` entries at once.
 
@@ -775,6 +828,10 @@ class TreeEpisodicMemory(nn.Module):
             raise ValueError("query and visited-node rows must align")
         if len(node_ids) == 0:
             raise ValueError("node_ids cannot be empty")
+        if retrieval_chunk_size is None:
+            retrieval_chunk_size = 64
+        if retrieval_chunk_size <= 0:
+            raise ValueError("retrieval_chunk_size must be positive")
 
         node_count = len(node_ids)
         device = query.device
@@ -834,7 +891,6 @@ class TreeEpisodicMemory(nn.Module):
         # allocation seen in frontier training.  Chunking keeps peak memory
         # independent of the number of visited frontier rows while preserving
         # exactly the same per-row retriever calculation.
-        retrieval_chunk_size = 64
         credit = (
             query.new_zeros(node_count, capacity)
             if update_state

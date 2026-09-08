@@ -327,6 +327,7 @@ class HawkesTree(
         precomputed_node_delta: Optional[torch.Tensor],
         precomputed_episodic_delta: Optional[torch.Tensor],
         precomputed_memory_info: Optional[Mapping[str, torch.Tensor]],
+        retrieval_chunk_size: Optional[int],
     ):
         output = self.frontier_routing(
             z_t,
@@ -343,6 +344,7 @@ class HawkesTree(
             precomputed_node_delta=precomputed_node_delta,
             precomputed_episodic_delta=precomputed_episodic_delta,
             precomputed_memory_info=precomputed_memory_info,
+            retrieval_chunk_size=retrieval_chunk_size,
         )
         batch_size = z_t.size(0)
         frontier_mass = output.frontier_mass
@@ -369,6 +371,25 @@ class HawkesTree(
             - expanded_probability[..., 1].log()
         ).masked_fill(~output.frontier.expanded_mask, 0.0)
         evaluated_mask = output.frontier.expanded_mask
+        node_embedding_table = getattr(output, "node_embedding_table", None)
+        if node_embedding_table is None:
+            # Compatibility with an older external frontier adapter that does
+            # not expose the static tables used during its packed forward.
+            node_embedding_table = self._node_embedding_table()
+        normalized_node_table = getattr(
+            output,
+            "normalized_node_table",
+            None,
+        )
+        if normalized_node_table is None:
+            normalized_node_table = self.router_compat.normalize_nodes(
+                node_embedding_table.detach()
+            )
+        semantic_theta_table = getattr(output, "semantic_theta_table", None)
+        if semantic_theta_table is None:
+            # Compatibility with an older external frontier adapter that does
+            # not expose the table used during its packed forward.
+            semantic_theta_table = self.semantic_theta_table()
         semantic_mix_theta = (
             frontier_mass.unsqueeze(-1) * semantic
         ).sum(dim=1)
@@ -392,6 +413,9 @@ class HawkesTree(
             "effective_params": output.effective_params,
             "episodic_delta": episodic,
             "frontier_semantic_theta": semantic,
+            "semantic_theta_table": semantic_theta_table,
+            "node_embedding_table": node_embedding_table,
+            "normalized_node_table": normalized_node_table,
             "frontier_episodic_delta": episodic,
             "frontier_theta": frontier_theta,
             "frontier_mass": frontier_mass,
@@ -449,6 +473,7 @@ class HawkesTree(
         precomputed_node_delta: Optional[torch.Tensor] = None,
         precomputed_episodic_delta: Optional[torch.Tensor] = None,
         precomputed_memory_info: Optional[Mapping[str, torch.Tensor]] = None,
+        retrieval_chunk_size: Optional[int] = None,
     ):
         return self._forward_frontier(
             z_t,
@@ -465,6 +490,7 @@ class HawkesTree(
             precomputed_node_delta=precomputed_node_delta,
             precomputed_episodic_delta=precomputed_episodic_delta,
             precomputed_memory_info=precomputed_memory_info,
+            retrieval_chunk_size=retrieval_chunk_size,
         )
 
 
