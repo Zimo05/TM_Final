@@ -248,10 +248,6 @@ class TrainingCheckpointMixin:
                 "memory_capacity_per_node": (
                     self.tree.episodic_memory.capacity_per_node
                 ),
-                "memory_mode": self.tree.episodic_memory.memory_mode,
-                "continual_memory_age_mode": (
-                    self.tree.episodic_memory.continual_memory_age_mode
-                ),
                 "tree_temperature": self.tree.temperature,
                 "router_kind": "posterior_frontier_v2",
                 "frontier_routing_config": asdict(

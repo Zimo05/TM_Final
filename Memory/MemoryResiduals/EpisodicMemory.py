@@ -41,7 +41,6 @@ class TreeEpisodicMemory(nn.Module):
         init_lambda_usage: float = 0.1,
         init_lambda_age: float = 0.01,
         query_input_dim: Optional[int] = None,
-        continual_memory_age_mode: str = "linear",
     ):
         super().__init__()
         if key_dim <= 0:
@@ -88,11 +87,7 @@ class TreeEpisodicMemory(nn.Module):
             init_tau=init_tau,
             init_lambda_usage=init_lambda_usage,
             init_lambda_age=init_lambda_age,
-            continual_memory_age_mode=continual_memory_age_mode,
         )
-        self.continual_memory_age_mode = "linear"
-        self.memory_mode = "stationary"
-        self.configure_memory_age_mode(continual_memory_age_mode)
         self.banks: Dict[str, MemoryBank] = {}
         # Lazily rebuilt GPU mirror for packed retrieval. Bank dictionaries
         # remain authoritative; tensor identity/version signatures invalidate
@@ -121,24 +116,6 @@ class TreeEpisodicMemory(nn.Module):
     @property
     def device(self) -> torch.device:
         return self._device_anchor.device
-
-    def configure_memory_age_mode(self, mode: str) -> str:
-        """Configure the age penalty for stationary or continual runs."""
-        normalized = str(mode).strip().lower()
-        if normalized in {"continual", "log"}:
-            public_mode = "continual"
-            age_mode = "log"
-        elif normalized in {"stationary", "linear"}:
-            public_mode = "stationary"
-            age_mode = "linear"
-        else:
-            raise ValueError(
-                "memory mode must be one of: continual, stationary"
-            )
-        self.retriever.set_continual_memory_age_mode(age_mode)
-        self.continual_memory_age_mode = age_mode
-        self.memory_mode = public_mode
-        return self.memory_mode
 
     def _apply(self, fn):
         """Make module.to(...) move dynamic memory tensors as well."""
@@ -302,6 +279,10 @@ class TreeEpisodicMemory(nn.Module):
             base_age[node_index, :width] = bank.age[:width]
             age_reference[node_index] = bank._age_reference_clock
             valid[node_index, :width] = True
+        # Context keys are immutable within a mirror generation.  Normalize
+        # once here instead of repeating the same work for every retrieval
+        # chunk.  Zero padding remains zero under F.normalize.
+        context_keys = F.normalize(context_keys, dim=-1)
         self._packed_mirror = {
             "keys": keys,
             "context_keys": context_keys,
@@ -355,7 +336,6 @@ class TreeEpisodicMemory(nn.Module):
         for bank in self.banks.values():
             bank.configure_prototype_policy(**merged)
 
-    @torch.no_grad()
     def snapshot_semantic_references(
         self,
         semantic_theta_for_node: Callable[[str], Tensor] | Tensor,
@@ -811,6 +791,7 @@ class TreeEpisodicMemory(nn.Module):
         keep_gate: Optional[Tensor] = None,
         null_logit: Optional[float | Tensor] = None,
         retrieval_chunk_size: Optional[int] = None,
+        info_fields: Optional[Sequence[str]] = None,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """Retrieve all ``prefix × visited-node × bank-row`` entries at once.
 
@@ -832,6 +813,24 @@ class TreeEpisodicMemory(nn.Module):
             retrieval_chunk_size = 64
         if retrieval_chunk_size <= 0:
             raise ValueError("retrieval_chunk_size must be positive")
+        available_info_fields = {
+            "alpha",
+            "similarity",
+            "effective_k",
+            "null_alpha",
+            "valid_mask",
+        }
+        requested_info_fields = (
+            available_info_fields
+            if info_fields is None
+            else set(info_fields)
+        )
+        unknown_info_fields = requested_info_fields - available_info_fields
+        if unknown_info_fields:
+            raise ValueError(
+                "unknown packed retrieval info fields: "
+                f"{sorted(unknown_info_fields)}"
+            )
 
         node_count = len(node_ids)
         device = query.device
@@ -868,7 +867,10 @@ class TreeEpisodicMemory(nn.Module):
         )
         gathered_context_valid = context_valid.index_select(0, flat_nodes)
         gathered_context_valid = gathered_context_valid & node_mask.reshape(-1, 1, 1)
-        flat_query = query[:, None, :].expand(
+        # The same query is reused for every visited node and inner retrieval
+        # chunk, so normalize once per input row before expanding it.
+        normalized_query = F.normalize(query, dim=-1)
+        flat_query = normalized_query[:, None, :].expand(
             -1, node_indices.size(1), -1
         ).reshape(-1, self.key_dim)
         active = gathered_valid.any(dim=-1)
@@ -879,12 +881,28 @@ class TreeEpisodicMemory(nn.Module):
         flat_delta = query.new_zeros(
             flat_query.size(0), self.param_dim
         )
-        alpha = query.new_zeros(flat_query.size(0), capacity)
-        similarity = query.new_zeros(flat_query.size(0), capacity)
-        effective_k = torch.zeros(
-            flat_query.size(0), dtype=torch.long, device=device
+        alpha = (
+            query.new_zeros(flat_query.size(0), capacity)
+            if "alpha" in requested_info_fields
+            else None
         )
-        null_alpha = query.new_zeros(flat_query.size(0))
+        similarity = (
+            query.new_zeros(flat_query.size(0), capacity)
+            if "similarity" in requested_info_fields
+            else None
+        )
+        effective_k = (
+            torch.zeros(
+                flat_query.size(0), dtype=torch.long, device=device
+            )
+            if "effective_k" in requested_info_fields
+            else None
+        )
+        null_alpha = (
+            query.new_zeros(flat_query.size(0))
+            if "null_alpha" in requested_info_fields
+            else None
+        )
         # Gather large key/context rows in bounded chunks.  A single
         # ``context_keys.index_select(0, active_nodes)`` still materializes
         # [active_visits, capacity, aliases, key_dim], which is the 5 GiB
@@ -896,6 +914,15 @@ class TreeEpisodicMemory(nn.Module):
             if update_state
             else None
         )
+        retriever_info_fields = set()
+        if alpha is not None or credit is not None:
+            retriever_info_fields.add("alpha")
+        if similarity is not None:
+            retriever_info_fields.add("sim")
+        if effective_k is not None:
+            retriever_info_fields.add("effective_k")
+        if null_alpha is not None:
+            retriever_info_fields.add("null_alpha")
         for start in range(0, int(active_rows.numel()), retrieval_chunk_size):
             stop = min(start + retrieval_chunk_size, int(active_rows.numel()))
             row_chunk = active_rows[start:stop]
@@ -919,16 +946,23 @@ class TreeEpisodicMemory(nn.Module):
                 ),
                 null_logit=null_logit,
                 context_valid=active_context_valid[start:stop],
+                info_fields=retriever_info_fields,
+                query_is_normalized=True,
+                keys_are_normalized=True,
             )
             flat_delta = flat_delta.index_copy(0, row_chunk, retrieved)
-            alpha.index_copy_(0, row_chunk, retrieval_info["alpha"])
-            similarity.index_copy_(0, row_chunk, retrieval_info["sim"])
-            effective_k.index_copy_(
-                0, row_chunk, retrieval_info["effective_k"]
-            )
-            null_alpha.index_copy_(
-                0, row_chunk, retrieval_info["null_alpha"]
-            )
+            if alpha is not None:
+                alpha.index_copy_(0, row_chunk, retrieval_info["alpha"])
+            if similarity is not None:
+                similarity.index_copy_(0, row_chunk, retrieval_info["sim"])
+            if effective_k is not None:
+                effective_k.index_copy_(
+                    0, row_chunk, retrieval_info["effective_k"]
+                )
+            if null_alpha is not None:
+                null_alpha.index_copy_(
+                    0, row_chunk, retrieval_info["null_alpha"]
+                )
             if credit is not None:
                 credit.index_add_(0, node_chunk, retrieval_info["alpha"])
 
@@ -942,17 +976,27 @@ class TreeEpisodicMemory(nn.Module):
                         )
 
         shape = (*node_indices.shape, self.param_dim)
-        info = {
-            "alpha": alpha.reshape(*node_indices.shape, capacity).detach(),
-            "similarity": similarity.reshape(
+        info: Dict[str, Tensor] = {}
+        if alpha is not None:
+            info["alpha"] = alpha.reshape(
                 *node_indices.shape, capacity
-            ).detach(),
-            "effective_k": effective_k.reshape(node_indices.shape).detach(),
-            "null_alpha": null_alpha.reshape(node_indices.shape).detach(),
-            "valid_mask": gathered_valid.reshape(
+            ).detach()
+        if similarity is not None:
+            info["similarity"] = similarity.reshape(
                 *node_indices.shape, capacity
-            ).detach(),
-        }
+            ).detach()
+        if effective_k is not None:
+            info["effective_k"] = effective_k.reshape(
+                node_indices.shape
+            ).detach()
+        if null_alpha is not None:
+            info["null_alpha"] = null_alpha.reshape(
+                node_indices.shape
+            ).detach()
+        if "valid_mask" in requested_info_fields:
+            info["valid_mask"] = gathered_valid.reshape(
+                *node_indices.shape, capacity
+            ).detach()
         return flat_delta.reshape(shape), info
 
     def novelty_count_packed(
@@ -982,10 +1026,9 @@ class TreeEpisodicMemory(nn.Module):
         context_valid = mirror["context_valid"].index_select(0, node_indices)
         valid = mirror["valid"].index_select(0, node_indices)
         normalized_query = F.normalize(query, dim=-1)
-        normalized_keys = F.normalize(keys, dim=-1)
         alias_similarity = torch.einsum(
             "bckd,bd->bck",
-            normalized_keys,
+            keys,
             normalized_query,
         )
         similarity = alias_similarity.masked_fill(
@@ -1353,13 +1396,13 @@ class TreeEpisodicMemory(nn.Module):
         write_quality: Tensor,
         virtual_usage: Tensor,
         virtual_age: Tensor,
+        info_fields: Optional[Sequence[str]] = None,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """Read owner banks with one ephemeral row per query.
 
-        This is the batched equivalent of
-        :meth:`read_node_with_virtual_item`.  The persistent banks remain in
-        the cached padded mirror; only the candidate row is appended per
-        query.  No bank usage, age, or prototype state is mutated.
+        Persistent banks remain in the cached padded mirror; only the
+        candidate row is appended per query. No bank usage, age, or prototype
+        state is mutated.
         """
         if query.ndim != 2 or query.size(-1) != self.key_dim:
             raise ValueError("query must have shape [R, key_dim]")
@@ -1388,12 +1431,8 @@ class TreeEpisodicMemory(nn.Module):
         capacity = int(mirror["deltas"].size(1))
         aliases = int(mirror["context_keys"].size(2))
         base_valid = mirror["valid"].index_select(0, safe_nodes)
-        base_context_valid = mirror["context_valid"].index_select(
-            0, safe_nodes
-        )
-        base_context_keys = mirror["context_keys"].index_select(
-            0, safe_nodes
-        )
+        base_context_valid = mirror["context_valid"].index_select(0, safe_nodes)
+        base_context_keys = mirror["context_keys"].index_select(0, safe_nodes)
         base_deltas = mirror["deltas"].index_select(0, safe_nodes)
         base_quality = mirror["quality"].index_select(0, safe_nodes)
         base_usage = mirror["usage"].index_select(0, safe_nodes)
@@ -1404,25 +1443,22 @@ class TreeEpisodicMemory(nn.Module):
         base_age = mirror["base_age"].index_select(0, safe_nodes)
         base_age = base_age + age_offset[:, None] * base_valid.to(query.dtype)
 
-        virtual_context_keys = query.new_zeros(row_count, 1, aliases, self.key_dim)
+        virtual_context_keys = query.new_zeros(
+            row_count, 1, aliases, self.key_dim
+        )
         virtual_context_keys[:, 0, 0] = F.normalize(keys, dim=-1)
         virtual_context_valid = torch.zeros(
-            row_count,
-            1,
-            aliases,
-            dtype=torch.bool,
-            device=query.device,
+            row_count, 1, aliases, dtype=torch.bool, device=query.device
         )
         virtual_context_valid[:, 0, 0] = True
 
-        all_context_keys = torch.cat(
-            (base_context_keys, virtual_context_keys), dim=1
-        )
-        all_context_valid = torch.cat(
-            (base_context_valid, virtual_context_valid), dim=1
-        )
+        all_context_keys = torch.cat((base_context_keys, virtual_context_keys), dim=1)
+        all_context_valid = torch.cat((base_context_valid, virtual_context_valid), dim=1)
         all_valid = torch.cat(
-            (base_valid, torch.ones(row_count, 1, dtype=torch.bool, device=query.device)),
+            (
+                base_valid,
+                torch.ones(row_count, 1, dtype=torch.bool, device=query.device),
+            ),
             dim=1,
         )
         all_deltas = torch.cat((base_deltas, deltas[:, None, :].to(query)), dim=1)
@@ -1431,8 +1467,13 @@ class TreeEpisodicMemory(nn.Module):
         all_quality = torch.cat(
             (base_quality, write_quality[:, None].to(query)), dim=1
         )
+        requested_info_fields = (
+            None
+            if info_fields is None
+            else tuple(set(info_fields) | {"alpha"})
+        )
         virtual_delta, info = self.retriever.forward_batched(
-            query=query,
+            query=F.normalize(query, dim=-1),
             keys=all_context_keys,
             deltas=all_deltas,
             usage=all_usage,
@@ -1440,6 +1481,9 @@ class TreeEpisodicMemory(nn.Module):
             valid_mask=all_valid,
             write_quality=all_quality,
             context_valid=all_context_valid,
+            info_fields=requested_info_fields,
+            query_is_normalized=True,
+            keys_are_normalized=True,
         )
         info = dict(info)
         info["virtual_alpha"] = info["alpha"][:, capacity]
@@ -1575,6 +1619,9 @@ class TreeEpisodicMemory(nn.Module):
 
     def set_extra_state(self, state) -> None:
         self.banks = {}
+        self._packed_mirror_signature = None
+        self._packed_mirror = None
+        self._packed_mirror_node_ids = None
         # Stored ages are already effective at checkpoint time; rebasing the
         # logical clock to zero preserves all future age differences.
         self._age_clock = 0

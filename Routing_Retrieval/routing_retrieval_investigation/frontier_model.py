@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import inspect
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, Mapping, Optional, Sequence
 
@@ -215,6 +216,9 @@ class FrontierRoutingRetrieval(nn.Module):
         self._topology_tensors: Dict[str, Tensor] = {}
         self._target_leaf_mass_by_id: Dict[str, float] = {}
         self._pending_target_leaf_mass: Optional[tuple[float, ...]] = None
+        self._memory_read_parameters = frozenset(
+            inspect.signature(tree.episodic_memory.read_packed).parameters
+        )
         self._reset_target_leaf_mass_from_config()
 
     @staticmethod
@@ -1154,6 +1158,7 @@ class FrontierRoutingRetrieval(nn.Module):
         precomputed_episodic_delta: Optional[Tensor] = None,
         precomputed_memory_info: Optional[Mapping[str, Tensor]] = None,
         retrieval_chunk_size: Optional[int] = None,
+        retrieval_info_fields: Optional[Sequence[str]] = None,
     ) -> FrontierBatchOutput:
         if static_cache is None:
             static_cache = self.build_static_cache()
@@ -1213,13 +1218,20 @@ class FrontierRoutingRetrieval(nn.Module):
                 raise ValueError(
                     "precomputed_memory_info requires precomputed_node_delta"
                 )
+            read_kwargs = {
+                "query": query,
+                "node_indices": frontier.visited_indices,
+                "node_mask": frontier.visited_mask,
+                "node_ids": self.tree.all_node_ids,
+                "update_state": update_memory_state,
+            }
+            read_parameters = self._memory_read_parameters
+            if "retrieval_chunk_size" in read_parameters:
+                read_kwargs["retrieval_chunk_size"] = retrieval_chunk_size
+            if "info_fields" in read_parameters:
+                read_kwargs["info_fields"] = retrieval_info_fields
             node_delta, packed_memory_info = memory.read_packed(
-                query=query,
-                node_indices=frontier.visited_indices,
-                node_mask=frontier.visited_mask,
-                node_ids=self.tree.all_node_ids,
-                update_state=update_memory_state,
-                retrieval_chunk_size=retrieval_chunk_size,
+                **read_kwargs
             )
         else:
             expected_delta_shape = (
@@ -1241,19 +1253,34 @@ class FrontierRoutingRetrieval(nn.Module):
                     "precomputed_memory_info is required with "
                     "precomputed_node_delta"
                 )
-            for key in (
-                "alpha",
-                "similarity",
-                "effective_k",
-                "null_alpha",
-                "valid_mask",
-            ):
+            required_info_fields = (
+                (
+                    "alpha",
+                    "similarity",
+                    "effective_k",
+                    "null_alpha",
+                    "valid_mask",
+                )
+                if materialize_diagnostics
+                else ()
+            )
+            for key in required_info_fields:
                 value = precomputed_memory_info.get(key)
                 if value is None:
                     raise ValueError(
                         "precomputed_memory_info is missing "
                         f"{key!r}"
                     )
+                if value.shape[:2] != frontier.visited_indices.shape:
+                    raise ValueError(
+                        "precomputed memory info must align with "
+                        "frontier.visited_indices"
+                    )
+                if value.device != z_t.device:
+                    raise ValueError(
+                        "precomputed memory info is on the wrong device"
+                    )
+            for value in precomputed_memory_info.values():
                 if value.shape[:2] != frontier.visited_indices.shape:
                     raise ValueError(
                         "precomputed memory info must align with "

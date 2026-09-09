@@ -1,5 +1,6 @@
 import copy
 import unittest
+from unittest import mock
 
 import torch
 
@@ -12,6 +13,67 @@ from MemoryResiduals.EpisodicMemory import TreeEpisodicMemory
 
 
 class MaskedEntmaxTests(unittest.TestCase):
+    def test_packed_read_materializes_only_requested_info(self):
+        torch.manual_seed(79)
+        memory = TreeEpisodicMemory(
+            key_dim=3,
+            num_event_types=2,
+            num_basis=1,
+            capacity_per_node=5,
+            device="cpu",
+        )
+        memory.add_memory(
+            "root", torch.randn(3), torch.randn(memory.param_dim)
+        )
+        query = torch.randn(2, 3)
+        indices = torch.zeros(2, 1, dtype=torch.long)
+        mask = torch.ones_like(indices, dtype=torch.bool)
+
+        full_delta, full_info = memory.read_packed(
+            query, indices, mask, ("root",), update_state=False
+        )
+        alpha_delta, alpha_info = memory.read_packed(
+            query,
+            indices,
+            mask,
+            ("root",),
+            update_state=False,
+            info_fields=("alpha",),
+        )
+        empty_delta, empty_info = memory.read_packed(
+            query,
+            indices,
+            mask,
+            ("root",),
+            update_state=False,
+            info_fields=(),
+        )
+
+        torch.testing.assert_close(alpha_delta, full_delta)
+        torch.testing.assert_close(empty_delta, full_delta)
+        torch.testing.assert_close(alpha_info["alpha"], full_info["alpha"])
+        self.assertEqual(set(alpha_info), {"alpha"})
+        self.assertEqual(empty_info, {})
+
+        full_credit_memory = copy.deepcopy(memory)
+        empty_credit_memory = copy.deepcopy(memory)
+        full_credit_memory.read_packed(
+            query, indices, mask, ("root",), update_state=True
+        )
+        _, empty_credit_info = empty_credit_memory.read_packed(
+            query,
+            indices,
+            mask,
+            ("root",),
+            update_state=True,
+            info_fields=(),
+        )
+        torch.testing.assert_close(
+            empty_credit_memory.banks["root"].cycle_usage,
+            full_credit_memory.banks["root"].cycle_usage,
+        )
+        self.assertEqual(empty_credit_info, {})
+
     def test_packed_read_with_no_active_memories_stays_zero(self):
         memory = TreeEpisodicMemory(
             key_dim=3,
@@ -335,6 +397,119 @@ class MaskedEntmaxTests(unittest.TestCase):
                 atol=2e-6,
                 rtol=2e-5,
             ))
+
+    def test_indexed_embedding_bag_matches_expanded_bank_and_gradients(self):
+        torch.manual_seed(107)
+        bank_count, row_count = 3, 7
+        width, key_dim, param_dim = 5, 4, 9
+        row_bank_indices = torch.tensor([2, 0, 2, 1, 0, 1, 2])
+        keys = torch.randn(row_count, width, key_dim)
+        usage = torch.rand(row_count, width)
+        age = torch.rand(row_count, width)
+        valid = torch.ones(row_count, width, dtype=torch.bool)
+        indexed_retriever = SmoothSparseRetriever()
+        expanded_retriever = copy.deepcopy(indexed_retriever)
+        indexed_query = torch.randn(
+            row_count, key_dim, requires_grad=True
+        )
+        expanded_query = indexed_query.detach().clone().requires_grad_(True)
+        indexed_deltas = torch.randn(
+            bank_count, width, param_dim, requires_grad=True
+        )
+        expanded_deltas = indexed_deltas.detach().clone().requires_grad_(True)
+
+        indexed, _ = indexed_retriever.forward_batched(
+            query=indexed_query,
+            keys=keys,
+            deltas=indexed_deltas,
+            row_bank_indices=row_bank_indices,
+            usage=usage,
+            age=age,
+            valid_mask=valid,
+            info_fields=(),
+        )
+        expanded, _ = expanded_retriever.forward_batched(
+            query=expanded_query,
+            keys=keys,
+            deltas=expanded_deltas.index_select(0, row_bank_indices),
+            usage=usage,
+            age=age,
+            valid_mask=valid,
+            info_fields=(),
+        )
+        torch.testing.assert_close(indexed, expanded)
+
+        objective_weight = torch.randn_like(indexed)
+        indexed_grad = torch.autograd.grad(
+            (indexed * objective_weight).sum(),
+            (indexed_query, indexed_deltas),
+        )
+        expanded_grad = torch.autograd.grad(
+            (expanded * objective_weight).sum(),
+            (expanded_query, expanded_deltas),
+        )
+        torch.testing.assert_close(indexed_grad[0], expanded_grad[0])
+        torch.testing.assert_close(indexed_grad[1], expanded_grad[1])
+
+    def test_indexed_retrieval_falls_back_for_embedding_bag_autograd_assert(self):
+        """Old torch builds must retain the differentiable shared-bank path."""
+        torch.manual_seed(109)
+        bank_count, row_count = 2, 4
+        width, key_dim, param_dim = 3, 4, 6
+        row_bank_indices = torch.tensor([1, 0, 1, 0])
+        keys = torch.randn(row_count, width, key_dim)
+        usage = torch.rand(row_count, width)
+        age = torch.rand(row_count, width)
+        valid = torch.ones(row_count, width, dtype=torch.bool)
+        fallback_retriever = SmoothSparseRetriever()
+        reference_retriever = copy.deepcopy(fallback_retriever)
+        fallback_query = torch.randn(row_count, key_dim, requires_grad=True)
+        reference_query = fallback_query.detach().clone().requires_grad_(True)
+        fallback_deltas = torch.randn(
+            bank_count, width, param_dim, requires_grad=True
+        )
+        reference_deltas = fallback_deltas.detach().clone().requires_grad_(True)
+
+        with mock.patch.object(
+            torch.nn.functional,
+            "embedding_bag",
+            side_effect=RuntimeError(
+                "isDifferentiableType(variable.scalar_type()) INTERNAL ASSERT FAILED"
+            ),
+        ):
+            fallback, _ = fallback_retriever.forward_batched(
+                query=fallback_query,
+                keys=keys,
+                deltas=fallback_deltas,
+                row_bank_indices=row_bank_indices,
+                usage=usage,
+                age=age,
+                valid_mask=valid,
+                info_fields=(),
+            )
+
+        reference, _ = reference_retriever.forward_batched(
+            query=reference_query,
+            keys=keys,
+            deltas=reference_deltas.index_select(0, row_bank_indices),
+            usage=usage,
+            age=age,
+            valid_mask=valid,
+            info_fields=(),
+        )
+        self.assertFalse(fallback_retriever._embedding_bag_supported)
+        torch.testing.assert_close(fallback, reference)
+        objective_weight = torch.randn_like(fallback)
+        fallback_grad = torch.autograd.grad(
+            (fallback * objective_weight).sum(),
+            (fallback_query, fallback_deltas),
+        )
+        reference_grad = torch.autograd.grad(
+            (reference * objective_weight).sum(),
+            (reference_query, reference_deltas),
+        )
+        torch.testing.assert_close(fallback_grad[0], reference_grad[0])
+        torch.testing.assert_close(fallback_grad[1], reference_grad[1])
 
 
 if __name__ == "__main__":

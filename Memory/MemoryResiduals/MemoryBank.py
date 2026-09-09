@@ -586,7 +586,6 @@ class SmoothSparseRetriever(nn.Module):
         init_lambda_age: float = 0.01,
         dense_gradient_mass: float = 0.05,
         eps: float = 1e-8,
-        continual_memory_age_mode: str = "linear",
     ):
         super().__init__()
 
@@ -594,40 +593,18 @@ class SmoothSparseRetriever(nn.Module):
             raise ValueError("dense_gradient_mass must be in (0, 1)")
         self.eps = eps
         self.dense_gradient_mass = float(dense_gradient_mass)
-        self.continual_memory_age_mode = self._normalize_age_mode(
-            continual_memory_age_mode
-        )
         self.raw_gamma = nn.Parameter(self._inverse_softplus(init_gamma))
         self.raw_tau = nn.Parameter(self._inverse_softplus(init_tau))
         self.raw_lambda_usage = nn.Parameter(
             self._inverse_softplus(init_lambda_usage)
         )
         self.raw_lambda_age = nn.Parameter(self._inverse_softplus(init_lambda_age))
-
-    @staticmethod
-    def _normalize_age_mode(mode: str) -> str:
-        mode = str(mode).strip().lower()
-        aliases = {
-            "stationary": "linear",
-            "linear": "linear",
-            "continual": "log",
-            "log": "log",
-        }
-        if mode not in aliases:
-            raise ValueError(
-                "continual_memory_age_mode must be one of: "
-                "linear, log"
-            )
-        return aliases[mode]
-
-    def set_continual_memory_age_mode(self, mode: str) -> None:
-        """Select the age penalty while retaining the legacy linear default."""
-        self.continual_memory_age_mode = self._normalize_age_mode(mode)
-
-    def _age_penalty(self, age: Tensor) -> Tensor:
-        if self.continual_memory_age_mode == "log":
-            return torch.log1p(age)
-        return age
+        # ``embedding_bag(..., per_sample_weights=...)`` is the fastest path
+        # for shared-bank retrieval, but some older PyTorch builds hit an
+        # autograd internal assertion when the weights require gradients.  The
+        # flag is deliberately not a buffer/state-dict entry: it is a local
+        # runtime capability probe and must be re-evaluated in each process.
+        self._embedding_bag_supported: Optional[bool] = None
 
     def _inverse_softplus(self, value: float) -> Tensor:
         target = torch.tensor(float(value) - self.eps)
@@ -717,7 +694,7 @@ class SmoothSparseRetriever(nn.Module):
         sparse_scores = (
             attn_logits
             - lambda_usage * torch.log1p(usage)
-            - lambda_age * self._age_penalty(age)
+            - lambda_age * age
         )
 
         scaled_scores = sparse_scores / tau
@@ -792,6 +769,9 @@ class SmoothSparseRetriever(nn.Module):
         null_logit: Optional[float | Tensor] = None,
         row_bank_indices: Optional[Tensor] = None,  # [R] into shared B
         context_valid: Optional[Tensor] = None,  # [R, M, K_ctx]
+        info_fields: Optional[Sequence[str]] = None,
+        query_is_normalized: bool = False,
+        keys_are_normalized: bool = False,
     ):
         """Retrieve from padded banks with one independently normalized row.
 
@@ -851,13 +831,40 @@ class SmoothSparseRetriever(nn.Module):
             raise ValueError("query and bank batch dimensions must match")
         if query.shape[-1] != keys.shape[-1]:
             raise ValueError("query/key dimensions must match")
+        available_info_fields = {
+            "sim",
+            "rho",
+            "sparse_rho",
+            "dense_rho",
+            "alpha",
+            "null_alpha",
+            "gamma",
+            "tau",
+            "lambda_usage",
+            "lambda_age",
+            "effective_k",
+            "valid_mask",
+        }
+        requested_info_fields = (
+            available_info_fields
+            if info_fields is None
+            else set(info_fields)
+        )
+        unknown_info_fields = requested_info_fields - available_info_fields
+        if unknown_info_fields:
+            raise ValueError(
+                "unknown retrieval info fields: "
+                f"{sorted(unknown_info_fields)}"
+            )
         gamma = self.positive(self.raw_gamma)
         tau = self.positive(self.raw_tau)
         lambda_usage = self.positive(self.raw_lambda_usage)
         lambda_age = self.positive(self.raw_lambda_age)
 
-        query = F.normalize(query, dim=-1)
-        keys = F.normalize(keys, dim=-1)
+        if not query_is_normalized:
+            query = F.normalize(query, dim=-1)
+        if not keys_are_normalized:
+            keys = F.normalize(keys, dim=-1)
         if keys.ndim == 4:
             alias_sim = torch.einsum("rmkd,rd->rmk", keys, query)
             alias_any = context_valid.any(dim=-1)
@@ -869,7 +876,7 @@ class SmoothSparseRetriever(nn.Module):
         sparse_scores = (
             attn_logits
             - lambda_usage * torch.log1p(usage)
-            - lambda_age * self._age_penalty(age)
+            - lambda_age * age
         )
         scaled_scores = sparse_scores / tau
         sparse_rho = entmax15_masked(
@@ -937,57 +944,81 @@ class SmoothSparseRetriever(nn.Module):
                 "rm,rmp->rp", weighted_alpha, deltas
             )
         else:
-            # Frontier rows repeatedly visit the same small set of tree
-            # nodes.  The caller bounds this tensor operation with
-            # ``read_packed``'s retrieval chunk, so gathering only the bank
-            # rows for this chunk is both memory-safe and much cheaper than
-            # synchronizing the accelerator to enumerate unique banks.
-            #
-            # This is the same row-wise operation as
-            # ``weighted_alpha[r] @ deltas[row_bank_indices[r]]``.  Keep a
-            # conservative fallback for direct callers that pass a much
-            # larger batch, so the optimization cannot recreate the old
-            # multi-GiB temporary outside read_packed.
-            if query.size(0) <= 1024:
+            # Frontier rows repeatedly visit the same small set of tree nodes.
+            # Flatten [node, slot] into one embedding table and perform the
+            # indexed weighted reduction directly on device.  This avoids
+            # materializing selected_deltas [R, M, P], while remaining
+            # algebraically identical to the former index_select + bmm path.
+            capacity = weighted_alpha.size(1)
+            slot_indices = torch.arange(
+                capacity,
+                device=row_bank_indices.device,
+                dtype=row_bank_indices.dtype,
+            )
+            flat_indices = (
+                row_bank_indices[:, None] * capacity
+                + slot_indices[None, :]
+            )
+            if self._embedding_bag_supported is not False:
+                try:
+                    delta_epi = F.embedding_bag(
+                        flat_indices,
+                        deltas.reshape(-1, deltas.size(-1)),
+                        mode="sum",
+                        per_sample_weights=weighted_alpha,
+                    )
+                    self._embedding_bag_supported = True
+                except RuntimeError as exc:
+                    # Older torch/CUDA combinations can raise this internal
+                    # assertion only when per-sample weights participate in
+                    # autograd.  Do not hide unrelated kernel errors.
+                    if "isDifferentiableType" not in str(exc):
+                        raise
+                    self._embedding_bag_supported = False
+                    selected_deltas = deltas.index_select(
+                        0, row_bank_indices
+                    )
+                    delta_epi = torch.bmm(
+                        weighted_alpha.unsqueeze(1), selected_deltas
+                    ).squeeze(1)
+            else:
+                # Exact compatibility fallback.  It has the same weighted
+                # reduction and gradient as embedding_bag, with only the
+                # selected [R, M, P] materialization that the fast path avoids.
                 selected_deltas = deltas.index_select(
                     0, row_bank_indices
                 )
                 delta_epi = torch.bmm(
                     weighted_alpha.unsqueeze(1), selected_deltas
                 ).squeeze(1)
-            else:
-                # Keep direct callers with a larger row batch bounded too.
-                # Chunking by row position preserves the same independent
-                # bank selection and never enumerates accelerator indices on
-                # the host.
-                delta_chunks = []
-                for start in range(0, query.size(0), 1024):
-                    stop = min(start + 1024, query.size(0))
-                    selected_deltas = deltas.index_select(
-                        0, row_bank_indices[start:stop]
-                    )
-                    delta_chunks.append(
-                        torch.bmm(
-                            weighted_alpha[start:stop].unsqueeze(1),
-                            selected_deltas,
-                        ).squeeze(1)
-                    )
-                delta_epi = torch.cat(delta_chunks, dim=0)
 
-        info = {
-            "sim": sim.detach(),
-            "rho": rho.detach(),
-            "sparse_rho": sparse_rho.detach(),
-            "dense_rho": dense_rho.detach(),
-            "alpha": alpha.detach(),
-            "null_alpha": null_alpha.detach(),
-            "gamma": gamma.detach(),
-            "tau": tau.detach(),
-            "lambda_usage": lambda_usage.detach(),
-            "lambda_age": lambda_age.detach(),
-            "effective_k": (sparse_rho > 1e-6).sum(dim=-1).detach(),
-            "valid_mask": valid_mask.detach(),
-        }
+        info: Dict[str, Tensor] = {}
+        if "sim" in requested_info_fields:
+            info["sim"] = sim.detach()
+        if "rho" in requested_info_fields:
+            info["rho"] = rho.detach()
+        if "sparse_rho" in requested_info_fields:
+            info["sparse_rho"] = sparse_rho.detach()
+        if "dense_rho" in requested_info_fields:
+            info["dense_rho"] = dense_rho.detach()
+        if "alpha" in requested_info_fields:
+            info["alpha"] = alpha.detach()
+        if "null_alpha" in requested_info_fields:
+            info["null_alpha"] = null_alpha.detach()
+        if "gamma" in requested_info_fields:
+            info["gamma"] = gamma.detach()
+        if "tau" in requested_info_fields:
+            info["tau"] = tau.detach()
+        if "lambda_usage" in requested_info_fields:
+            info["lambda_usage"] = lambda_usage.detach()
+        if "lambda_age" in requested_info_fields:
+            info["lambda_age"] = lambda_age.detach()
+        if "effective_k" in requested_info_fields:
+            info["effective_k"] = (
+                sparse_rho > 1e-6
+            ).sum(dim=-1).detach()
+        if "valid_mask" in requested_info_fields:
+            info["valid_mask"] = valid_mask.detach()
         return delta_epi, info
 
 
@@ -3075,7 +3106,6 @@ class MemoryBank:
             self.age.add_(float(delta))
         self._age_reference_clock = current_clock
 
-    @torch.no_grad()
     def rebase_reference(
         self,
         theta_old: Tensor,

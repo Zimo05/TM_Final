@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 from Train.TrainingComponents import *  # noqa: F403
 from Train.TrainingComponents import _assert_finite_without_cuda_sync
 
@@ -812,39 +814,94 @@ class TrainingWakeMixin:
 
         memory = self.tree.episodic_memory
         node_ids = tuple(self.tree.all_node_ids)
-        node_delta_chunks: list[Tensor] = []
-        episodic_delta_chunks: list[Tensor] = []
-        info_chunks: Dict[str, list[Tensor]] = {}
+        visited_width = int(frontier_flat.visited_indices.size(1))
+        frontier_width = int(frontier_flat.path_incidence.size(1))
+        capacity = int(
+            memory._packed_bank_mirror(node_ids, query_flat)["deltas"].size(1)
+        )
+        node_delta_flat = query_flat.new_empty(
+            row_count, visited_width, memory.param_dim
+        )
+        episodic_delta_flat = query_flat.new_empty(
+            row_count, frontier_width, memory.param_dim
+        )
+        # Wake applies retrieval credit after the causal transaction and only
+        # consumes alpha.  Preallocate that one diagnostic instead of growing
+        # per-microbatch lists for all packed fields.
+        alpha_flat = query_flat.new_empty(
+            row_count, visited_width, capacity
+        )
+        read_parameters = inspect.signature(memory.read_packed).parameters
+        supports_info_fields = "info_fields" in read_parameters
+        supports_chunk_size = "retrieval_chunk_size" in read_parameters
+        frontier_parameters = inspect.signature(
+            self.tree.frontier_routing.forward
+        ).parameters
+        # A legacy routing adapter validates the complete packed diagnostic
+        # mapping even when diagnostics are disabled. Keep its compatibility
+        # contract while allowing the current adapter to use alpha-only.
+        alpha_only = (
+            supports_info_fields
+            and "retrieval_info_fields" in frontier_parameters
+        )
+        packed_info_flat: Dict[str, Tensor] = {"alpha": alpha_flat}
+        if not alpha_only:
+            packed_info_flat.update({
+                "similarity": query_flat.new_empty(
+                    row_count, visited_width, capacity
+                ),
+                "effective_k": torch.empty(
+                    row_count,
+                    visited_width,
+                    dtype=torch.long,
+                    device=query_flat.device,
+                ),
+                "null_alpha": query_flat.new_empty(
+                    row_count, visited_width
+                ),
+                "valid_mask": torch.empty(
+                    row_count,
+                    visited_width,
+                    capacity,
+                    dtype=torch.bool,
+                    device=query_flat.device,
+                ),
+            })
         for start in range(0, row_count, microbatch):
             end = min(start + microbatch, row_count)
-            node_delta, packed_info = memory.read_packed(
-                query=query_flat[start:end],
-                node_indices=frontier_flat.visited_indices[start:end],
-                node_mask=frontier_flat.visited_mask[start:end],
-                node_ids=node_ids,
-                update_state=False,
-                retrieval_chunk_size=(
+            read_kwargs = {
+                "query": query_flat[start:end],
+                "node_indices": frontier_flat.visited_indices[start:end],
+                "node_mask": frontier_flat.visited_mask[start:end],
+                "node_ids": node_ids,
+                "update_state": False,
+            }
+            if supports_chunk_size:
+                read_kwargs["retrieval_chunk_size"] = (
                     self.wake_config.global_retrieval_microbatch
-                ),
-            )
-            node_delta_chunks.append(node_delta)
-            episodic_delta_chunks.append(torch.einsum(
+                )
+            if supports_info_fields:
+                read_kwargs["info_fields"] = (
+                    ("alpha",) if alpha_only else None
+                )
+            node_delta, packed_info = memory.read_packed(**read_kwargs)
+            node_delta_flat[start:end] = node_delta
+            episodic_delta_flat[start:end] = torch.einsum(
                 "nkv,nvp->nkp",
                 frontier_flat.path_incidence[start:end].to(
                     node_delta.dtype
                 ),
                 node_delta,
-            ))
-            for key, value in packed_info.items():
-                info_chunks.setdefault(key, []).append(value)
+            )
+            alpha_flat[start:end] = packed_info["alpha"]
+            for key, value in packed_info_flat.items():
+                if key != "alpha":
+                    value[start:end] = packed_info[key]
 
         return (
-            torch.cat(node_delta_chunks, dim=0),
-            torch.cat(episodic_delta_chunks, dim=0),
-            {
-                key: torch.cat(values, dim=0)
-                for key, values in info_chunks.items()
-            },
+            node_delta_flat,
+            episodic_delta_flat,
+            packed_info_flat,
         )
 
     def train_wake_batch(

@@ -44,7 +44,6 @@ class TrainingLifecycleMixin:
             mode_threshold=self.wake_config.prototype_mode_threshold,
             duplicate_quantile=self.wake_config.prototype_duplicate_quantile,
             mode_capacity=self.wake_config.prototype_mode_capacity,
-            adaptive_history_size=self.wake_config.adaptive_history_size,
             context_alias_capacity=(
                 self.wake_config.prototype_context_alias_capacity
             ),
@@ -125,7 +124,9 @@ class TrainingLifecycleMixin:
         if self.wake_config.retrieval_microbatch <= 0:
             raise ValueError("retrieval_microbatch must be positive")
         if self.wake_config.global_retrieval_microbatch <= 0:
-            raise ValueError("global_retrieval_microbatch must be positive")
+            raise ValueError(
+                "global_retrieval_microbatch must be positive"
+            )
         if self.wake_config.route_balance_max_steps <= 0:
             raise ValueError("route_balance_max_steps must be positive")
         if self.wake_config.route_balance_target_kl < 0.0:
@@ -752,12 +753,6 @@ class TrainingLifecycleMixin:
                 "checkpoint contains unexpected model tensors: "
                 f"{incompatible.unexpected_keys}"
             )
-        tree.configure_memory_age_mode(
-            config.get(
-                "memory_mode",
-                config.get("continual_memory_age_mode", "stationary"),
-            )
-        )
         tree.semantic_blend = float(config.get("semantic_blend", 0.0))
         tree.initialization_metadata = dict(
             config.get("initialization_metadata", {})

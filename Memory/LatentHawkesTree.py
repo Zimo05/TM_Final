@@ -13,7 +13,8 @@ existing checkpoint keys and external imports remain compatible.
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Optional
+import inspect
+from typing import Dict, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -184,6 +185,15 @@ class HawkesTree(
                 routing_temperature=float(temperature),
             ),
         )
+        # Optional retrieval kwargs are negotiated once at construction time
+        # because the adapter may come from either the current or the legacy
+        # routing package. Do not run inspect.signature in the Wake event loop.
+        self._frontier_forward_parameters = frozenset(
+            inspect.signature(self.frontier_routing.forward).parameters
+        )
+        self._memory_read_parameters = frozenset(
+            inspect.signature(self.episodic_memory.read_packed).parameters
+        )
         register_pre_hook = getattr(
             self,
             "register_load_state_dict_pre_hook",
@@ -239,10 +249,6 @@ class HawkesTree(
         self.frontier_routing._sync_topology()
         self.frontier_routing.config = config
         self.frontier_routing._reset_target_leaf_mass_from_config()
-
-    def configure_memory_age_mode(self, mode: str) -> str:
-        """Configure stationary or continual episodic-memory age scoring."""
-        return self.episodic_memory.configure_memory_age_mode(mode)
 
     def _frontier_router_logits(
         self,
@@ -328,23 +334,38 @@ class HawkesTree(
         precomputed_episodic_delta: Optional[torch.Tensor],
         precomputed_memory_info: Optional[Mapping[str, torch.Tensor]],
         retrieval_chunk_size: Optional[int],
+        retrieval_info_fields: Optional[Sequence[str]],
     ):
+        frontier_kwargs = {
+            "z_t": z_t,
+            "working_delta": working_delta,
+            "decays": decays,
+            "static_cache": frontier_static_cache,
+            "projected_z": frontier_projected_z,
+            "precomputed_query": frontier_query,
+            "update_memory_state": update_memory_state,
+            "update_search_state": update_search_state,
+            "detach_routing": detach_routing,
+            "materialize_diagnostics": materialize_diagnostics,
+            "precomputed_frontier": precomputed_frontier,
+            "precomputed_node_delta": precomputed_node_delta,
+            "precomputed_episodic_delta": precomputed_episodic_delta,
+            "precomputed_memory_info": precomputed_memory_info,
+        }
+        frontier_parameters = self._frontier_forward_parameters
+        memory_parameters = self._memory_read_parameters
+        if (
+            "retrieval_chunk_size" in frontier_parameters
+            and "retrieval_chunk_size" in memory_parameters
+        ):
+            frontier_kwargs["retrieval_chunk_size"] = retrieval_chunk_size
+        if (
+            "retrieval_info_fields" in frontier_parameters
+            and "info_fields" in memory_parameters
+        ):
+            frontier_kwargs["retrieval_info_fields"] = retrieval_info_fields
         output = self.frontier_routing(
-            z_t,
-            working_delta=working_delta,
-            decays=decays,
-            static_cache=frontier_static_cache,
-            projected_z=frontier_projected_z,
-            precomputed_query=frontier_query,
-            update_memory_state=update_memory_state,
-            update_search_state=update_search_state,
-            detach_routing=detach_routing,
-            materialize_diagnostics=materialize_diagnostics,
-            precomputed_frontier=precomputed_frontier,
-            precomputed_node_delta=precomputed_node_delta,
-            precomputed_episodic_delta=precomputed_episodic_delta,
-            precomputed_memory_info=precomputed_memory_info,
-            retrieval_chunk_size=retrieval_chunk_size,
+            **frontier_kwargs,
         )
         batch_size = z_t.size(0)
         frontier_mass = output.frontier_mass
@@ -474,6 +495,7 @@ class HawkesTree(
         precomputed_episodic_delta: Optional[torch.Tensor] = None,
         precomputed_memory_info: Optional[Mapping[str, torch.Tensor]] = None,
         retrieval_chunk_size: Optional[int] = None,
+        retrieval_info_fields: Optional[Sequence[str]] = None,
     ):
         return self._forward_frontier(
             z_t,
@@ -491,6 +513,7 @@ class HawkesTree(
             precomputed_episodic_delta=precomputed_episodic_delta,
             precomputed_memory_info=precomputed_memory_info,
             retrieval_chunk_size=retrieval_chunk_size,
+            retrieval_info_fields=retrieval_info_fields,
         )
 
 

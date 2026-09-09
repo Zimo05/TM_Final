@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 from Train.TrainingComponents import *  # noqa: F403
 
 
@@ -73,10 +75,9 @@ class TrainingWakeSupportMixin:
     ) -> tuple[Tensor, Tensor, Tensor, Any, Tensor, Tensor]:
         """Pure tensor Wake transition for one causal time position.
 
-        This intentionally stops before request creation, MemoryBank mutation,
-        topology, replay, and logging.  Fixed-shape DWS batches may opt into
-        compiling this function; variable-length masking and all host-side
-        work remain outside the compiled region.
+        Request creation, replay, MemoryBank mutation, topology, and logging
+        stay outside this function. Fixed-shape Wake batches may compile this
+        region while variable-length masking remains in the eager caller.
         """
         pre_action_theta = semantic_base + working_delta
         pre_action_effective = self._effective_parameters_from_theta(
@@ -1387,10 +1388,9 @@ class TrainingWakeSupportMixin:
     ) -> tuple[Tensor, Dict[str, Tensor]]:
         """Select v6 probes while preserving the scalar exploration RNG.
 
-        Stable Top-C remains a device operation.  Only the small remaining
-        candidate-index list for each sequence crosses to CPU, where v6's
-        historical ``seed + signature`` generator chooses exploration rows.
-        The selected indices are then gathered back into the tensor buffer.
+        Stable Top-C remains a device operation. Only the small candidate list
+        used by the historical seed+signature exploration sampler crosses to
+        CPU; delayed evidence stays tensor-backed.
         """
         sequence_rows = buffer["sequence_rows"]
         eligible_mask = eligible_mask.to(
@@ -1730,23 +1730,20 @@ class TrainingWakeSupportMixin:
     ) -> Dict[str, Tensor]:
         """Compute causal v6 Write labels for selected tensor probes.
 
-        v6 builds a residual on ``F=[t, t+H)`` and scores its virtual read on
-        the disjoint ``C=[t+H, t+2H)`` window.  The probe buffer keeps those
-        contexts as tensors; only the eventual top-C rows are materialized as
-        MemoryItems after this method returns.
+        v6 constructs the residual on ``F=[t, t+H)`` and scores its virtual
+        read on the disjoint ``C=[t+H, t+2H)`` window. Candidate rows remain
+        batched; only the causal score-window age loop is retained.
         """
         event_indices = packed["event_indices"]
         sequence_rows = packed["sequence_rows"]
         query = packed["queries"]
         write_gate = packed["write_gate"]
-        probe_count = int(event_indices.numel())
-        if probe_count == 0:
+        if event_indices.numel() == 0:
             return {}
         h = int(self.wake_config.write_horizon)
         if h <= 0:
             raise ValueError("v6 write horizon must be positive")
 
-        # Construction-window posterior and causal owner.
         frontier_mass = packed["frontier_mass"]
         frontier_theta = packed["frontier_theta"]
         frontier_mask = packed["frontier_mask"]
@@ -1758,11 +1755,7 @@ class TrainingWakeSupportMixin:
             candidate_starts,
             candidate_rows,
             padded,
-            torch.arange(
-                h,
-                device=event_indices.device,
-                dtype=torch.long,
-            ),
+            torch.arange(h, device=event_indices.device, dtype=torch.long),
         )
         frontier_losses = frontier_losses.reshape(Q, K, h)
         valid = valid.reshape(Q, K, h)
@@ -1774,8 +1767,7 @@ class TrainingWakeSupportMixin:
             frontier_mask,
         )
         owner_indices, owner_is_lca, confidence = self._posterior_owner_indices_batch(
-            packed["frontier_node_indices"],
-            posterior,
+            packed["frontier_node_indices"], posterior
         )
 
         D = self.hawkes.num_types
@@ -1798,22 +1790,14 @@ class TrainingWakeSupportMixin:
             window_events=h,
         )
 
-        # Map each selected probe to its disjoint score-window rows in the
-        # original flat wavefront.  The flat layout is sequence-major, so this
-        # is one arithmetic index construction rather than per-event Python
-        # context objects.
         offsets = torch.cat((
             event_indices.new_zeros(1),
             torch.as_tensor(lengths, device=event_indices.device).cumsum(0)[:-1],
         ))
         score_events = event_indices[:, None] + h + torch.arange(
-            h,
-            device=event_indices.device,
-            dtype=torch.long,
+            h, device=event_indices.device, dtype=torch.long
         )[None, :]
-        score_flat_rows = (
-            offsets.index_select(0, sequence_rows)[:, None] + score_events
-        )
+        score_flat_rows = offsets.index_select(0, sequence_rows)[:, None] + score_events
         score_flat = score_flat_rows.reshape(-1)
         context_semantic = buffer["context_frontier_semantic_theta"].index_select(
             0, score_flat
@@ -1848,12 +1832,15 @@ class TrainingWakeSupportMixin:
         virtual_usage = query.new_ones(Q)
         before = query.new_zeros(Q)
         after = query.new_zeros(Q)
-        owner_on_path = torch.zeros(
-            Q,
-            device=query.device,
-            dtype=torch.bool,
-        )
+        owner_on_path = torch.zeros(Q, device=query.device, dtype=torch.bool)
         virtual_alpha_total = query.new_zeros(Q)
+        read_parameters = inspect.signature(memory.read_packed).parameters
+        supports_chunk_size = "retrieval_chunk_size" in read_parameters
+        supports_info_fields = "info_fields" in read_parameters
+        virtual_parameters = inspect.signature(
+            memory.read_nodes_with_virtual_items_batch
+        ).parameters
+        supports_virtual_info_fields = "info_fields" in virtual_parameters
         for age in range(h):
             score_query = context_queries[:, age]
             owner_path = (
@@ -1864,30 +1851,37 @@ class TrainingWakeSupportMixin:
             ).any(dim=-1)
             owner_on_path = owner_on_path | owner_path.any(dim=-1)
 
-            base_delta, _ = memory.read_packed(
-                query=score_query,
-                node_indices=owner_indices[:, None],
-                node_mask=torch.ones(
-                    Q,
-                    1,
-                    device=query.device,
-                    dtype=torch.bool,
+            read_kwargs = {
+                "query": score_query,
+                "node_indices": owner_indices[:, None],
+                "node_mask": torch.ones(
+                    Q, 1, device=query.device, dtype=torch.bool
                 ),
-                node_ids=node_ids,
-                update_state=False,
-            )
-            base_delta = base_delta[:, 0]
-            virtual_delta, virtual_info = (
-                memory.read_nodes_with_virtual_items_batch(
-                    query=score_query,
-                    node_indices=owner_indices,
-                    node_ids=node_ids,
-                    keys=query,
-                    deltas=candidate_delta,
-                    write_quality=write_gate,
-                    virtual_usage=virtual_usage,
-                    virtual_age=query.new_full((Q,), float(age)),
+                "node_ids": node_ids,
+                "update_state": False,
+            }
+            if supports_chunk_size:
+                read_kwargs["retrieval_chunk_size"] = (
+                    self.wake_config.global_retrieval_microbatch
                 )
+            if supports_info_fields:
+                read_kwargs["info_fields"] = ()
+            base_delta, _ = memory.read_packed(**read_kwargs)
+            base_delta = base_delta[:, 0]
+            virtual_kwargs = {
+                "query": score_query,
+                "node_indices": owner_indices,
+                "node_ids": node_ids,
+                "keys": query,
+                "deltas": candidate_delta,
+                "write_quality": write_gate,
+                "virtual_usage": virtual_usage,
+                "virtual_age": query.new_full((Q,), float(age)),
+            }
+            if supports_virtual_info_fields:
+                virtual_kwargs["info_fields"] = ("alpha",)
+            virtual_delta, virtual_info = memory.read_nodes_with_virtual_items_batch(
+                **virtual_kwargs
             )
             virtual_alpha = virtual_info["virtual_alpha"]
             virtual_alpha_total = virtual_alpha_total + virtual_alpha
@@ -1925,12 +1919,10 @@ class TrainingWakeSupportMixin:
             before = before + before_loss[:, 0] * valid_score
             after = after + after_loss[:, 0] * valid_score
 
-        raw_gain = before - after
-        raw_gain = torch.where(owner_on_path, raw_gain, raw_gain.new_zeros(()))
+        raw_gain = torch.where(owner_on_path, before - after, before.new_zeros(()))
         utility = raw_gain / h - self.wake_config.lambda_write
         bounded_gain = -torch.expm1(
-            -raw_gain.clamp_min(0.0)
-            / self.wake_config.controller_gain_reference
+            -raw_gain.clamp_min(0.0) / self.wake_config.controller_gain_reference
         )
         threshold = self.controller.calibration_thresholds[2].to(write_gate)
         priority = (

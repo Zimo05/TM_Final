@@ -18,13 +18,7 @@ DEFAULT_BATCH_SIZES = (64, 64, 96, 32)
 
 @dataclass(frozen=True)
 class ReplayTensorBatch:
-    """Columnar replay payload used by the global controller objective.
-
-    The legacy replay API intentionally remains row/dict based for checkpoint
-    compatibility and write-ranking diagnostics.  The hot global path uses
-    this compact representation so it does not rebuild five independent
-    ``torch.stack`` lists or perform a device transfer for every event.
-    """
+    """Columnar replay payload used by the global controller objective."""
 
     inputs: torch.Tensor
     target: torch.Tensor
@@ -34,7 +28,6 @@ class ReplayTensorBatch:
 
     @property
     def label_mask(self) -> torch.Tensor:
-        """Compatibility alias used by older objective code."""
         return self.mask
 
     def to(
@@ -167,6 +160,7 @@ class ControllerUtilityReplay:
         action: int,
         *,
         metadata: Optional[Mapping[str, Sequence[Any]]] = None,
+        pin_memory: bool = False,
     ) -> None:
         """Insert a batch while transferring the payload to CPU once.
 
@@ -198,15 +192,36 @@ class ControllerUtilityReplay:
 
         # All differentiable fields are packed before the single host transfer.
         # The mask is reconstructed as bool below; its numeric representation is
-        # only an intermediate transport format.
-        payload = torch.cat((
+        # only an intermediate transport format.  When Global runs on CUDA,
+        # use one pinned destination for the complete payload so the later
+        # row-wise reservoir/admission pass never re-enters a device transfer.
+        packed = torch.cat((
             inputs.detach(),
             utility.detach(),
             target.detach(),
             label_mask.detach().to(dtype=inputs.dtype),
             propensity.detach(),
             gate.detach(),
-        ), dim=1).to("cpu")
+        ), dim=1)
+        if (
+            pin_memory
+            and packed.device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            payload = torch.empty(
+                packed.shape,
+                dtype=packed.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            # The reservoir pass below reads ``payload`` immediately on the
+            # host.  A non-blocking D2H copy would let those reads race the
+            # CUDA transfer, so complete this single batch copy before
+            # indexing the pinned buffer.  This is one synchronization per
+            # replay batch, not one synchronization per event or field.
+            payload.copy_(packed, non_blocking=False)
+        else:
+            payload = packed.to("cpu")
         input_width = inputs.size(1)
         action_width = utility.size(1)
         start_utility = input_width
@@ -536,14 +551,18 @@ class ControllerUtilityReplay:
         *,
         pin_memory: bool = False,
     ) -> ReplayTensorBatch | None:
-        """Sample once and return the differentiable fields in columnar form."""
+        """Sample once and return differentiable fields in columnar form."""
         rows = self._sample_rows(batch_sizes)
         if not rows:
             return None
+        can_pin = bool(pin_memory and torch.cuda.is_available())
 
         def stack(name: str) -> torch.Tensor:
             value = torch.stack([row[name] for row in rows])
-            if pin_memory and value.device.type == "cpu":
+            if (
+                can_pin
+                and value.device.type == "cpu"
+            ):
                 value = value.pin_memory()
             return value
 

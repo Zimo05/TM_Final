@@ -240,14 +240,13 @@ class WakeObjectiveConfig:
     # Number of recent accepted observations retained by adaptive prototype
     # statistics. Appended to preserve positional construction of older configs.
     adaptive_history_size: int = 64
-    # Optional compilation of the pure tensor Wake transition.  MemoryBank,
+    # Optional compilation of the pure tensor Wake transition. MemoryBank,
     # topology, replay, and diagnostics intentionally remain eager/Python.
     compile_wake_step: bool = False
     compile_wake_mode: str = "reduce-overhead"
     # Maximum number of active visited-node rows processed by one packed
-    # episodic retrieval kernel. Appended to preserve positional construction
-    # of older configs; unlike retrieval_microbatch above, this controls the
-    # inner MemoryBank workspace used by Global and Wake.
+    # episodic retrieval kernel. This controls the inner MemoryBank workspace
+    # independently of the outer Wake retrieval microbatch.
     global_retrieval_microbatch: int = 64
 
 

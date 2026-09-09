@@ -515,6 +515,55 @@ class TrainingObjectivesMixin:
         router_row_count = zero.detach()
         probe_leaf_count = 0
 
+        # A leaf can be selected by several ancestor regions.  Build one
+        # candidate axis for the unique active region/leaf nodes and evaluate
+        # each Hawkes law once for the complete minibatch.  Region buckets
+        # below only gather from this cache, so repeated ancestors do not
+        # relaunch the same energy kernel.  Leaf offsets retain their local
+        # gradient; the shared HyperNet/internal-node coordinates remain
+        # detached exactly as in the previous per-region construction.
+        unique_node_ids: list[str] = []
+        unique_node_positions: dict[str, int] = {}
+        leaf_ids = set(self.tree.leaf_ids)
+        for region_index in active_host:
+            node_ids = (
+                topology["region_ids"][region_index],
+                *selected_by_region[region_index],
+            )
+            for node_id in node_ids:
+                if node_id not in unique_node_positions:
+                    unique_node_positions[node_id] = len(unique_node_ids)
+                    unique_node_ids.append(node_id)
+        unique_node_indices = torch.as_tensor(
+            [
+                self.tree.all_node_ids.index(node_id)
+                for node_id in unique_node_ids
+            ],
+            device=semantic_table.device,
+            dtype=torch.long,
+        )
+        unique_theta_full = semantic_table.index_select(
+            0, unique_node_indices
+        )
+        unique_offsets = torch.stack([
+            self.tree.semantic_offset[node_id]
+            if node_id in leaf_ids
+            else semantic_table.new_zeros(semantic_table.size(-1))
+            for node_id in unique_node_ids
+        ]).to(semantic_table)
+        unique_theta = (
+            unique_theta_full - unique_offsets
+        ).detach() + unique_offsets
+        unique_raw_theta = unique_theta[None, None, :, :].expand(
+            1, sequence_count, unique_theta.size(0), unique_theta.size(1)
+        )
+        unique_energy = self._probe_sequence_energy_bucket(
+            flat,
+            sequence_index,
+            sequence_count,
+            unique_raw_theta,
+        )[0]
+
         for probe_count in sorted(buckets):
             bucket_indices = buckets[probe_count]
             bucket_nodes = torch.tensor(
@@ -522,9 +571,6 @@ class TrainingObjectivesMixin:
             )
             bucket_regions = len(bucket_indices)
             coarse_weight = all_coarse_weight.index_select(0, bucket_nodes)
-            region_node_indices = region_nodes.index_select(
-                0, bucket_nodes
-            )
             selected_positions = torch.as_tensor(
                 [
                     [
@@ -541,51 +587,37 @@ class TrainingObjectivesMixin:
             bucket_descendant_nodes = topology["descendant_nodes"].index_select(
                 0, bucket_nodes
             )
-            selected_leaf_node_indices = bucket_descendant_nodes.gather(
-                1, selected_positions
+            coarse_positions = torch.as_tensor(
+                [
+                    unique_node_positions[
+                        topology["region_ids"][region_index]
+                    ]
+                    for region_index in bucket_indices
+                ],
+                device=semantic_table.device,
+                dtype=torch.long,
             )
-            coarse_theta = semantic_table.index_select(
-                0, region_node_indices
-            ).detach()
-            leaf_theta_full = semantic_table.index_select(
-                0, selected_leaf_node_indices.reshape(-1)
+            coarse_energy = unique_energy.index_select(
+                1, coarse_positions
+            ).transpose(0, 1)
+            selected_positions_unique = torch.as_tensor(
+                [
+                    [unique_node_positions[leaf_id] for leaf_id in selected]
+                    for selected in (
+                        selected_by_region[region_index]
+                        for region_index in bucket_indices
+                    )
+                ],
+                device=semantic_table.device,
+                dtype=torch.long,
+            )
+            selected_energy = unique_energy.index_select(
+                1, selected_positions_unique.reshape(-1)
             ).reshape(
+                sequence_count,
                 bucket_regions,
                 probe_count,
-                semantic_table.size(-1),
-            )
-            selected_leaf_ids = [
-                leaf_id
-                for region_index in bucket_indices
-                for leaf_id in selected_by_region[region_index]
-            ]
-            leaf_offsets = torch.stack([
-                self.tree.semantic_offset[leaf_id]
-                for leaf_id in selected_leaf_ids
-            ]).reshape(
-                bucket_regions,
-                probe_count,
-                semantic_table.size(-1),
-            )
-            leaf_theta = (leaf_theta_full - leaf_offsets).detach() + leaf_offsets
-            candidate_theta = torch.cat(
-                (coarse_theta[:, None, :], leaf_theta),
-                dim=1,
-            )
-            raw_theta = candidate_theta[:, None, :, :].expand(
-                bucket_regions,
-                sequence_count,
-                probe_count + 1,
-                candidate_theta.size(-1),
-            )
-            energy = self._probe_sequence_energy_bucket(
-                flat,
-                sequence_index,
-                sequence_count,
-                raw_theta,
-            )
-            coarse_energy = energy[:, :, 0]
-            selected_energy = energy[:, :, 1:]
+            ).permute(1, 0, 2)
             selected_leaf_indices = topology[
                 "descendant_leaf_indices"
             ].index_select(0, bucket_nodes).gather(
@@ -1222,6 +1254,7 @@ class TrainingObjectivesMixin:
                 retrieval_chunk_size=(
                     self.wake_config.global_retrieval_microbatch
                 ),
+                retrieval_info_fields=(),
             )
             sequence_index = flat["sequence_index"]
             # Full/pre/frontier/expanded-child energies are all detached
@@ -1354,35 +1387,40 @@ class TrainingObjectivesMixin:
                     posterior_kl_rows, sequence_index, sequence_count
                 )
                 batch_posterior_kl = posterior_kl_by_sequence.mean()
-            owner_indices, _, owner_confidence = (
-                self._posterior_owner_indices_batch(
-                    memory_output["frontier_node_indices"], posterior
+            # Ownership, novelty, and retrieval statistics are used only as
+            # detached controller features/diagnostics.  Keep their indexing
+            # and packed-memory work out of the autograd graph as well as the
+            # candidate-energy kernels above.
+            with torch.no_grad():
+                owner_indices, _, owner_confidence = (
+                    self._posterior_owner_indices_batch(
+                        memory_output["frontier_node_indices"], posterior
+                    )
                 )
-            )
-            novelty, soft_count, retrieval_similarity = (
-                self.tree.episodic_memory.novelty_count_packed(
-                    memory_query,
-                    owner_indices,
-                    self.tree.all_node_ids,
-                    temperature=self.controller.novelty_temperature,
-                    count_exponent=self.controller.count_exponent,
-                    eps=self.controller.controller_eps,
-                    count_similarity_low=(
-                        self.controller.count_similarity_low
-                    ),
-                    count_similarity_high=(
-                        self.controller.count_similarity_high
-                    ),
-                    count_topk=self.controller.count_topk,
-                    count_saturation=self.controller.count_saturation,
+                novelty, soft_count, retrieval_similarity = (
+                    self.tree.episodic_memory.novelty_count_packed(
+                        memory_query,
+                        owner_indices,
+                        self.tree.all_node_ids,
+                        temperature=self.controller.novelty_temperature,
+                        count_exponent=self.controller.count_exponent,
+                        eps=self.controller.controller_eps,
+                        count_similarity_low=(
+                            self.controller.count_similarity_low
+                        ),
+                        count_similarity_high=(
+                            self.controller.count_similarity_high
+                        ),
+                        count_topk=self.controller.count_topk,
+                        count_saturation=self.controller.count_saturation,
+                    )
                 )
-            )
-            retrieval_norm = memory_output[
-                "frontier_episodic_delta"
-            ].detach().norm(dim=-1)
-            retrieval_norm = (
-                retrieval_norm * memory_output["r"].detach()
-            ).sum(dim=-1)
+                retrieval_norm = memory_output[
+                    "frontier_episodic_delta"
+                ].norm(dim=-1)
+                retrieval_norm = (
+                    retrieval_norm * memory_output["r"]
+                ).sum(dim=-1)
             controller_output = self.controller.action_distribution_batch(
                 pre_action_terms.detach(),
                 novelty.detach(),
@@ -1496,6 +1534,7 @@ class TrainingObjectivesMixin:
                         controller_output["probabilities"].detach(),
                         1,
                         metadata=metadata,
+                        pin_memory=self.device.type == "cuda",
                     )
 
                 replay_batch = self.controller_utility_replay.sample_batch(
